@@ -138,3 +138,27 @@ top_level_req.in
 top_level_req.txt
 _autosummary
 _conf_master.py
+
+# assorted filetypes
+*.eps
+*.png
+*.jpg
+*.pyc
+*.pvd
+*.vtu
+*.npy
+*.html
+*.xdmf
+*.vscode*
+*.sql
+*.txt
+*.h5
+*.bp*
+*.bp/*
+*.0
+*.idx
+*.mat
+*.info
+*.nav
+*.snm
+*.vrb
