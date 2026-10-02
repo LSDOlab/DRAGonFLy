@@ -162,3 +162,6 @@ _conf_master.py
 *.nav
 *.snm
 *.vrb
+
+# Meshes are kept out of version control for now
+meshes/

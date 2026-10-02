@@ -1,0 +1,50 @@
+# Builds the Sphinx documentation in docs/ and publishes it to GitHub Pages
+# (https://lsdolab.github.io/DRAGonFLy). Pull requests only build it, as a check.
+# One-time setup: in the repository's Settings > Pages, set "Source" to "GitHub Actions".
+name: docs
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One deployment at a time; a newer push supersedes a queued one
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+    # The build does not import the package, so only the pinned documentation tools are needed
+    - name: Install documentation dependencies
+      run: pip install -r requirements.txt
+    - name: Build HTML
+      run: make -C docs html SPHINXOPTS="--keep-going"
+    - uses: actions/upload-pages-artifact@v3
+      with:
+        path: docs/_build/html
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+    - id: deployment
+      uses: actions/deploy-pages@v4

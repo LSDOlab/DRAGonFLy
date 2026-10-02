@@ -1,51 +1,39 @@
-# lsdo_project_template
+# DRAGonFLy
 
-<!---
-[![Python](https://img.shields.io/pypi/pyversions/lsdo_project_template)](https://img.shields.io/pypi/pyversions/lsdo_project_template)
-[![Pypi](https://img.shields.io/pypi/v/lsdo_project_template)](https://pypi.org/project/lsdo_project_template/)
-[![Coveralls Badge][13]][14]
-[![PyPI version][10]][11]
-[![PyPI Monthly Downloads][12]][11]
--->
+[![Tests](https://github.com/LSDOlab/DRAGonFLy/actions/workflows/actions.yml/badge.svg)](https://github.com/LSDOlab/DRAGonFLy/actions/workflows/actions.yml)
+[![Docs](https://github.com/LSDOlab/DRAGonFLy/actions/workflows/docs.yml/badge.svg)](https://lsdolab.github.io/DRAGonFLy)
 
-[![GitHub Actions Test Badge](https://github.com/LSDOlab/lsdo_project_template/actions/workflows/actions.yml/badge.svg)](https://github.com/lsdo_project_template/lsdo_project_template/actions)
-[![Forks](https://img.shields.io/github/forks/LSDOlab/lsdo_project_template.svg)](https://github.com/LSDOlab/lsdo_project_template/network)
-[![Issues](https://img.shields.io/github/issues/LSDOlab/lsdo_project_template.svg)](https://github.com/LSDOlab/lsdo_project_template/issues)
+Aerodynamic shape optimization with a discontinuous Galerkin (DG) compressible Euler solver, built on
+FEniCSx and CSDL. It is distributed as `dragonfly-sim` and imported as `dragonfly_sim`.
 
+**Documentation: <https://lsdolab.github.io/DRAGonFLy>**
 
-A template repository for LSDOlab projects
+## Capabilities
+- **Flow solver**: steady compressible Euler equations in 2D and 3D, discretized with a discontinuous Galerkin
+  method (piecewise-constant, i.e. p=0, elements in this release) and HLL, HLLC or local Lax-Friedrichs numerical
+  fluxes. Subsonic inflow/outflow, slip-wall and symmetry-plane boundaries.
+- **Nonlinear and linear solvers**: Newton's method (PETSc SNES) with a positivity-preserving step limiter on
+  density and pressure, and GMRES with additive-Schwarz/ILU preconditioning. Runs in parallel with MPI.
+- **Shape parameterization**: B-spline free-form deformation (FFD) of the wall, with individual control-point
+  motions and sectional variables (camber, thickness, twist) as design variables, plus geometric constraints:
+  enclosed area/volume, thickness at chosen stations and wing planform.
+- **Mesh deformation**: inverse-distance-weighting volume mesh warping (IDWarp), driven by the FFD wall motion.
+- **Outputs and derivatives**: lift, drag and pitching moment, with adjoint-based derivatives with respect to
+  the shape variables and the angle of attack, assembled by CSDL across the FFD, mesh warping, flow and force
+  computations, for gradient-based optimization with modOpt (e.g. SLSQP). The force and moment coefficients
+  and the pitching-moment slope are reported for monitoring.
+- **Output files**: flow solution, pressure and mesh deformation in ADIOS2/VTX (`.bp`) format for ParaView.
 
-This repository serves as a template for all LSDOlab projects with regard to documentation, testing and hosting of open-source code.
-Note that template users need to edit the README badge definitions for their respective packages.
-
-*README.md file contains high-level information about your package: it's purpose, high-level instructions for installation and usage.*
-
-# Installation
-
-## Installation instructions for users
-For direct installation with all dependencies, run on the terminal or command line
+## Installation
+`fenics-dolfinx` 0.11.0 and `mpich` come from conda-forge; `environment.yml` sets up everything:
 ```sh
-pip install git+https://github.com/LSDOlab/lsdo_project_template.git
+git clone https://github.com/LSDOlab/DRAGonFLy.git
+cd DRAGonFLy
+conda env create -f environment.yml
+conda activate dragonfly
 ```
-If you want users to install a specific branch, run
-```sh
-pip install git+https://github.com/LSDOlab/lsdo_project_template.git@branch
-```
+See the [documentation](https://lsdolab.github.io/DRAGonFLy/src/getting_started.html) for details, running the
+examples and the tests.
 
-<!-- **Enabled by**: `packages=find_packages()` in the `setup.py` file. -->
-
-## Installation instructions for developers
-To install `lsdo_project_template`, first clone the repository and install using pip.
-On the terminal or command line, run
-```sh
-git clone https://github.com/LSDOlab/lsdo_project_template.git
-pip install -e ./lsdo_project_template
-```
-
-# For Developers
-For details on documentation, refer to the README in `docs` directory.
-
-For details on testing/pull requests, refer to the README in `tests` directory.
-
-# License
-This project is licensed under the terms of the **GNU Lesser General Public License v3.0**.
+## License
+This project is licensed under the terms of the **MIT License**.

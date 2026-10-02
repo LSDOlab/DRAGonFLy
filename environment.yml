@@ -1,0 +1,16 @@
+# Conda environment for DRAGonFLy:  conda env create -f environment.yml
+# fenics-dolfinx and mpich are only distributed through conda-forge; everything else
+# (including the LSDOlab packages on their `main` branches) is installed by pip from setup.py.
+name: dragonfly
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - fenics-dolfinx=0.11.0
+  - mpich
+  - pyvista
+  - networkx
+  - git-lfs   # the meshes in meshes/ are stored with Git LFS; run `git lfs install` once after creating the env
+  - pip
+  - pip:
+      - -e .[test,docs]

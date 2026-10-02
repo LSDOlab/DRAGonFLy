@@ -12,13 +12,13 @@
 
 # import os
 # import sys
-# sys.path.insert(0, os.path.abspath('../lsdo_project_template/core'))     # for autodoc
+# sys.path.insert(0, os.path.abspath('../dragonfly_sim'))     # for autodoc
 
 # -- Project information -----------------------------------------------------
 
-project = 'lsdo_project_template'
-copyright = '2023, Anugrah'
-author = 'Anugrah'
+project = 'DRAGonFLy'
+copyright = '2026, Sebastiaan van Schie'
+author = 'Sebastiaan van Schie'
 version = '0.1'
 # release = 0.1.0rtc
 
@@ -35,9 +35,13 @@ extensions = [
     "sphinx_copybutton",            # allows copying code embedded in the docs rendered from .md or .ipynb files
     "myst_nb",                      # renders .md, .myst, .ipynb files
     "sphinx.ext.viewcode",          # adds the source code for classes and functions in auto generated api ref
-    "sphinxcontrib.collections",    # adds files from outside src and executes functions before Sphinx builds
+    "sphinx_collections",          # adds files from outside src and executes functions before Sphinx builds
     "sphinxcontrib.bibtex",         # for references and citations
+    "sphinx.ext.githubpages",       # writes .nojekyll so GitHub Pages serves the _static/ directories
 ]
+
+# The site is published on GitHub Pages
+html_baseurl = 'https://lsdolab.github.io/DRAGonFLy/'
 
 # import sphinx as aa
 # print(aa.__version__)
@@ -54,7 +58,7 @@ myst_enable_extensions = ["dollarmath", "amsmath", "tasklist"]
 nb_execution_mode = 'off'
 
 # autoapi options
-autoapi_dirs = ["../lsdo_project_template/core"]
+autoapi_dirs = ["../dragonfly_sim"]
 autoapi_root = 'src/autoapi'
 autoapi_type = 'python'
 autoapi_file_patterns = ['*.py', '*.pyi']
@@ -65,6 +69,9 @@ autoapi_member_order = 'groupwise'
 autoapi_python_class_content = 'class' # 'both' or '__init'
 
 root_doc = 'index'
+
+# the `collections` config value holds a function (py2md), which Sphinx cannot pickle; harmless
+suppress_warnings = ['config.cache']
 
 # Add any paths that contain templates here, relative to this directory.
 templates_path = ['_templates']
@@ -85,7 +92,6 @@ html_theme = 'sphinx_rtd_theme' # other theme options: 'sphinx_book_theme', 'sph
 # html_theme_options for sphinx_rtd_theme
 html_theme_options = {
     'logo_only': False,
-    'display_version': True,
     'prev_next_buttons_location': 'bottom',
     'style_external_links': False,
     'vcs_pageview_mode': '',
@@ -105,11 +111,13 @@ html_theme_options = {
 
 
 import glob
+import os
 # Function used by collections for converting .py files from examples
 # to .md and writing those into `_temp/target/` directory before Sphinx builds
 def py2md(config):
-    # root_dir needs a trailing slash (i.e. /root/dir/)
-    for ex in glob.iglob(config['target'] + '**/ex_*.py', recursive=True):
+    # the copied examples live in the `copy_examples` target; root_dir needs a trailing slash (i.e. /root/dir/)
+    examples_dir = os.path.join(config['confdir'], collections_target, 'examples') + os.sep
+    for ex in glob.iglob(examples_dir + '**/ex_*.py', recursive=True):
         with open(ex) as f:
             code = f.read()
             no_line_breaks = ' '.join(code.splitlines())
@@ -155,24 +163,6 @@ def split_first_string_between_quotes(code_string, quotes):
 
 collections = {
     
-    # copy_tutorials collection copies the contents inside `/tutorials` 
-    # directory into `/src/_temp/tutorials`
-   'copy_tutorials': {
-      'driver': 'copy_folder',
-      'source': '../tutorials', # source relative to path of makefile, not wrt /src
-      'target': 'tutorials/',
-      'ignore': [],
-    #   'active': True,         # default: True. If False, this collection is ignored during doc build.
-    #   'safe': True,           # default: True. If True, any problem will raise an exception and stops the build.
-      'clean': True,            # default: True. If False, no cleanup is done before collections get executed.
-      'final_clean': True,      # default: True. If True, a final cleanup is done at the end of a Sphinx build.
-    #   'tags': ['my_collection', 'dummy'],     # List of tags, which trigger an activation of the collection.
-                                        # Should be used together with active set to False, 
-                                        # otherwise the collection gets always executed.
-                                        # Use -t tag option of sphinx-build command to trigger related collections.
-                                        # e.g. : `sphinx-build -b html -t dummy . _build/html`
-   },
-
    'copy_examples': {
       'driver': 'copy_folder',
       'source': '../examples',  # source relative to path of makefile, not wrt /src
@@ -182,18 +172,18 @@ collections = {
       'final_clean': True,      # default: True. If True, a final cleanup is done at the end of a Sphinx build.
    },
 
-    # convert_examples collection converts all .py files to .md files recursively inside `_temp/examples` 
+    # convert_examples collection converts all .py files to .md files recursively inside `_temp/examples`
     # directory and also extracts the docstrings from the .py files to generate title and descriptions
-    # for those examples
+    # for those examples. It uses the `function` driver from the public sphinx-collections package:
+    # `py2md` writes the .md files itself, so the driver must not write a result file (`write_result: False`).
+    # The `target` is therefore a placeholder file that is never created.
    'convert_examples': {
-      'driver': 'writer_function',  # uses custom WriterFunctionDriver written by Anugrah
-      'from'  : '_temp/examples/',  # source relative to path of makefile, not wrt /src
+      'driver': 'function',
       'source': py2md,              # custom function written above in `conf.py`
-      'target': 'examples/',        # target was a file for original FunctionDriver, e.g., 'target': 'examples/temp.txt'
-                                    # the original FunctionDriver was supposed to write only 1 file.
-      'clean': True,       
-      'final_clean': True,      
-    #   'write_result': True,   # this prevents original FunctionDriver from writing to the target file
+      'target': 'convert_examples.done',
+      'write_result': False,
+      'clean': True,
+      'final_clean': True,
    },
 }
 
