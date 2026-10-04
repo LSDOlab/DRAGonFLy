@@ -18,6 +18,7 @@ jobs:
     # (fenics-dolfinx and mpich are only available through conda-forge).
     # Add other OSes like windows and macOS if needed.
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     # Login shell so that the activated conda environment is used by the `run` steps
     defaults:
