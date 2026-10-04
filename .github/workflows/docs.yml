@@ -1,10 +1,14 @@
 # Builds the Sphinx documentation in docs/ and publishes it to GitHub Pages
 # (https://lsdolab.github.io/DRAGonFLy). Pull requests only build it, as a check.
+# Deployments run after the Tests workflow succeeds on main, so that its coverage badge and report
+# (published at /coverage/) are included in the site.
 # One-time setup: in the repository's Settings > Pages, set "Source" to "GitHub Actions".
 name: docs
 
 on:
-  push:
+  workflow_run:
+    workflows: [Tests]
+    types: [completed]
     branches: [main]
   pull_request:
     branches: [main]
@@ -12,6 +16,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 # One deployment at a time; a newer push supersedes a queued one
 concurrency:
@@ -20,9 +25,13 @@ concurrency:
 
 jobs:
   build:
+    # Skip when the Tests run on main failed
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.workflow_run.head_sha || github.sha }}
     - uses: actions/setup-python@v5
       with:
         python-version: "3.12"
@@ -31,12 +40,20 @@ jobs:
       run: pip install -r requirements.txt
     - name: Build HTML
       run: make -C docs html SPHINXOPTS="--keep-going"
+    - name: Add coverage badge and report from the Tests run
+      if: github.event_name == 'workflow_run'
+      uses: actions/download-artifact@v4
+      with:
+        name: coverage-site
+        path: docs/_build/html/coverage
+        run-id: ${{ github.event.workflow_run.id }}
+        github-token: ${{ github.token }}
     - uses: actions/upload-pages-artifact@v3
       with:
         path: docs/_build/html
 
   deploy:
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
     needs: build
     runs-on: ubuntu-latest
     permissions:
