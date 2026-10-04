@@ -1,6 +1,7 @@
 # DRAGonFLy
 
 [![Tests](https://github.com/LSDOlab/DRAGonFLy/actions/workflows/actions.yml/badge.svg)](https://github.com/LSDOlab/DRAGonFLy/actions/workflows/actions.yml)
+[![Coverage](https://codecov.io/gh/LSDOlab/DRAGonFLy/branch/main/graph/badge.svg)](https://codecov.io/gh/LSDOlab/DRAGonFLy)
 [![Docs](https://github.com/LSDOlab/DRAGonFLy/actions/workflows/docs.yml/badge.svg)](https://lsdolab.github.io/DRAGonFLy)
 
 Aerodynamic shape optimization with a discontinuous Galerkin (DG) compressible Euler solver, built on
