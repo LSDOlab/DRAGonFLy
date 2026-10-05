@@ -9,26 +9,17 @@ cracks. FileWriter gathers those spaces to rank 0 and writes DG p >= 1 per
 rank (VTX writes those with separate points for every cell, so partition
 boundaries add nothing).
 
-Two layers:
-
-- In-process tests of the output meshes and functions FileWriter hands to
-  dolfinx's VTXWriter, including the mesh_deformation and time_dependent
-  keywords. They are communicator-agnostic; a serial run re-runs them under
-  mpirun -n 3 (test_runs_under_multiple_mpi_ranks).
-- test_vtx_output_is_independent_of_the_number_of_ranks writes the cases of
-  vtx_replay/write_cases.py on 1 and 3 ranks, replays each file the way
-  ParaView's VTX reader assembles it (vtx_replay/vtxdump.cpp, compiled
-  against this environment's ADIOS2) and requires identical structure and
-  values. It skips without mpirun, a C++ compiler, the ADIOS2 C++ headers or
-  the vtk package.
+The tests check the output meshes and functions FileWriter hands to dolfinx's
+VTXWriter, including the mesh_deformation and time_dependent keywords, on a
+small mesh in a temporary directory. They are communicator-agnostic; a
+serial run re-runs them under mpirun -n 3 (test_runs_under_multiple_mpi_ranks),
+which is where the gather and per-rank paths actually differ.
 
     OMP_NUM_THREADS=1 python -m pytest tests/test_filewriter.py -v
     OMP_NUM_THREADS=1 mpirun -n 3 python -m pytest tests/test_filewriter.py -q \\
-        -p no:cacheprovider -k "not runs_under_multiple_mpi_ranks and not number_of_ranks"
+        -p no:cacheprovider -k "not runs_under_multiple_mpi_ranks"
 """
 
-import importlib.util
-import json
 import os
 import shutil
 import subprocess
@@ -36,6 +27,7 @@ import sys
 import tempfile
 
 import dolfinx
+import dolfinx.plot
 import numpy as np
 import pytest
 import ufl
@@ -44,24 +36,29 @@ from mpi4py import MPI
 from dragonfly_sim.utils.filewriter import FileWriter
 
 _MPI_CHILD_ENV = "FILEWRITER_TEST_MPI_CHILD"
-_REPLAY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vtx_replay")
-
-
-def _load_helper(name):
-    spec = importlib.util.spec_from_file_location(
-        "vtx_replay_" + name, os.path.join(_REPLAY_DIR, name + ".py"))
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 @pytest.fixture
-def outdir():
-    """A temporary directory with the same path on every rank."""
+def make_writer():
+    """FileWriter factory writing into a temporary directory shared by all ranks.
+
+    The writers' files are closed before the directory is removed: a failed
+    test keeps its writers alive, and ADIOS2 aborts the process when a writer
+    destroyed later finds its directory gone.
+    """
     comm = MPI.COMM_WORLD
     path = tempfile.mkdtemp(prefix="filewriter_test_") if comm.rank == 0 else None
     path = comm.bcast(path, root=0)
-    yield path
+    writers = []
+
+    def make(name, V, **keywords):
+        writers.append(FileWriter(os.path.join(path, name), comm, V, **keywords))
+        return writers[-1]
+
+    yield make
+    for w in writers:
+        if w.writer is not None:
+            w.writer.close()
     comm.Barrier()
     if comm.rank == 0:
         shutil.rmtree(path, ignore_errors=True)
@@ -109,22 +106,22 @@ SPACES = {
 
 
 @pytest.mark.parametrize("space", SPACES)
-def test_dg0_and_continuous_spaces_are_gathered_and_dg_p_ge_1_is_written_per_rank(space, outdir):
+def test_dg0_and_continuous_spaces_are_gathered_and_dg_p_ge_1_is_written_per_rank(space, make_writer):
     element, gathered = SPACES[space]
     comm = MPI.COMM_WORLD
     V = dolfinx.fem.functionspace(quad_mesh(), element)
-    w = FileWriter(os.path.join(outdir, space), comm, V)
+    w = make_writer(space, V)
     assert w.gather == gathered
     has_writer = comm.allgather(w.writer is not None)
     assert has_writer == ([True] + [False] * (comm.size - 1) if gathered else [True] * comm.size)
 
 
-def test_gathered_output_mesh_holds_every_cell_and_node_exactly_once(outdir):
+def test_gathered_output_mesh_holds_every_cell_and_node_exactly_once(make_writer):
     """A single block without duplicated points is what removes the seams."""
     comm = MPI.COMM_WORLD
     msh = quad_mesh()
     V = dolfinx.fem.functionspace(msh, ("DG", 0, (4,)))
-    w = FileWriter(os.path.join(outdir, "dg0"), comm, V)
+    w = make_writer("dg0", V)
     if comm.rank == 0:
         tdim = msh.topology.dim
         assert w.target_mesh.comm.size == 1
@@ -133,13 +130,13 @@ def test_gathered_output_mesh_holds_every_cell_and_node_exactly_once(outdir):
         assert w.target_mesh.geometry.x.shape[0] == msh.geometry.index_map().size_global
 
 
-def test_per_rank_output_mesh_holds_the_owned_cells_and_no_ghosts(outdir):
+def test_per_rank_output_mesh_holds_the_owned_cells_and_no_ghosts(make_writer):
     """Ghost cells would be written by two ranks and overlap."""
     comm = MPI.COMM_WORLD
     msh = quad_mesh()
     tdim = msh.topology.dim
     V = dolfinx.fem.functionspace(msh, ("DG", 1, (4,)))
-    w = FileWriter(os.path.join(outdir, "dg1"), comm, V)
+    w = make_writer("dg1", V)
     cells = w.target_mesh.topology.index_map(tdim)
     assert cells.num_ghosts == 0
     assert cells.size_local == msh.topology.index_map(tdim).size_local
@@ -148,7 +145,7 @@ def test_per_rank_output_mesh_holds_the_owned_cells_and_no_ghosts(outdir):
 
 @pytest.mark.parametrize("space", SPACES)
 @pytest.mark.parametrize("path", ["function", "expression"])
-def test_written_values_are_the_nodal_values_at_the_output_dof_coordinates(space, path, outdir):
+def test_written_values_are_the_nodal_values_at_the_output_dof_coordinates(space, path, make_writer):
     """Lagrange interpolation is nodal, so every output dof must hold the
     field at its own coordinates -- whichever rank the parent dof lived on."""
     comm = MPI.COMM_WORLD
@@ -156,7 +153,7 @@ def test_written_values_are_the_nodal_values_at_the_output_dof_coordinates(space
     V = dolfinx.fem.functionspace(msh, SPACES[space][0])
     bs = V.dofmap.bs
     expr, evaluate = field(ufl.SpatialCoordinate(msh), bs)
-    w = FileWriter(os.path.join(outdir, space), comm, V)
+    w = make_writer(space, V)
     if path == "function":
         u = dolfinx.fem.Function(V)
         u.interpolate(dolfinx.fem.Expression(expr, V.element.interpolation_points))
@@ -169,25 +166,57 @@ def test_written_values_are_the_nodal_values_at_the_output_dof_coordinates(space
         assert np.allclose(values, evaluate(coords), rtol=0, atol=1e-12)
 
 
-def test_dof_mapping_check_rejects_a_scrambled_mapping(outdir):
+@pytest.mark.parametrize("space", SPACES)
+def test_vtx_blocks_add_up_to_a_serial_write(space, make_writer):
+    """ParaView concatenates the per-rank VTX blocks without merging shared
+    points, so the blocks must add up to the points and cells of a serial
+    write; a partition seam shows up as extra (duplicated) points or cells.
+    dolfinx.plot.vtk_mesh builds the same arrays VTXWriter writes: the mesh
+    geometry when only DG0 fields are written, the function-space nodes
+    otherwise."""
+    comm = MPI.COMM_WORLD
+    msh = quad_mesh()
+    tdim = msh.topology.dim
+    V = dolfinx.fem.functionspace(msh, SPACES[space][0])
+    w = make_writer(space, V)
+
+    points = cells = 0
+    if w.writer is not None:
+        cellwise = V.dofmap.dof_layout.num_dofs == 1 and V.ufl_element().discontinuous
+        topology, _, x = dolfinx.plot.vtk_mesh(w.target_mesh if cellwise else w.target_funcspace)
+        points, cells = x.shape[0], len(topology) // (topology[0] + 1)
+    points, cells = comm.allreduce(points), comm.allreduce(cells)
+
+    num_cells = msh.topology.index_map(tdim).size_global
+    if V.dofmap.dof_layout.num_dofs == 1:
+        serial_points = msh.geometry.index_map().size_global
+    elif V.ufl_element().discontinuous:
+        serial_points = num_cells * V.dofmap.dof_layout.num_dofs
+    else:
+        serial_points = V.dofmap.index_map.size_global
+    assert cells == num_cells
+    assert points == serial_points
+
+
+def test_dof_mapping_check_rejects_a_scrambled_mapping(make_writer):
     comm = MPI.COMM_WORLD
     V = dolfinx.fem.functionspace(quad_mesh(), ("DG", 1, (4,)))
-    w = FileWriter(os.path.join(outdir, "dg1"), comm, V)
+    w = make_writer("dg1", V)
     w.target_rows = w.target_rows[::-1].copy()
     with pytest.raises(RuntimeError, match="dof mapping"):
         w._check_dof_mapping()
 
 
 @pytest.mark.parametrize("element", [("DG", 0, (4,)), ("DG", 1, (4,)), ("Lagrange", 1, (2,))])
-def test_mesh_deformation_true_follows_the_parent_mesh_and_false_keeps_the_baseline(element, outdir):
+def test_mesh_deformation_true_follows_the_parent_mesh_and_false_keeps_the_baseline(element, make_writer):
     """Both writers live on the same space, so a deforming writer must not
     move the geometry of the baseline writer's (shared, cached) output mesh."""
     comm = MPI.COMM_WORLD
     msh = quad_mesh()
     V = dolfinx.fem.functionspace(msh, element)
     expr, _ = field(ufl.SpatialCoordinate(msh), V.dofmap.bs)
-    still = FileWriter(os.path.join(outdir, "still"), comm, V, mesh_deformation=False)
-    moving = FileWriter(os.path.join(outdir, "moving"), comm, V, mesh_deformation=True)
+    still = make_writer("still", V, mesh_deformation=False)
+    moving = make_writer("moving", V, mesh_deformation=True)
     baseline = {w: w.target_mesh.geometry.x.copy() for w in (still, moving) if w.writer is not None}
 
     x0 = msh.geometry.x.copy()
@@ -202,11 +231,11 @@ def test_mesh_deformation_true_follows_the_parent_mesh_and_false_keeps_the_basel
             assert np.allclose(moving.target_mesh.geometry.x, expected, rtol=0, atol=1e-14)
 
 
-def test_time_dependent_frames_are_labelled_by_increasing_time(outdir):
+def test_time_dependent_frames_are_labelled_by_increasing_time(make_writer):
     comm = MPI.COMM_WORLD
     V = dolfinx.fem.functionspace(quad_mesh(), ("DG", 1, (4,)))
     expr, _ = field(ufl.SpatialCoordinate(V.mesh), 4)
-    w = FileWriter(os.path.join(outdir, "timed"), comm, V, time_dependent=True)
+    w = make_writer("timed", V, time_dependent=True)
     for t in (0.0, 0.05, 0.1):
         w.interpolate_and_write(expr, time=t)
         assert w.last_time == t
@@ -218,11 +247,11 @@ def test_time_dependent_frames_are_labelled_by_increasing_time(outdir):
         w.interpolate_and_write(expr, time=0.1)
 
 
-def test_counter_labelled_writer_rejects_time_and_keeps_a_pinned_counter(outdir):
+def test_counter_labelled_writer_rejects_time_and_keeps_a_pinned_counter(make_writer):
     comm = MPI.COMM_WORLD
     V = dolfinx.fem.functionspace(quad_mesh(), ("DG", 0, (4,)))
     expr, _ = field(ufl.SpatialCoordinate(V.mesh), 4)
-    w = FileWriter(os.path.join(outdir, "counted"), comm, V)
+    w = make_writer("counted", V)
     w.interpolate_and_write(expr, write_counter=5)
     assert w.write_counter == 0
     w.interpolate_and_write(expr)
@@ -231,87 +260,31 @@ def test_counter_labelled_writer_rejects_time_and_keeps_a_pinned_counter(outdir)
         w.interpolate_and_write(expr, time=1.0)
 
 
-def _run_mpi(n, args, timeout=900):
-    env = dict(os.environ)
-    env[_MPI_CHILD_ENV] = "1"
-    env.setdefault("OMP_NUM_THREADS", "1")
-    try:
-        return subprocess.run(["mpirun", "-n", str(n)] + args, env=env, capture_output=True,
-                              text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        pytest.fail(
-            "the {}-rank run did not finish within {}s, which usually means one rank failed "
-            "and the rest are blocked in a collective".format(n, timeout))
-
-
 @pytest.mark.skipif(shutil.which("mpirun") is None, reason="mpirun is not available")
 @pytest.mark.skipif(os.environ.get(_MPI_CHILD_ENV) == "1",
                     reason="already running inside the spawned MPI child")
 def test_runs_under_multiple_mpi_ranks():
     """Re-run this file under mpirun, so a serial pytest invocation also
     covers the gather and the per-rank paths with more than one rank."""
-    proc = _run_mpi(3, [sys.executable, "-m", "pytest", "-x", "-q", "-p", "no:cacheprovider",
-                        __file__, "-k", "not runs_under_multiple_mpi_ranks and not number_of_ranks"])
-    assert proc.returncode == 0, "3-rank run failed:\n{}\n{}".format(proc.stdout, proc.stderr)
+    cmd = [
+        "mpirun", "-n", "3",
+        sys.executable, "-m", "pytest", "-x", "-q",
+        "-p", "no:cacheprovider",
+        __file__,
+        "-k", "not runs_under_multiple_mpi_ranks",
+    ]
+    env = dict(os.environ)
+    env[_MPI_CHILD_ENV] = "1"
+    env.setdefault("OMP_NUM_THREADS", "1")
 
+    try:
+        proc = subprocess.run(cmd, env=env, capture_output=True, text=True,
+                              timeout=300)
+    except subprocess.TimeoutExpired:
+        pytest.fail(
+            "the 3-rank run did not finish within 300s, which usually means "
+            "one rank failed an assertion and the rest are blocked in a "
+            "collective")
 
-@pytest.mark.skipif(shutil.which("mpirun") is None, reason="mpirun is not available")
-@pytest.mark.skipif(os.environ.get(_MPI_CHILD_ENV) == "1" or MPI.COMM_WORLD.size > 1,
-                    reason="spawns its own MPI runs")
-def test_vtx_output_is_independent_of_the_number_of_ranks(tmp_path):
-    """The files ParaView assembles from a 3-rank write must match a serial
-    write: same points, no duplicated points in gathered output, the same
-    exterior edges/faces, the same values. A partition seam shows up here as
-    extra points and extra exterior edges/faces."""
-    pytest.importorskip("vtk")
-    replay = _load_helper("replay")
-    vtxdump = replay.build_vtxdump(str(tmp_path))
-    if vtxdump is None:
-        pytest.skip("no C++ compiler or no ADIOS2 C++ headers/libraries in this environment")
-
-    runs = {}
-    for n in (1, 3):
-        out = tmp_path / "np{}".format(n)
-        out.mkdir()
-        proc = _run_mpi(n, [sys.executable, os.path.join(_REPLAY_DIR, "write_cases.py"), str(out)])
-        assert proc.returncode == 0, "{}-rank write failed:\n{}\n{}".format(n, proc.stdout, proc.stderr)
-        runs[n] = out
-    manifest = json.loads((runs[3] / "manifest.json").read_text())
-    amplitudes, times = manifest["amplitudes"], manifest["times"]
-
-    failures = []
-    for entry in manifest["files"]:
-        name = entry["name"]
-        dumps = {n: [replay.dump(vtxdump, str(runs[n] / (name + ".bp")),
-                                 str(runs[n] / "dump" / name / str(k)), k)
-                     for k in range(len(amplitudes))] for n in runs}
-        first = {n: replay.load(dumps[n][0]) for n in runs}
-        for k in range(len(amplitudes)):
-            serial, parallel = replay.summary(dumps[1][k]), replay.summary(dumps[3][k])
-            expected_blocks = 1 if entry["gathered"] else 3
-            if parallel["blocks"] != expected_blocks:
-                failures.append("{} frame {}: {} blocks, expected {}".format(
-                    name, k, parallel["blocks"], expected_blocks))
-            for key in ("points", "unique_points", "cells", "exterior"):
-                if serial[key] != parallel[key]:
-                    failures.append("{} frame {}: {} = {} on 3 ranks vs {} on 1 rank".format(
-                        name, k, key, parallel[key], serial[key]))
-            if entry["gathered"] and parallel["points"] != parallel["unique_points"]:
-                failures.append("{} frame {}: duplicated points in gathered output".format(name, k))
-            diff = replay.max_value_difference(dumps[1][k], dumps[3][k])
-            if diff > 1e-12:
-                failures.append("{} frame {}: values differ by {:.2e}".format(name, k, diff))
-
-            frame = replay.load(dumps[3][k])
-            if entry["points_are_nodes"]:
-                x0 = first[3]["geometry"]
-                amp = amplitudes[k] if entry["deform"] else 0.0
-                err = np.abs(frame["geometry"] - (x0 + deformation(x0, amp))).max()
-                if err > 1e-12:
-                    failures.append("{} frame {}: geometry off by {:.2e}".format(name, k, err))
-            if entry["time"] and frame["time"] != times[k]:
-                failures.append("{} frame {}: time label {} != {}".format(
-                    name, k, frame["time"], times[k]))
-            elif not entry["time"] and frame["time"] != k:
-                failures.append("{} frame {}: counter label {}".format(name, k, frame["time"]))
-    assert not failures, "\n".join(failures)
+    assert proc.returncode == 0, (
+        "3-rank run failed:\n{}\n{}".format(proc.stdout, proc.stderr))

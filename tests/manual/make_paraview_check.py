@@ -2,7 +2,7 @@
 Write a VTX file set for checking FileWriter output by hand in ParaView.
 
 usage (from the repository root, meshes from Git LFS):
-    OMP_NUM_THREADS=1 mpirun -n 8 python tests/vtx_replay/make_paraview_check.py \\
+    OMP_NUM_THREADS=1 mpirun -n 8 python tests/manual/make_paraview_check.py \\
         [--reference-filewriter path/to/other/filewriter.py]
 
 Writes a new folder vtx_paraview_check_np<N>_<timestamp>_<random>/ in the
