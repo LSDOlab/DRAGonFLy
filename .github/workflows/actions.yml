@@ -35,14 +35,18 @@ jobs:
         miniforge-version: latest
         channels: conda-forge
 
-      # The package and its dependencies are installed by the `pip` section of environment.yml;
-      # we then run the package unit-tests.
-    - name: Test with pytest
-      # test_form_manager re-runs itself under mpirun; threaded BLAS in the conda stack stalls MPI runs
-      env:
-        OMP_NUM_THREADS: 1
+    - name: Verify conda environment
       run: |
-        pytest --cov=dragonfly_sim --cov-report=xml --cov-report=html
+        conda list
+        python -c "import fenics_dolfinx; print('DOLFINX OK')"
+        python -c "import mpi4py; print('MPI4PY OK')"
+
+    - name: Test with pytest
+      env:
+      OMP_NUM_THREADS: 1
+      run: |
+        python -c "import dragonfly_sim; print('Import successful')"
+        pytest -v --tb=short --cov=dragonfly_sim --cov-report=xml --cov-report=html
 
     # On main, package the coverage badge and HTML report; the docs workflow publishes them to GitHub Pages
     - name: Build coverage badge
