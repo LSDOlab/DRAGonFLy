@@ -18,6 +18,7 @@ jobs:
     # (fenics-dolfinx and mpich are only available through conda-forge).
     # Add other OSes like windows and macOS if needed.
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     # Login shell so that the activated conda environment is used by the `run` steps
     defaults:
@@ -41,4 +42,19 @@ jobs:
       env:
         OMP_NUM_THREADS: 1
       run: |
-        pytest
+        pytest --cov=dragonfly_sim --cov-report=xml --cov-report=html
+
+    # On main, package the coverage badge and HTML report; the docs workflow publishes them to GitHub Pages
+    - name: Build coverage badge
+      if: github.event_name == 'push'
+      run: |
+        pip install "genbadge[coverage]"
+        mkdir -p coverage-site
+        genbadge coverage -i coverage.xml -o coverage-site/badge.svg
+        cp -r htmlcov/. coverage-site/
+    - name: Upload coverage site
+      if: github.event_name == 'push'
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-site
+        path: coverage-site

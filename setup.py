@@ -50,7 +50,7 @@ setup(
         # install them with conda (see environment.yml)
     ],
     extras_require={
-        'test': ['pytest'],
+        'test': ['pytest', 'pytest-cov'],
         'docs': [
             'sphinx',
             'myst-nb',

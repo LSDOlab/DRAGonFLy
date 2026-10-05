@@ -210,11 +210,16 @@ def test_runs_under_multiple_mpi_ranks():
         "mpirun", "-n", "3",
         sys.executable, "-m", "pytest", "-x", "-q",
         "-p", "no:cacheprovider",
+        "-p", "no:cov",
         __file__,
         "-k", "not runs_under_multiple_mpi_ranks",
     ]
     env = dict(os.environ)
     env[_MPI_CHILD_ENV] = "1"
+    # The ranks must not inherit the parent's pytest-cov subprocess hooks: three
+    # ranks tracing and writing coverage data at once is slow and can stall
+    for key in [k for k in env if k.startswith(("COV_CORE_", "COVERAGE_"))]:
+        del env[key]
 
     try:
         proc = subprocess.run(cmd, env=env, capture_output=True, text=True,
