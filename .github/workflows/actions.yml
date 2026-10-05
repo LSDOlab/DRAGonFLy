@@ -44,6 +44,7 @@ jobs:
     - name: Test with pytest
       env:
         OMP_NUM_THREADS: 1
+        UCX_TLS: tcp  # Force UCX to use TCP instead of UD verbs
       run: |
         python -c "import dragonfly_sim; print('Import successful')"
         pytest -v --tb=short --cov=dragonfly_sim --cov-report=xml --cov-report=html
