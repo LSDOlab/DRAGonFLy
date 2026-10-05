@@ -43,7 +43,7 @@ jobs:
 
     - name: Test with pytest
       env:
-      OMP_NUM_THREADS: 1
+        OMP_NUM_THREADS: 1
       run: |
         python -c "import dragonfly_sim; print('Import successful')"
         pytest -v --tb=short --cov=dragonfly_sim --cov-report=xml --cov-report=html
