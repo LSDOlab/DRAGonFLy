@@ -19,10 +19,22 @@ This installs the package (`dragonfly-sim`, imported as `dragonfly_sim`) in edit
 documentation tools. The meshes in `meshes/` are stored with Git LFS; `git lfs pull` fetches them.
 
 ### For users
-In a conda environment that provides `fenics-dolfinx` 0.11.0 and `mpich` (for example the one above), run
+In an existing conda environment, install the conda-forge dependencies (skip this if they are already present),
+then the package, from which pip installs the remaining dependencies:
 ```sh
+$ conda install -c conda-forge fenics-dolfinx=0.11.0 mpich pyvista networkx
 $ pip install git+https://github.com/LSDOlab/DRAGonFLy.git
 ```
+
+### Dependencies
+- From conda-forge: `fenics-dolfinx` 0.11.0 (not on PyPI), which brings `mpi4py`, `petsc4py`, `ufl` and `basix`,
+  `mpich` (not on PyPI), `pyvista` and `networkx`.
+- From PyPI, installed by pip: `numpy`, `scipy`, `matplotlib`, `jax`.
+- From the `main` branches of the LSDOlab repositories, installed by pip: CSDL_alpha, lsdo_function_spaces,
+  lsdo_geo, modopt and IDWarp-JAX.
+
+All runtime dependencies are declared in `setup.py`; `pyvista` and `networkx` are listed there too, so pip would
+fetch them from PyPI if they were missing.
 
 ## Running an example
 From the repository root:
