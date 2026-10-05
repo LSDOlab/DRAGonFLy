@@ -76,13 +76,17 @@ class CompressibleEulerModel():
         self.export_solutions = False
 
 
-    def define_sol_export_files(self, func_space, file_name_addendum=None):
+    def define_sol_export_files(self, func_space, file_name_addendum=None, mesh_deformation=False):
         # FOM_solution_<suffix>.bp is the ALIGNED series: exactly one frame per
         # design evaluation, written by write_solution_output() at eval_idx, so
         # step k here is step k in mesh_deformation_<suffix>.bp. It carries the
         # accepted solution -- see DG_windtunnel_model.solve_residual_equations.
-        self.fom_solution_writer = FileWriter("FOM_solution_{}".format(file_name_addendum), self.mesh_obj.mesh.comm, func_space)
-        self.fom_pressure_writer = FileWriter("FOM_pressure_{}".format(file_name_addendum), self.mesh_obj.mesh.comm, self.functionspaces["V_scalar"])
+        # mesh_deformation=True writes each frame on the deformed mesh it was
+        # solved on.
+        self.fom_solution_writer = FileWriter("FOM_solution_{}".format(file_name_addendum), self.mesh_obj.mesh.comm, func_space,
+                                              mesh_deformation=mesh_deformation)
+        self.fom_pressure_writer = FileWriter("FOM_pressure_{}".format(file_name_addendum), self.mesh_obj.mesh.comm, self.functionspaces["V_scalar"],
+                                              mesh_deformation=mesh_deformation)
         self.pressure_func = dolfinx.fem.Function(self.functionspaces["V_scalar"], name="pressure")
         self.export_solutions = True
 

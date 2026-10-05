@@ -310,21 +310,23 @@ class Mesh():
         """Enable the per-evaluation mesh output files, named with ``suffix``.
 
         ``deformation`` writes mesh_deformation_<suffix>.bp (through
-        write_deformation_output); ``quality`` writes the DG0 quality fields
-        mesh_{vol,jac,min_edge,max_edge,cell_aspect_ratio}_<suffix>.bp on every
-        apply_node_motions. ``suffix`` also names the memory logs of the
-        classes that use this mesh. Collective.
+        write_deformation_output) on the baseline mesh, so ParaView's Warp By
+        Vector with it reproduces the deformed mesh; ``quality`` writes the DG0
+        quality fields mesh_{vol,jac,min_edge,max_edge,cell_aspect_ratio}_<suffix>.bp
+        on the deformed mesh on every apply_node_motions. ``suffix`` also names
+        the memory logs of the classes that use this mesh. Collective.
         """
         comm = self.mesh.comm
         self.output_suffix = suffix
         self._deformation_writer = (
-            FileWriter("mesh_deformation_{}".format(suffix), comm, self.coordinate_space)
+            FileWriter("mesh_deformation_{}".format(suffix), comm, self.coordinate_space,
+                       mesh_deformation=False)
             if deformation else None)
         self._quality_writers = None
         if quality:
             V0 = self._setup_quality()["V"]
             self._quality_writers = {
-                name: FileWriter("mesh_{}_{}".format(name, suffix), comm, V0)
+                name: FileWriter("mesh_{}_{}".format(name, suffix), comm, V0, mesh_deformation=True)
                 for name in ("vol", "jac", "min_edge", "max_edge", "cell_aspect_ratio")}
 
     def write_deformation_output(self, node_motions, write_counter):

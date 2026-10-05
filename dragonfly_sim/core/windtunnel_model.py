@@ -245,8 +245,9 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         self.sim_model.compute_weakform()
 
         # Define the file names and objects for solution writes to external files for Paraview
-        self.sim_model.define_sol_export_files(self.sim_model.functionspaces["V"], 
-                                               file_name_addendum=self.filename_suffix)
+        self.sim_model.define_sol_export_files(self.sim_model.functionspaces["V"],
+                                               file_name_addendum=self.filename_suffix,
+                                               mesh_deformation=True)
 
         # We instantiate a separate DG_postprocessor object here so we can print 
         # forces and moments and coefficients after each forward solve
