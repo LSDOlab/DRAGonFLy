@@ -38,12 +38,13 @@ jobs:
     - name: Verify conda environment
       run: |
         conda list
-        python -c "import fenics_dolfinx; print('DOLFINX OK')"
+        python -c "import dolfinx; print('DOLFINX OK')"
         python -c "import mpi4py; print('MPI4PY OK')"
 
     - name: Test with pytest
       env:
-      OMP_NUM_THREADS: 1
+        OMP_NUM_THREADS: 1
+        UCX_TLS: tcp  # Force UCX to use TCP instead of UD verbs
       run: |
         python -c "import dragonfly_sim; print('Import successful')"
         pytest -v --tb=short --cov=dragonfly_sim --cov-report=xml --cov-report=html
