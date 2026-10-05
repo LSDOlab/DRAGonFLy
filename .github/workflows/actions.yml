@@ -38,7 +38,7 @@ jobs:
     - name: Verify conda environment
       run: |
         conda list
-        python -c "import fenics_dolfinx; print('DOLFINX OK')"
+        python -c "import dolfinx; print('DOLFINX OK')"
         python -c "import mpi4py; print('MPI4PY OK')"
 
     - name: Test with pytest
