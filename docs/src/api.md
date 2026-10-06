@@ -10,6 +10,10 @@ The main entry points:
   `ShapeDVSet`)
 - `dragonfly_sim.core.Euler_model.CompressibleEulerModel` and `dragonfly_sim.core.mesh_manager.Mesh`: the
   underlying flow discretization and mesh handling
+- `dragonfly_sim.core.RANS_model.CompressibleRANSModel` and `dragonfly_sim.core.turbulence_models`: RANS and
+  the turbulence closures (see [RANS, time integration and far fields](flow_models.md))
+- `dragonfly_sim.core.time_integration`: `TimeIntegrator`, `CFLController`, `StepSizeController`
+- `dragonfly_sim.core.farfield.TransverseFarfield`: the transverse (riemann2) far field
 
 ```{toctree}
 :maxdepth: 2

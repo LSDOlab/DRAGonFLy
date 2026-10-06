@@ -63,6 +63,9 @@ class Mesh():
         self.output_suffix = None
         self._deformation_writer = None
         self._quality_writers = None
+        # callables run after every change of the node coordinates (see
+        # add_geometry_listener)
+        self._geometry_listeners = []
 
         self.n = ufl.FacetNormal(self.mesh)  # cell boundary normal vector
 
@@ -76,6 +79,9 @@ class Mesh():
         self.cell_volume = (abs(ufl.JacobianDeterminant(self.mesh))
                             * ufl.classes.ReferenceCellVolume(self.mesh))
         self.h_vol = self.cell_volume ** (1.0 / tdim)
+        # Shortest edge, for the local pseudo-time step of PTC
+        # (core/time_integration.py); never part of the residual.
+        self.h_min = ufl.MinCellEdgeLength(self.mesh)
 
         # The boundary queries below, and the wall-node lookups done later on
         # (entities_to_geometry) need these to exist already: the facet
@@ -204,10 +210,22 @@ class Mesh():
     # Deformation
     # ==================================================================
 
-    def reset_nodes(self):
+    def add_geometry_listener(self, callback):
+        """Run `callback()` (collective) after every reset_nodes and
+        apply_node_motions, e.g. to refresh fields computed from the node
+        coordinates (cell centres, wall distance)."""
+        self._geometry_listeners.append(callback)
+
+    def _notify_geometry_listeners(self):
+        for callback in self._geometry_listeners:
+            callback()
+
+    def reset_nodes(self, notify=True):
         """Put every local node, ghosts included, back at its baseline position."""
         gdim = self.mesh.geometry.dim
         self.mesh.geometry.x[:, :gdim] = self.baseline_nodes[:, :gdim]
+        if notify:
+            self._notify_geometry_listeners()
 
     def apply_node_motions(self, node_motions):
         """Move the mesh to baseline + ``node_motions`` and re-check its cells.
@@ -218,7 +236,7 @@ class Mesh():
         their owners. Sets ``is_valid`` (no inverted or zero-volume cell) and
         returns it. Collective.
         """
-        self.reset_nodes()
+        self.reset_nodes(notify=False)
         n, gdim = self.n_owned_nodes, self.mesh.geometry.dim
         x = self.mesh.geometry.x
         x[:n, :gdim] += node_motions[:, :gdim]
@@ -231,6 +249,7 @@ class Mesh():
         x[:] = geom_vec.array.reshape(-1, 3)
 
         self._update_quality()
+        self._notify_geometry_listeners()
         return self.is_valid
 
     # ==================================================================

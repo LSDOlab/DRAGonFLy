@@ -91,7 +91,23 @@ POSITIVITY_FLOOR = 1e-4
 MIN_POSITIVITY_THETA = 1e-6
 
 
-def compute_positivity_preserving_theta(comm, x_arr, dx_arr, gamma=1.4, initial_theta=1.0, min_theta=None, block_size=4):
+def _mean_flow_blocks(x_arr, dx_arr, block_size, n_mean):
+    """
+    Drop the trailing transported scalars (turbulence variables) from every
+    block, so the density/pressure checks below see (rho, rho u, rho E) only.
+    Returns (x, dx, block size); a no-op when n_mean is None or the blocks
+    are already mean flow.
+    """
+    if n_mean is None or n_mean >= block_size:
+        return x_arr, dx_arr, block_size
+    n_blocks = len(x_arr) // block_size
+    x = x_arr[:n_blocks * block_size].reshape(-1, block_size)[:, :n_mean].ravel()
+    dx = dx_arr[:n_blocks * block_size].reshape(-1, block_size)[:, :n_mean].ravel()
+    return x, dx, n_mean
+
+
+def compute_positivity_preserving_theta(comm, x_arr, dx_arr, gamma=1.4, initial_theta=1.0, min_theta=None, block_size=4,
+                                        n_mean=None):
     """
     Computes the maximum theta <= initial_theta such that x_new = x_arr - theta * dx_arr
     has positive mass density and positive pressure everywhere.
@@ -99,10 +115,14 @@ def compute_positivity_preserving_theta(comm, x_arr, dx_arr, gamma=1.4, initial_
     Returns the step length only. To find out WHICH nodes bounded it -- the
     question a collapsed theta raises -- pass twice the returned value to
     locate_positivity_limiting_nodes.
+
+    With n_mean given, each block of block_size entries is (rho, rho u, rho E)
+    followed by transported scalars, which are not limited.
     """
     import numpy as np
     if min_theta is None:
         min_theta = MIN_POSITIVITY_THETA
+    x_arr, dx_arr, block_size = _mean_flow_blocks(x_arr, dx_arr, block_size, n_mean)
     theta = initial_theta
 
     # Determine the number of valid full blocks
@@ -156,7 +176,7 @@ def compute_positivity_preserving_theta(comm, x_arr, dx_arr, gamma=1.4, initial_
 
 
 def locate_positivity_limiting_nodes(x_arr, dx_arr, theta_probe, gamma=1.4,
-                                     block_size=4, floor=POSITIVITY_FLOOR):
+                                     block_size=4, floor=POSITIVITY_FLOOR, n_mean=None):
     """
     Find which local nodes make x_arr - theta_probe*dx_arr unphysical.
 
@@ -190,6 +210,7 @@ def locate_positivity_limiting_nodes(x_arr, dx_arr, theta_probe, gamma=1.4,
         rho, p, rho_trial, p_trial, d_rho, d_rhou_norm, d_rhoE
             the state, the trial state and the update at that node.
     """
+    x_arr, dx_arr, block_size = _mean_flow_blocks(x_arr, dx_arr, block_size, n_mean)
     n_blocks = len(x_arr) // block_size
     empty = {"n_density": 0, "n_pressure": 0, "n_nonfinite": 0, "block": None}
     if n_blocks == 0:

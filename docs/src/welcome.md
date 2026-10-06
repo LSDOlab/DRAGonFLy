@@ -27,6 +27,7 @@ The Python package is distributed as `dragonfly-sim` and imported as `dragonfly_
 
 src/getting_started
 src/background
+src/flow_models
 src/user_guide
 src/shape_parameterization
 src/examples

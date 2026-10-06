@@ -57,6 +57,16 @@ Solver settings are attributes; change them before `set_up_sim()`:
 | `linear_solver_max_it` | `1000` | iteration limit of those solves |
 | `log_cm_alpha` | `True` | print $dc_m/d\alpha$ after each solve (one extra linear solve) |
 
+Constructor options select the flow model and the far field:
+
+| Argument | Default | Meaning |
+|---|---|---|
+| `model_class`, `model_kwargs` | `CompressibleEulerModel`, `{}` | e.g. `CompressibleRANSModel`, `{'Re': 6e6}` for SA-neg RANS (see [RANS, time integration and far fields](flow_models.md)); the body becomes an adiabatic no-slip wall |
+| `farfield` | `"split"` | `"riemann"`: characteristic far field on the whole outer boundary instead of the inflow/outflow split |
+
+RANS solves use pseudo-transient continuation, so `max_newton_iterations` counts pseudo steps (~60 from the free
+stream on the coarse NACA0012 C-grid at $M = 0.7$); raise it to a few hundred.
+
 ## 4. Postprocessor
 ```python
 from dragonfly_sim.core.postprocessor import DG_postprocessor

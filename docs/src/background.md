@@ -50,6 +50,9 @@ $\hat{H}_b = \mathbf{F}(U)\cdot\mathbf{n} + \lambda\,(U - U_b)$.
 The far-field boundary is split into inflow and outflow by a plane through the middle of the domain,
 normal to the freestream direction at the initial angle of attack.
 
+Viscous (RANS) models, pseudo-transient continuation and unsteady time stepping, and the characteristic far
+field are described in [RANS, time integration and far fields](flow_models.md).
+
 ## Nonlinear and linear solvers
 $R(U) = 0$ is solved with Newton's method (PETSc SNES, full steps). Each update $\delta U$ is scaled by a
 step length $\theta \le 1$ that keeps density and pressure above a floor ($10^{-4}$) in every cell: $\theta$

@@ -32,17 +32,38 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
     # the shared mesh, so they must never overlap -- also on a single process.
     ordered_callbacks = True
 
-    def __init__(self, mesh, boundary_dict, ffd_shape, aero_center,
+    def __init__(self, mesh, boundary_dict, ffd_shape=None, aero_center=None,
                  mesh_inner_bdry_function=None, ffd_block_corner_list=None, cp_coord_opt_idxs=None,
                  poly_order=1, gamma=1.4, ffd_degree=2,
                  filename_suffix="test",
-                 asm_overlap=None, ilu_levels=None):
+                 asm_overlap=None, ilu_levels=None,
+                 model_class=CompressibleEulerModel, model_kwargs=None, farfield="split"):
         """
         The shape of the object being optimized is defined either through `mesh_inner_bdry_function`
         or through ffd_block_corner_list, which defines the box the inner boundary
         facets are contained in and can therefore supply the same signal. At least
         one of the two is required; when both are given the explicit function
         wins, since it can encode exclusions the FFD block cannot.
+
+        ffd_shape: the FFD control-point block (e.g. [5, 3]). With it,
+        set_up_sim builds the FFD block (self.ffd) and the IDWarp mesh warper
+        (self.mesh_warper), and evaluate() takes the mesh node motions and shape
+        parameters as inputs: shape optimization. Without it (None) neither is
+        built, the mesh stays fixed, and evaluate() takes alpha only: a forward
+        flow analysis, with derivatives with respect to alpha. solve_forward()
+        runs one flow solve without a CSDL graph at all.
+
+        aero_center: moment reference point; defaults to (0.25, 0[, 0]).
+
+        model_class / model_kwargs select the flow model: CompressibleEulerModel
+        (the default) or e.g. core.RANS_model.CompressibleRANSModel with
+        model_kwargs={'Re': 6e6}. The body's wall is the model's
+        define_wall_bc (slip for Euler, adiabatic no-slip for RANS).
+
+        farfield: "split" divides the outer boundary into a subsonic inflow
+        and outflow perpendicular to the free stream (the default); "riemann"
+        puts the characteristic far field (define_farfield_bc) on all of it,
+        which needs no split and so no guard on large alpha changes.
         """
         super().__init__()
 
@@ -90,8 +111,14 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         # Initial instantiation of mesh and simulation model
         self.mesh = Mesh(mesh, mesh_inner_bdry_function,
                          node_match_tol=self.mesh_node_match_tol)
-        _euler_kwargs = dict(poly_order=poly_order, gamma=gamma)
-        self.sim_model = CompressibleEulerModel(self.mesh, **_euler_kwargs)
+        if farfield not in ("split", "riemann"):
+            raise ValueError("farfield must be 'split' or 'riemann'")
+        self.farfield = farfield
+        if model_class is CompressibleEulerModel:
+            _euler_kwargs = dict(poly_order=poly_order, gamma=gamma)
+            self.sim_model = CompressibleEulerModel(self.mesh, **_euler_kwargs)
+        else:
+            self.sim_model = model_class(self.mesh, gamma=gamma, **(model_kwargs or {}))
         # TODO: Perhaps split up CompressibleEulerModel into an Euler model class and a solver class that facilitates solver interactions; 
         #       the solver has become so complicated recently that spinning it off into its own class would likely help with code readability
 
@@ -107,6 +134,8 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         self.sim_model.last_solve_converged = False
 
         self.ffd_shape = ffd_shape
+        # FFD and mesh warping only when an FFD block is given (see __init__)
+        self.shape_parameterized = ffd_shape is not None
         self.ffd_block_corner_list = ffd_block_corner_list
         self.ffd_degree = ffd_degree
         self.cp_coord_opt_idxs = cp_coord_opt_idxs
@@ -141,6 +170,7 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         self.OUTLET_TAG = 4  # flow outlet
         self.WALL_TAG = 2  # walls (including wing/airfoil boundaries)
         self.SYMMETRY_TAG = 5  # symmetry, only used in 3D thus far
+        self.FARFIELD_TAG = 6  # characteristic far field (farfield="riemann")
 
         # global evaluation index of solve_residual_equations
         self.eval_idx = 0
@@ -174,6 +204,8 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
 
         inlet_facets = (self.mesh.bdry_midpoints[:, 0] <= inlet_outlet_bdry) & ~np.asarray(inner_facets, dtype=bool) & ~np.asarray(symmetry_facets, dtype=bool)
         outlet_facets = (self.mesh.bdry_midpoints[:, 0] > inlet_outlet_bdry) & ~np.asarray(inner_facets, dtype=bool) & ~np.asarray(symmetry_facets, dtype=bool)
+        if self.farfield == "riemann":
+            farfield_facets = inlet_facets | outlet_facets
 
         # Print the local number of facets of each type for each MPI rank
         PETSc.Sys.syncPrint("Rank {}, number of wing boundary facets: {}".format(self.mesh.mesh.comm.Get_rank(), np.count_nonzero(inner_facets)))
@@ -183,7 +215,10 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         PETSc.Sys.syncFlush()
 
         # Pair the boundary facet sets with the various mesh tags
-        bdry_meshtags_and_ds_list = [(inlet_facets, self.INLET_TAG), (outlet_facets, self.OUTLET_TAG), (inner_facets, self.WALL_TAG)]
+        if self.farfield == "riemann":
+            bdry_meshtags_and_ds_list = [(farfield_facets, self.FARFIELD_TAG), (inner_facets, self.WALL_TAG)]
+        else:
+            bdry_meshtags_and_ds_list = [(inlet_facets, self.INLET_TAG), (outlet_facets, self.OUTLET_TAG), (inner_facets, self.WALL_TAG)]
         if self.sim_model.dimensions == 3:
             bdry_meshtags_and_ds_list += [(symmetry_facets, self.SYMMETRY_TAG)]
 
@@ -193,28 +228,34 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
             measure_metadata={'quadrature_degree': 3*self.poly_order + 1})
 
         # The inlet-outlet split above is now frozen in the meshtags; arm the guard in
-        # CompressibleEulerModel.set_angle_of_attack against it.
-        self.sim_model.alpha_tagging = alpha_tagging
+        # CompressibleEulerModel.set_angle_of_attack against it. The
+        # characteristic far field has no split to guard.
+        self.sim_model.alpha_tagging = alpha_tagging if self.farfield == "split" else None
 
-        self.mesh.configure_output(self.filename_suffix, deformation=True)
+        self.mesh.configure_output(self.filename_suffix, deformation=self.shape_parameterized)
 
-        # The JAX-based IDWarp implementation as mesh warper
-        self.mesh_warper = IDWarp_jax(self.mesh, wall_meshtag_val=self.WALL_TAG,
-                                      anchor_meshtag_vals=(self.INLET_TAG, self.OUTLET_TAG))
+        if self.shape_parameterized:
+            # The JAX-based IDWarp implementation as mesh warper
+            anchors = ((self.FARFIELD_TAG,) if self.farfield == "riemann"
+                       else (self.INLET_TAG, self.OUTLET_TAG))
+            self.mesh_warper = IDWarp_jax(self.mesh, wall_meshtag_val=self.WALL_TAG,
+                                          anchor_meshtag_vals=anchors)
 
-        PETSc.Sys.Print("Initialized mesh warping object")
+            PETSc.Sys.Print("Initialized mesh warping object")
 
-        # The lsdo_geo FFD block around the wall nodes. Shape layers
-        # (shape_parameterization.SectionalShape, WallFFD.apply_cp_motions) turn
-        # the design variables into its coefficients; wall_displacement() is the
-        # replicated (M_global, dim) array mesh_warper.evaluate takes, in the
-        # numbering of the mesh's wall node set.
-        wall_nodes = self.mesh.boundary_node_set((self.WALL_TAG,))
-        self.ffd = WallFFD(self.mesh.mesh.comm, wall_nodes.coords,
-                           wall_nodes.global_idx, self.ffd_shape,
-                           degree=self.ffd_degree,
-                           ffd_block_corner_list=self.ffd_block_corner_list,
-                           projection_newton_tol=self.ffd_projection_newton_tol)
+            # The lsdo_geo FFD block around the wall nodes. Shape layers
+            # (shape_parameterization.SectionalShape, WallFFD.apply_cp_motions) turn
+            # the design variables into its coefficients; wall_displacement() is the
+            # replicated (M_global, dim) array mesh_warper.evaluate takes, in the
+            # numbering of the mesh's wall node set.
+            wall_nodes = self.mesh.boundary_node_set((self.WALL_TAG,))
+            self.ffd = WallFFD(self.mesh.mesh.comm, wall_nodes.coords,
+                               wall_nodes.global_idx, self.ffd_shape,
+                               degree=self.ffd_degree,
+                               ffd_block_corner_list=self.ffd_block_corner_list,
+                               projection_newton_tol=self.ffd_projection_newton_tol)
+        else:
+            PETSc.Sys.Print("No FFD block given: fixed mesh, forward flow analysis")
 
         # define the integration measure for the mesh cells and non-boundary facets
         self.mesh.form_manager.build_cell_and_interior_facet_measures(
@@ -235,9 +276,12 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
             xdmf.write_meshtags(self.mesh.meshtags, self.mesh.mesh.geometry)
 
         # Define the boundary condition terms of the Euler weak form
-        self.sim_model.define_subsonic_inflow_bc(self.INLET_TAG)
-        self.sim_model.define_subsonic_outflow_bc(self.OUTLET_TAG)
-        self.sim_model.define_slipwall_bc(self.WALL_TAG)
+        if self.farfield == "riemann":
+            self.sim_model.define_farfield_bc(self.FARFIELD_TAG)
+        else:
+            self.sim_model.define_subsonic_inflow_bc(self.INLET_TAG)
+            self.sim_model.define_subsonic_outflow_bc(self.OUTLET_TAG)
+        self.sim_model.define_wall_bc(self.WALL_TAG)
         if self.sim_model.dimensions == 3:
             self.sim_model.define_slipwall_bc(self.SYMMETRY_TAG)
 
@@ -247,7 +291,10 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         # Define the file names and objects for solution writes to external files for Paraview
         self.sim_model.define_sol_export_files(self.sim_model.functionspaces["V"],
                                                file_name_addendum=self.filename_suffix,
-                                               mesh_deformation=True)
+                                               mesh_deformation=self.shape_parameterized)
+
+        if self.aero_center is None:
+            self.aero_center = np.array([0.25] + [0.0] * (self.sim_model.dimensions - 1))
 
         # We instantiate a separate DG_postprocessor object here so we can print 
         # forces and moments and coefficients after each forward solve
@@ -277,31 +324,68 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
 
         Built on first use. Collective: call it on every rank.
         """
+        if self.ffd is None:
+            raise RuntimeError("wall_geometry needs an FFD block (pass ffd_shape)")
         if self._wall_geometry is None:
             self._wall_geometry = WallGeometry(self.ffd, self.mesh.wall_facets(self.WALL_TAG))
         return self._wall_geometry
 
-    def evaluate(self, mesh_node_motions:csdl.Variable, cp_motion_inputs:csdl.Variable,
-                 alpha:csdl.Variable):
+    def evaluate(self, mesh_node_motions:csdl.Variable = None, cp_motion_inputs:csdl.Variable = None,
+                 alpha:csdl.Variable = None):
+        """
+        The flow state u_vec as a CSDL output.
+
+        Shape optimization (an FFD block was given): evaluate(mesh_node_motions,
+        cp_motion_inputs, alpha). Forward analysis on the fixed mesh:
+        evaluate(alpha=alpha). alpha is always required.
+        """
+        if alpha is None:
+            raise ValueError("evaluate needs alpha")
+        if (mesh_node_motions is None) != (cp_motion_inputs is None):
+            raise ValueError("pass mesh_node_motions and cp_motion_inputs together, or neither")
+        if mesh_node_motions is not None and not self.shape_parameterized:
+            raise ValueError("mesh_node_motions given, but there is no FFD block / mesh warper "
+                             "(pass ffd_shape to DG_windtunnel_model)")
 
         # set inputs using self.declare_input
-        self.declare_input('mesh_node_motions', mesh_node_motions)
-        self.declare_input('cp_motion_inputs', cp_motion_inputs)
+        if mesh_node_motions is not None:
+            self.declare_input('mesh_node_motions', mesh_node_motions)
+            self.declare_input('cp_motion_inputs', cp_motion_inputs)
         self.declare_input('alpha', alpha)
 
         # The output on this rank is only the local portion of the solution vector
         u_vec = self.create_output('u_vec', (self.sim_model.u_vec.x.petsc_vec.local_size,))
 
-        # We have declared cp_motion_inputs as an input here, just for logging and computation purposes,
-        # not because we actually need it; mesh_node_motions carries the effect of the cp_motion_inputs.
-        self.declare_derivative_parameters(of='u_vec', wrt='cp_motion_inputs', dependent=False)
+        if mesh_node_motions is not None:
+            # We have declared cp_motion_inputs as an input here, just for logging and computation purposes,
+            # not because we actually need it; mesh_node_motions carries the effect of the cp_motion_inputs.
+            self.declare_derivative_parameters(of='u_vec', wrt='cp_motion_inputs', dependent=False)
 
         return u_vec
 
+    def solve_forward(self, alpha=None):
+        """
+        One flow solve on the current (undeformed) mesh, without CSDL: set
+        alpha (radians; default: the boundary dictionary's), solve, print the
+        coefficients. Warm-starts from the previous solve. Call set_up_sim()
+        first. Returns (u_vec array, converged, forces), forces being
+        DG_postprocessor.forces_and_coefficients (L, D, M, c_l, c_d, c_m, and
+        the friction drag for a viscous model).
+        """
+        if alpha is not None:
+            self.sim_model.set_angle_of_attack(alpha)
+            self.postprocessor.set_angle_of_attack(alpha)
+        self.sim_model.compute_weakform()
+        solution, converged = self._run_fom_solve()
+        self.sim_model.last_solve_converged = converged
+        if np.isfinite(np.linalg.norm(solution)):
+            self.previous_solution = solution
+        return solution, converged, self.postprocessor.forces_and_coefficients(solution)
+
     def solve_residual_equations(self, input_vals, output_vals):
         # Define inputs
-        mesh_node_motions = input_vals['mesh_node_motions']
-        cp_motion_inputs = input_vals['cp_motion_inputs']
+        mesh_node_motions = input_vals['mesh_node_motions'] if 'mesh_node_motions' in input_vals else None
+        cp_motion_inputs = input_vals['cp_motion_inputs'] if 'cp_motion_inputs' in input_vals else None
         alpha = input_vals['alpha'][0]
 
         # Update the angle of attack to its current value
@@ -310,10 +394,11 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         PETSc.Sys.Print("angle of attack: {} deg".format(np.degrees(alpha)))
         PETSc.Sys.Print("cp motion inputs: {}".format(cp_motion_inputs))
         PETSc.Sys.Print("solve_residual_equations, stepping into mesh.apply_node_motions")
-        PETSc.Sys.Print("mesh_node_motions 2-norm: {}".format(np.linalg.norm(mesh_node_motions)))
+        if mesh_node_motions is not None:
+            PETSc.Sys.Print("mesh_node_motions 2-norm: {}".format(np.linalg.norm(mesh_node_motions)))
 
-        # Apply the mesh node motions to the mesh
-        self.mesh.apply_node_motions(mesh_node_motions)
+            # Apply the mesh node motions to the mesh
+            self.mesh.apply_node_motions(mesh_node_motions)
 
         # If the mesh is not valid (e.g. has inverted cells), set the output to zero and don't run any simulations
         if not self.mesh.is_valid:
@@ -347,7 +432,8 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         PETSc.Sys.Print("Writing aligned output frame at eval_idx {} (FOM solution)".format(
             self.eval_idx))
         # we write the deformation and the solution outputs to the same time step indices
-        self.mesh.write_deformation_output(mesh_node_motions, self.eval_idx)
+        if mesh_node_motions is not None:
+            self.mesh.write_deformation_output(mesh_node_motions, self.eval_idx)
         self.sim_model.write_solution_output(self.eval_idx,
                                              solution_array=solution_output)
 
@@ -417,7 +503,7 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         # Here we solve the adjoint equation when calculating derivatives for optimization
         print("starting apply_inverse_jacobian in DG_windtunnel_model...")
 
-        mesh_node_motions = input_vals['mesh_node_motions'] # numpy array
+        mesh_node_motions = input_vals['mesh_node_motions'] if 'mesh_node_motions' in input_vals else None
         alpha = input_vals['alpha'][0]
         u_vec = outputs['u_vec'] # numpy array
 
@@ -427,11 +513,20 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
             # apply the input mesh node motions to the mesh of the sim model
             # and set the angle of attack before constructing the weak form
             # and the corresponding solution that we are linearizing around
-            PETSc.Sys.Print("apply_inverse_jacobian, stepping into mesh.apply_node_motions")
-            self.mesh.apply_node_motions(mesh_node_motions)
+            if mesh_node_motions is not None:
+                PETSc.Sys.Print("apply_inverse_jacobian, stepping into mesh.apply_node_motions")
+                self.mesh.apply_node_motions(mesh_node_motions)
             self.sim_model.set_angle_of_attack(alpha)
             self.sim_model.compute_weakform()
             self.sim_model.set_u_vec(u_vec)
+
+            if self.sim_model.has_condensed_jacobian:
+                self._condensed_adjoint(d_outputs, d_residuals)
+                self.mesh.reset_nodes()
+                PETSc.garbage_cleanup()
+                PETSc.Sys.Print("apply_inverse_jacobian total time: {}".format(
+                    perf_counter() - pre_apply_inverse_jacobian_time))
+                return
 
             self._drdu_mat = self.sim_model.assemble_dRdu_mat()
             if not hasattr(self, '_d_output_petsc'):
@@ -484,9 +579,10 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
 
             PETSc.Sys.Print("d_residual norm: {}".format(self._d_residual_petsc.norm()))
 
-            PETSc.Sys.Print("mesh_node_motions min, max: {}, {}".format(mesh_node_motions.min(), mesh_node_motions.max()))
+            if mesh_node_motions is not None:
+                PETSc.Sys.Print("mesh_node_motions min, max: {}, {}".format(mesh_node_motions.min(), mesh_node_motions.max()))
+                PETSc.Sys.Print("cp motions: {}".format(input_vals['cp_motion_inputs']))
             PETSc.Sys.Print("alpha: {}".format(np.degrees(alpha)))
-            PETSc.Sys.Print("cp motions: {}".format(input_vals['cp_motion_inputs']))
 
             d_residuals['u_vec'] = self._d_residual_petsc.getArray()
 
@@ -501,12 +597,32 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         else:
             raise ValueError("Reverse mode required")
 
+    def _condensed_adjoint(self, d_outputs, d_residuals):
+        """The adjoint solve for a model whose dR/dU is a condensed product
+        (a reconstructed gradient): the model's own transposed linearized
+        solve (CompressibleEulerModel.solve_linearized)."""
+        A = self.sim_model.assemble_dRdu_mat()
+        rhs, sol = A.createVecLeft(), A.createVecLeft()
+        set_petsc_vec_array(rhs, d_outputs['u_vec'])
+        ksp = self.sim_model.solve_linearized(
+            rhs, sol, transpose=True, prefix="adj_", rtol=self.linear_solver_rtol,
+            atol=self.linear_solver_atol, max_it=self.linear_solver_max_it)
+        rnorm = ksp.getResidualNorm()
+        PETSc.Sys.Print("adj_ solve: {} iterations, residual norm {} [{}]".format(
+            ksp.getIterationNumber(), rnorm, ksp_converged_reason_name(ksp.getConvergedReason())))
+        ksp.destroy()
+        if rnorm > self.linear_residual_accept_limit:
+            raise ValueError(
+                "apply_inverse_jacobian residual norm is too high: {:.6e} > "
+                "linear_residual_accept_limit {:.1e}".format(rnorm, self.linear_residual_accept_limit))
+        d_residuals['u_vec'] = sol.getArray().copy()
+
     def compute_jacvec_product(self, input_vals, outputs, d_inputs, d_outputs, d_residuals, mode):
         # Here we compute the product of the adjoint solution with d_residual
         pre_compute_jacvec_product_time = perf_counter()
         print("starting compute_jacvec_product in DG_windtunnel_model...")
 
-        mesh_node_motions = input_vals['mesh_node_motions'] # numpy array
+        mesh_node_motions = input_vals['mesh_node_motions'] if 'mesh_node_motions' in input_vals else None
         alpha = input_vals['alpha'][0]
         u_vec = outputs['u_vec'] # numpy array
 
@@ -515,8 +631,9 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
 
             # apply the input mesh node motions to the mesh of the sim model,
             # apply the angle of attack and compute the weak form
-            PETSc.Sys.Print("compute_jacvec_product, stepping into mesh.apply_node_motions")
-            self.mesh.apply_node_motions(mesh_node_motions)
+            if mesh_node_motions is not None:
+                PETSc.Sys.Print("compute_jacvec_product, stepping into mesh.apply_node_motions")
+                self.mesh.apply_node_motions(mesh_node_motions)
             self.sim_model.set_angle_of_attack(alpha)
             self.sim_model.compute_weakform()
 
