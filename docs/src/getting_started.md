@@ -51,9 +51,13 @@ thread per core in every MPI rank and stalls the linear solves.
 ```sh
 $ OMP_NUM_THREADS=1 pytest
 ```
-The tests in `tests/` cover the boundary/interior integration measures and the shape parameterization.
-One test re-runs its file under `mpirun -n 3`, so `mpirun` and `pytest` must be available in the same
-environment; without `mpirun` that test is skipped.
+The tests in `tests/` cover the boundary/interior integration measures, the shape parameterization, the
+default Euler discretization against a stored reference (`tests/data/euler_reference.npz`), the RANS model
+(closures, Green-Gauss reconstruction, exact Jacobian and adjoint derivatives against finite differences, a
+manufactured-solution convergence rate), time integration, checkpoints and the far fields. They build their
+meshes in-process and take about a minute, most of it the first just-in-time compilation of the forms.
+Some tests re-run their files under `mpirun -n 3`, so `mpirun` and `pytest` must be available in the same
+environment; without `mpirun` those tests are skipped.
 
 ## Building the documentation
 ```sh

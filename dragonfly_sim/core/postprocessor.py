@@ -15,7 +15,7 @@ from dragonfly_sim.utils.Euler_utils import pressure
 class DG_postprocessor(csdl.CustomExplicitOperation):
     ordered_callbacks = True    # as DG_windtunnel_model: collectives and the shared mesh
 
-    def __init__(self, Mesh_obj, sim_model, wall_meshtag_val, aero_center,
+    def __init__(self, Mesh_obj, sim_model, wall_meshtag_val, aero_center=None,
                  ref_area_dim=None, ref_chord_dim=None, testing_mode=False,
                  linear_solver_rtol=1e-16, linear_solver_atol=1e-11,
                  linear_solver_max_it=1000, linear_residual_accept_limit=1e-10,
@@ -37,7 +37,10 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
         # False to skip it and report nan.
         self.log_cm_alpha = True
         self.wall_meshtag_val = wall_meshtag_val
-        self.aero_center = dolfinx.fem.Constant(self.mesh_obj.mesh, aero_center)
+        if aero_center is None:
+            # quarter chord of a unit chord at the origin
+            aero_center = np.array([0.25] + [0.0] * (sim_model.dimensions - 1))
+        self.aero_center = dolfinx.fem.Constant(self.mesh_obj.mesh, np.asarray(aero_center, dtype=np.double))
 
         # Reference quantities
         self.ref_area_dim = ref_area_dim  # reference area (if None, set to 1 in 2D and computed planform area in 3D)
@@ -128,7 +131,13 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
         self.psi_lift.value = lift_unit_vec
 
     def _pressure_force_vector(self, u_dof_vec):
+        """The force density on the wall: pressure, plus the viscous traction
+        for a viscous model (sim_model.wall_force_density)."""
         self.sim_model.set_u_vec(u_dof_vec)
+        if self.sim_model.derived_fields:
+            # the viscous traction reads the reconstructed gradient
+            self.sim_model.update_derived_fields()
+            return self.sim_model.wall_force_density(self.sim_model.u_vec, self.mesh_obj.n)
         p = pressure(self.sim_model.u_vec, self.sim_model.gamma)
         return p*self.mesh_obj.n
 
@@ -140,6 +149,13 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
         return raw_val, coeff_val
 
     def _assemble_state_derivative(self, form, label):
+        if self.sim_model.derived_fields:
+            # total derivative through the reconstructed gradient
+            vec = self.sim_model.state_derivative(form)
+            PETSc.Sys.Print("{} norm: {}".format(label, vec.norm()))
+            out = vec.getArray().copy()
+            vec.destroy()
+            return out
         d_duvec = ufl.derivative(form, self.sim_model.u_vec)
         d_duvec_vec = dolfinx.fem.petsc.assemble_vector(dolfinx.fem.form(d_duvec))
         d_duvec_vec.assemble()
@@ -151,6 +167,15 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
         return output_vec
 
     def _assemble_mesh_derivative(self, form, label):
+        if self.sim_model.derived_fields:
+            # total derivative through the derived fields (gradient, cell
+            # centres, wall distance)
+            dK = self.sim_model.mesh_derivative(form)
+            PETSc.Sys.Print("{} norm: {}".format(label, dK.norm()))
+            d_dmesh = dK.getArray().copy()
+            dK.destroy()
+            return (self.mesh_obj.dof_to_node_map.T @ d_dmesh.reshape(-1, self.mesh_obj.mesh.geometry.dim)).flatten()
+
         spatial_coordinate = ufl.SpatialCoordinate(self.mesh_obj.mesh)
 
         args = form.arguments()
@@ -221,6 +246,24 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
         # NOTE: this quantity is not used in the optimization, and is merely present as a logging output
         local_size = self.sim_model.u_vec.x.petsc_vec.local_size
 
+        if self.sim_model.has_condensed_jacobian:
+            # condensed dR/dU: the model's own linearized solve
+            self.sim_model.set_u_vec(u_dof_vec)
+            dr_dalpha = self.sim_model.assemble_dRdalpha_vec()
+            A = self.sim_model.assemble_dRdu_mat()
+            rhs, sol = A.createVecRight(), A.createVecRight()
+            set_petsc_vec_array(rhs, -dr_dalpha.getArray()[:local_size])
+            ksp = self.sim_model.solve_linearized(
+                rhs, sol, prefix="tangent_", rtol=self.linear_solver_rtol,
+                atol=self.linear_solver_atol, max_it=self.linear_solver_max_it)
+            PETSc.Sys.Print("tangent_ solve: {} iterations, residual norm {} [{}]".format(
+                ksp.getIterationNumber(), ksp.getResidualNorm(),
+                ksp_converged_reason_name(ksp.getConvergedReason())))
+            ksp.destroy()
+            dcm_du = self.compute_cm_deriv(u_dof_vec)
+            local_contribution = float(np.dot(dcm_du, sol.getArray()[:local_size]))
+            return self.mesh_obj.mesh.comm.allreduce(local_contribution, op=MPI.SUM)
+
         drdu_mat = self.sim_model.assemble_dRdu_mat(u_dof_vec)
         dr_dalpha = self.sim_model.assemble_dRdalpha_vec(u_dof_vec)
 
@@ -257,14 +300,48 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
         local_contribution = float(np.dot(dcm_du, self._tangent_sol.getArray()[:local_size]))
         return self.mesh_obj.mesh.comm.allreduce(local_contribution, op=MPI.SUM)
 
+    def forces_and_coefficients(self, u_dof_vec=None, alpha=None):
+        """
+        Lift, drag and pitching moment and their coefficients of a flow state,
+        outside any CSDL graph: no FFD block, mesh motion or recorder needed.
+
+        u_dof_vec: the owned state entries (default: the model's current
+        u_vec); alpha: angle of attack in radians (default: the model's). For a
+        viscous model, D_friction / c_d_friction is the part of the drag from
+        the viscous wall traction. Collective. Returns a dict.
+        """
+        if u_dof_vec is None:
+            u_dof_vec = self.sim_model.u_vec.x.petsc_vec.getArray().copy()
+        if alpha is not None:
+            self.set_angle_of_attack(alpha)
+        self.refresh_geometry_dependent_reference_quantities()
+        L, c_l = self.compute_cl(u_dof_vec)
+        D, c_d = self.compute_cd(u_dof_vec)
+        M, c_m = self.compute_cm(u_dof_vec)
+        out = dict(L=L, D=D, M=M, c_l=c_l, c_d=c_d, c_m=c_m)
+        if getattr(self.sim_model, "wall_traction", None) is not None:
+            # drag of the viscous traction alone
+            self.sim_model.set_u_vec(u_dof_vec)
+            self.sim_model.update_derived_fields()
+            t = self.sim_model.wall_traction(self.sim_model.u_vec, self.mesh_obj.n)
+            form = ufl.dot(self.psi_drag, t) * self.mesh_obj.form_manager.ds(self.wall_meshtag_val)
+            out["D_friction"], out["c_d_friction"] = self._assemble_value_and_coefficient(form, self.C_infty)
+        return out
+
     def compute_M_meshderiv(self, u_dof_vec):
         moment = self.compute_moment_form(u_dof_vec)
         return self._assemble_mesh_derivative(moment, "dM_dmesh")
 
-    def evaluate(self, u_vec, mesh_deformation, alpha, shape_param_inputs=None):
+    def evaluate(self, u_vec, mesh_deformation=None, alpha=None, shape_param_inputs=None):
+        """Forces and coefficients of the state u_vec. mesh_deformation is the
+        volume mesh motion of a shape optimization; leave it out (None) for a
+        forward analysis on the fixed mesh. alpha is required."""
+        if alpha is None:
+            raise ValueError("evaluate needs alpha")
         # declare input quantities
         self.declare_input('u_vec', u_vec)
-        self.declare_input('mesh_deformation', mesh_deformation)
+        if mesh_deformation is not None:
+            self.declare_input('mesh_deformation', mesh_deformation)
         self.declare_input('alpha', alpha)
         if shape_param_inputs is not None:
             self.declare_input('shape_param_inputs', shape_param_inputs)
@@ -280,7 +357,7 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
 
         # Force and moment coefficients (and derivatives) are only used as monitoring outputs;
         # to avoid CSDL from computing its derivatives we set these to zero
-        for _input_name in ('u_vec', 'mesh_deformation', 'alpha'):
+        for _input_name in ('u_vec', 'alpha') + (('mesh_deformation',) if mesh_deformation is not None else ()):
             for _output_name in ('c_l', 'c_d', 'c_m', 'c_m_alpha'):
                 self.declare_derivative_parameters(of=_output_name, wrt=_input_name, dependent=False)
         if shape_param_inputs is not None:
@@ -305,13 +382,14 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
 
         u_vec = input_vals['u_vec']
         alpha = input_vals['alpha'][0]
-        deform_array = input_vals['mesh_deformation']
+        deform_array = input_vals['mesh_deformation'] if 'mesh_deformation' in input_vals else None
 
         # Update the angle of attack and downstream quantities
         self.set_angle_of_attack(alpha)
 
-        # Apply the mesh deformations to the mesh
-        self.mesh_obj.apply_node_motions(deform_array)
+        # Apply the mesh deformations to the mesh (none in a forward analysis)
+        if deform_array is not None:
+            self.mesh_obj.apply_node_motions(deform_array)
 
         # check whether the mesh and solution on it are valid
         if (self.mesh_obj.is_valid and self.sim_model.last_solve_converged and not np.isnan(np.linalg.norm(u_vec))) or self.testing_mode:
@@ -354,13 +432,14 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
 
         u_vec = input_vals['u_vec']
         alpha = input_vals['alpha'][0]
-        deform_array = input_vals['mesh_deformation']
+        deform_array = input_vals['mesh_deformation'] if 'mesh_deformation' in input_vals else None
 
         # Update the angle of attack and downstream quantities
         self.set_angle_of_attack(alpha)
 
         # Apply the mesh deformations to the mesh and update geometry-dependent quantities
-        self.mesh_obj.apply_node_motions(deform_array)
+        if deform_array is not None:
+            self.mesh_obj.apply_node_motions(deform_array)
         self.refresh_geometry_dependent_reference_quantities()
 
         # Compute all force and moment derivatives w.r.t. the nondimensional state and mesh vertex movement
@@ -368,9 +447,10 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
         derivatives['D', 'u_vec'] = self.compute_D_deriv(u_vec)[None, :]
         derivatives['M', 'u_vec'] = self.compute_M_deriv(u_vec)[None, :]
 
-        derivatives['L', 'mesh_deformation'] = self.compute_L_meshderiv(u_vec)[None, :]
-        derivatives['D', 'mesh_deformation'] = self.compute_D_meshderiv(u_vec)[None, :]
-        derivatives['M', 'mesh_deformation'] = self.compute_M_meshderiv(u_vec)[None, :]
+        if deform_array is not None:
+            derivatives['L', 'mesh_deformation'] = self.compute_L_meshderiv(u_vec)[None, :]
+            derivatives['D', 'mesh_deformation'] = self.compute_D_meshderiv(u_vec)[None, :]
+            derivatives['M', 'mesh_deformation'] = self.compute_M_meshderiv(u_vec)[None, :]
 
         # Compute the force derivatives w.r.t. angle of attack changes; the arithmetic for this looks odd but the math checks out
         L_val, _ = self.compute_cl(u_vec)

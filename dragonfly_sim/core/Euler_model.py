@@ -11,15 +11,58 @@ from dragonfly_sim.utils.petsc_utils import set_petsc_vec_array
 from dragonfly_sim.utils.solver_utils import (locate_positivity_limiting_nodes, ksp_converged_reason_name,
                                               ksp_norm_type_name, ksp_pc_side_name)
 from dragonfly_sim.core.form_manager import FormManager
-from dragonfly_sim.utils.Euler_utils import pressure, energy_density, flux, subsonic_inflow_state, subsonic_outflow_state, slip_wall_state, hll_flux, boundary_flux
+from dragonfly_sim.utils.Euler_utils import primitives, pressure, energy_density, flux, subsonic_inflow_state, subsonic_outflow_state, slip_wall_state, hll_flux, boundary_flux
+from dragonfly_sim.utils.NS_utils import (mean_flow, concat_state, extended_flux, extended_normal_flux,
+                                          extended_hll_flux, extended_boundary_flux)
+from dragonfly_sim.utils.farfield_utils import riemann_farfield_state
 from dragonfly_sim.utils.filewriter import FileWriter
 
 
 class CompressibleEulerModel():
     """
+    The p = 0 DG (cell-centred finite-volume) compressible Euler model, and
+    the host every other flow model in the package is built on.
 
+    State: the conservative mean flow (rho, rho u, rho E), n_mean = 2 + dim
+    components per cell, optionally followed by `extra_variables`
+    transported scalars (n_state components in all). The scalars are
+    convected with the mean flow (NS_utils.extended_flux) and are not
+    positivity-limited. With no extra variables every form below is the
+    plain Euler one.
+
+    Plug-in points. CompressibleRANSModel fills these; for the plain Euler
+    model they are all empty or None, and the residual, Jacobian and
+    derivative forms are the same expressions as without them.
+
+        face_traces         () -> (U+, U-) interior-facet traces of the
+                            inviscid flux (MUSCL reconstruction)
+        residual_terms      callables () -> UFL form added to the residual
+        boundary_terms      callables (U_b, tag, kind) -> UFL form or None,
+                            added to every boundary condition
+        boundary_scalars    (kind, U, inflow) -> list of the extra variables'
+                            boundary values (kind: inflow, outflow, slip,
+                            farfield, wall); required when n_extra > 0
+        freestream_scalars  () -> list of the extra variables' free-stream values
+        wall_bc             (tag) -> None, replaces the slip wall in define_wall_bc
+        wall_traction       (U, n) -> traction added to p n in wall_force_density
+        time_scale_terms    callables (U) -> added to the PTC inverse time scale
+        derived_fields      DerivedField objects (utils/derived_fields.py):
+                            fields the residual reads that are not unknowns
+                            (a reconstructed gradient, cell centres, the wall
+                            distance). Every derivative assembler adds their
+                            chain-rule terms.
+        problem_factory     (F, J) -> nonlinear problem, replacing
+                            NonlinearProblem_mod in set_up_solver
+
+    Every boundary condition records (U_b, tag, kind) in boundary_states.
+
+    Time integration (core/time_integration.py): use_ptc makes solve_system
+    a pseudo-transient continuation solve; enable_time_stepping() adds a
+    BDF physical time term for unsteady runs. Both live in newton_forms()
+    only, so self.F stays the steady residual that the adjoint
+    differentiates.
     """
-    def __init__(self, mesh, poly_order=0, gamma=1.4, flux_function=hll_flux):  # llf_flux  # hll_flux
+    def __init__(self, mesh, poly_order=0, gamma=1.4, flux_function=hll_flux, extra_variables=()):  # llf_flux  # hll_flux
         if poly_order > 0:
             raise ValueError("This release only support 0th-order DG bases for now")
 
@@ -29,6 +72,46 @@ class CompressibleEulerModel():
         self.dimensions = self.mesh_obj.mesh._ufl_domain._geometric_dimension
 
         self.flux_function = flux_function
+
+        # State layout: mean flow, then the transported scalars
+        self.extra_variables = tuple(extra_variables)
+        self.n_mean = 2 + self.dimensions
+        self.n_extra = len(self.extra_variables)
+        self.n_state = self.n_mean + self.n_extra
+        if self.n_extra and flux_function is not hll_flux:
+            raise NotImplementedError(
+                "Extra transported variables need the HLL flux (NS_utils.extended_hll_flux); "
+                "the other Riemann fluxes have no extended-state version.")
+
+        # Plug-in points (see the class docstring); all inert by default
+        self.boundary_states = []
+        self.face_traces = None
+        self.residual_terms = []
+        self.boundary_terms = []
+        self.boundary_scalars = None
+        self.freestream_scalars = None
+        self.wall_bc = None
+        self.wall_traction = None
+        self.time_scale_terms = []
+        self.derived_fields = []
+        self.problem_factory = None
+
+        # Time integration (core/time_integration.py). time_integrator is
+        # created by set_up_solver when use_ptc is set or by
+        # enable_time_stepping(); ptc_settings are CFLController keywords.
+        self.use_ptc = False
+        self.ptc_settings = {}
+        self.time_integrator = None
+        self._time_stepping = None
+        # Smallest positivity step length applied since the caller last
+        # reset it; the PTC CFL law reads it.
+        self.last_step_theta = 1.0
+
+        # Krylov solver of the Newton steps (see apply_krylov_solver_settings);
+        # direct_linear_solver switches every linear solve to MUMPS.
+        self.krylov_type = "gmres"
+        self.krylov_diagonal_scale = True
+        self.direct_linear_solver = False
 
         # Instantiate the FormManager
         self.forms = FormManager(mesh, model=self,
@@ -95,7 +178,7 @@ class CompressibleEulerModel():
 
         u_vec must already hold the state being exported.
         """
-        p_expr = dolfinx.fem.Expression(pressure(self.u_vec, self.gamma), self.functionspaces["V_scalar"].element.interpolation_points)
+        p_expr = dolfinx.fem.Expression(pressure(self.mean_flow(self.u_vec), self.gamma), self.functionspaces["V_scalar"].element.interpolation_points)
         self.pressure_func.interpolate(p_expr)
 
         solution_writer.interpolate_and_write(self.u_vec, write_counter=write_counter)
@@ -125,7 +208,7 @@ class CompressibleEulerModel():
     def define_elements_functionspaces(self):
         # Throughout this class we need access to various function spaces; this is where we define them
         self.functionspaces = {
-            "V": dolfinx.fem.functionspace(self.mesh_obj.mesh, ("DG", self.poly_order, (2 + self.dimensions,))),
+            "V": dolfinx.fem.functionspace(self.mesh_obj.mesh, ("DG", self.poly_order, (self.n_state,))),
             "V_scalar": dolfinx.fem.functionspace(self.mesh_obj.mesh, ("DG", self.poly_order)),
         }
 
@@ -238,6 +321,13 @@ class CompressibleEulerModel():
         rho_in = dolfinx.fem.Constant(self.mesh_obj.mesh, inlet_conditions['rho'])
         rhoE_in_guess = energy_density(inlet_conditions['p'], rho_in, inlet_conditions['u'], self.gamma)        
         self.initial_conditions = ufl.as_vector((rho_in, *[rho_in*inlet_conditions['u'][i] for i in range(self.dimensions)], rhoE_in_guess))
+        if self.n_extra:
+            # plain numbers become Constants on this mesh, so the initial
+            # condition stays interpolable
+            extras = [v if isinstance(v, ufl.core.expr.Expr)
+                      else dolfinx.fem.Constant(self.mesh_obj.mesh, float(v))
+                      for v in self._freestream_scalars()]
+            self.initial_conditions = concat_state(self.initial_conditions, extras)
 
     def interpolate_solution_vector(self, interpolant=None):
         if interpolant is None:
@@ -248,46 +338,156 @@ class CompressibleEulerModel():
         else:
             for j in range(interpolant.ufl_shape[0]):
                 self.u_vec.sub(j).interpolate(
-                    dolfinx.fem.Expression(interpolant[j], self.functionspaces['V'].sub(j).element.interpolation_points))
+                    dolfinx.fem.Expression(interpolant[j], self.functionspaces['V'].sub(j).element.interpolation_points,
+                                           comm=self.mesh_obj.mesh.comm))
 
         self.u_vec.x.scatter_forward()
+
+    # ------------------------------------------------------------------
+    # State layout
+    # ------------------------------------------------------------------
+    def mean_flow(self, U):
+        """The mean-flow slice (rho, rho u, rho E) of a state expression."""
+        return mean_flow(U, self.n_mean)
+
+    def _freestream_scalars(self):
+        if self.freestream_scalars is None:
+            raise RuntimeError("{} extra variables but no freestream_scalars plug-in".format(self.n_extra))
+        return list(self.freestream_scalars())
+
+    def _boundary_state(self, U_b_mean, kind, inflow=None):
+        """The full boundary state: the mean-flow state and, with extra
+        variables, their values from the boundary_scalars plug-in."""
+        if not self.n_extra:
+            return U_b_mean
+        if self.boundary_scalars is None:
+            raise RuntimeError("{} extra variables but no boundary_scalars plug-in".format(self.n_extra))
+        return concat_state(U_b_mean, list(self.boundary_scalars(kind, self.u_vec, inflow)))
+
+    # ------------------------------------------------------------------
+    # Boundary conditions
+    # ------------------------------------------------------------------
+    def add_boundary_condition(self, meshtag, U_b, kind, inviscid_flux="llf"):
+        """
+        Weakly impose the boundary state U_b on ds(meshtag) and register it.
+
+        inviscid_flux="llf" is the one-sided Lax-Friedrichs boundary flux
+        against U_b (Euler_utils.boundary_flux); "exact" is the physical flux
+        of U_b itself, for states that already carry the upwinding (the
+        characteristic far field) or that must have no mass flux (no-slip
+        wall). The boundary_terms plug-ins add their terms (e.g. viscous
+        fluxes) to the same integral.
+        """
+        U, n = self.u_vec, self.mesh_obj.n
+        if inviscid_flux == "llf":
+            if self.n_extra:
+                f = extended_boundary_flux(U, U_b, n, self.gamma, self.n_mean)
+            else:
+                f = boundary_flux(U, U_b, n, self.gamma)
+        elif inviscid_flux == "exact":
+            f = extended_normal_flux(U_b, n, self.gamma, self.n_mean)
+        else:
+            raise ValueError("inviscid_flux must be 'llf' or 'exact'")
+        F = ufl.inner(f, self.v_vec) * self.forms.ds(meshtag)
+        for term in self.boundary_terms:
+            extra = term(U_b, meshtag, kind)
+            if extra is not None:
+                F = F + extra
+        self.bcs += [F]
+        self.boundary_states.append((U_b, meshtag, kind))
 
     def define_subsonic_inflow_bc(self, meshtag):
         # define the weak form term for natural enforcement of the inflow boundary condition 
         inlet_conditions = self.boundary_conditions['inlet']
-        inflow = subsonic_inflow_state(self.u_vec, inlet_conditions['rho'], inlet_conditions['u'], self.gamma)
-
-        flux_in = boundary_flux(self.u_vec, inflow, self.mesh_obj.n, self.gamma)
-        F_in = ufl.inner(flux_in, self.v_vec) * self.forms.ds(meshtag)
-
-        self.bcs += [F_in]
+        inflow = subsonic_inflow_state(self.mean_flow(self.u_vec), inlet_conditions['rho'], inlet_conditions['u'], self.gamma)
+        self.add_boundary_condition(meshtag, self._boundary_state(inflow, "inflow"), "inflow")
 
     def define_subsonic_outflow_bc(self, meshtag):
         # define the weak form term for natural enforcement of the outflow boundary condition
         outlet_conditions = self.boundary_conditions['outlet']
-        # outflow = dolfin_dg.aero.subsonic_outflow(outlet_conditions['p'], self.u_vec, self.gamma)
-        outflow = subsonic_outflow_state(self.u_vec, outlet_conditions['p'], self.gamma)
-
-        flux_out = boundary_flux(self.u_vec, outflow, self.mesh_obj.n, self.gamma)
-        F_out = ufl.inner(flux_out, self.v_vec) * self.forms.ds(meshtag)
-
-        self.bcs += [F_out]
+        outflow = subsonic_outflow_state(self.mean_flow(self.u_vec), outlet_conditions['p'], self.gamma)
+        self.add_boundary_condition(meshtag, self._boundary_state(outflow, "outflow"), "outflow")
 
     def define_slipwall_bc(self, meshtag):
         # define the weak form term for natural enforcement of the slip wall boundary condition
-        u_wall = slip_wall_state(self.u_vec, self.mesh_obj.n)
+        u_wall = slip_wall_state(self.mean_flow(self.u_vec), self.mesh_obj.n)
+        self.add_boundary_condition(meshtag, self._boundary_state(u_wall, "slip"), "slip")
 
-        flux_wall = boundary_flux(self.u_vec, u_wall, self.mesh_obj.n, self.gamma)
-        F_wall = ufl.inner(flux_wall, self.v_vec) * self.forms.ds(meshtag)
-        self.bcs += [F_wall]
+    def define_wall_bc(self, meshtag):
+        """The wall of the body: a slip wall, unless a wall_bc plug-in
+        (e.g. the RANS model's no-slip wall) replaces it."""
+        if self.wall_bc is not None:
+            self.wall_bc(meshtag)
+        else:
+            self.define_slipwall_bc(meshtag)
+
+    def define_farfield_bc(self, meshtag, transverse=None):
+        """
+        Characteristic (Riemann-invariant) far field on ds(meshtag), meant
+        for the whole outer boundary in place of the inflow/outflow split.
+        Outgoing acoustic waves leave the domain (exactly at normal incidence)
+        instead of reflecting off a fixed state. The inviscid flux is the
+        physical flux of the characteristic state, which already carries the
+        upwinding; extra variables take their free-stream values where the
+        flow enters and the interior values where it leaves.
+
+        `transverse` (core/farfield.py:TransverseFarfield) adds the
+        transverse correction to the incoming invariant: the 'riemann2' far
+        field of unsteady runs.
+
+        The state depends on alpha through the free-stream velocity, so
+        dR/dalpha follows automatically.
+        """
+        inlet = self.boundary_conditions['inlet']
+        R_in = None if transverse is None else transverse.R_in
+        U_b, inflow = riemann_farfield_state(self.mean_flow(self.u_vec), self.mesh_obj.n,
+                                             inlet['rho'], inlet['u'], inlet['p'], self.gamma,
+                                             R_in=R_in)
+        self.add_boundary_condition(meshtag, self._boundary_state(U_b, "farfield", inflow),
+                                    "farfield", inviscid_flux="exact")
+        if transverse is not None:
+            self.transverse_farfield = transverse
 
     def compute_interior_integral_terms(self):
-        F_vol = ufl.inner(ufl.grad(self.v_vec), flux(self.u_vec, self.gamma)) * self.forms.dx
+        if not self.n_extra and self.face_traces is None and not self.residual_terms:
+            # the plain Euler residual, written exactly as it always was
+            F_vol = ufl.inner(ufl.grad(self.v_vec), flux(self.u_vec, self.gamma)) * self.forms.dx
 
-        F_int = ufl.inner(
-            self.flux_function(self.u_vec('+'), self.u_vec('-'), self.mesh_obj.n('+'), self.gamma),
-            self.v_vec('+') - self.v_vec('-')) * self.forms.dS
-        return -F_vol + F_int
+            F_int = ufl.inner(
+                self.flux_function(self.u_vec('+'), self.u_vec('-'), self.mesh_obj.n('+'), self.gamma),
+                self.v_vec('+') - self.v_vec('-')) * self.forms.dS
+            return -F_vol + F_int
+
+        U, v, n = self.u_vec, self.v_vec, self.mesh_obj.n
+        F = -ufl.inner(ufl.grad(v), extended_flux(U, self.gamma, self.n_mean)) * self.forms.dx
+        U_p, U_m = self.face_traces() if self.face_traces is not None else (U('+'), U('-'))
+        if self.n_extra:
+            F_num = extended_hll_flux(U_p, U_m, n('+'), self.gamma, self.n_mean)
+        else:
+            F_num = self.flux_function(U_p, U_m, n('+'), self.gamma)
+        F += ufl.inner(F_num, v('+') - v('-')) * self.forms.dS
+        for term in self.residual_terms:
+            F += term()
+        return F
+
+    def _lambda_max_expr(self, U):
+        """The largest wave speed |u| + c of the state U (mean flow), with rho
+        and p floored as in Euler_utils.signed_wave_speeds."""
+        U = self.mean_flow(U)
+        rho, u_vel, _ = primitives(U)
+        p = pressure(U, self.gamma)
+        rho_safe = ufl.max_value(rho, 1e-8)
+        p_safe = ufl.max_value(p, 1e-8)
+        c = ufl.sqrt(self.gamma * p_safe / rho_safe)
+        return ufl.sqrt(ufl.dot(u_vel, u_vel)) + c
+
+    def wall_force_density(self, U, n):
+        """Force per unit wall area on the body: pressure, plus the
+        wall_traction plug-in's viscous traction when there is one."""
+        f = pressure(self.mean_flow(U), self.gamma) * n
+        if self.wall_traction is not None:
+            f = f + self.wall_traction(U, n)
+        return f
 
     def assemble_dRdalpha_vec(self, u_vec_entries=None):
         """
@@ -315,6 +515,13 @@ class CompressibleEulerModel():
         if u_vec_entries is not None:
             self.set_u_vec(u_vec_entries)
 
+        if self.derived_fields:
+            self.update_derived_fields()
+            if not hasattr(self, 'dRdalpha_vec'):
+                self.dRdalpha_vec = dolfinx.fem.petsc.create_vector(
+                    dolfinx.fem.extract_function_spaces(self.F_physical_form))
+            return self._chain.residual_alpha(self.F, "F", self.dRdalpha_vec)
+
         if not hasattr(self, 'dRdalpha_form'):
             self.dRdalpha_form = dolfinx.fem.form(
                 ufl.diff(self.F, self.alpha_var))
@@ -330,6 +537,10 @@ class CompressibleEulerModel():
         return self.dRdalpha_vec
 
     def compute_weakform(self):
+        if self.derived_fields and not getattr(self, "_geometry_listener_added", False):
+            # derived fields follow the mesh through every node motion
+            self.mesh_obj.add_geometry_listener(self.update_geometry_fields)
+            self._geometry_listener_added = True
         if self.F is not None and self.J is not None:
             return
 
@@ -342,12 +553,51 @@ class CompressibleEulerModel():
 
         self.J = self.compute_dRdu_mat()
 
+    # ------------------------------------------------------------------
+    # Time integration
+    # ------------------------------------------------------------------
+    def enable_time_stepping(self, dual_time=False):
+        """
+        Add the BDF physical time term to the Newton forms (and, with
+        dual_time, the pseudo-time term as well). Call before set_up_solver.
+        Returns the model's TimeIntegrator.
+        """
+        if self.solver_is_set_up:
+            raise RuntimeError("enable_time_stepping must be called before set_up_solver")
+        self._time_stepping = {"dual_time": bool(dual_time)}
+        return self._make_time_integrator()
+
+    def _make_time_integrator(self):
+        from dragonfly_sim.core.time_integration import TimeTerm, TimeIntegrator
+        if self.time_integrator is None:
+            physical = self._time_stepping is not None
+            pseudo = self.use_ptc or (physical and self._time_stepping["dual_time"])
+            if physical or pseudo:
+                self.time_integrator = TimeIntegrator(self, TimeTerm(self, physical=physical, pseudo=pseudo))
+        return self.time_integrator
+
+    def newton_forms(self):
+        """
+        The residual/Jacobian pair Newton drives: model.F with the time
+        terms the model uses (core/time_integration.py). Without PTC or time
+        stepping this is (self.F, self.J), the plain steady solve.
+        """
+        integrator = self._make_time_integrator()
+        if integrator is None:
+            return self.F, self.J
+        F = integrator.term.augment(self.F)
+        return F, ufl.derivative(F, self.u_vec)
+
     def set_up_solver(self):
         if not self.solver_is_set_up:
             mat_type = "baij"
-            self.problem = NonlinearProblem_mod(self.F, self.J, self.u_vec,
-                                                jit_options={"cffi_extra_compile_args": ["-O3", "-march=native", "-ffast-math"]},
-                                                mat_type=mat_type)
+            F_newton, J_newton = self.newton_forms()
+            if self.problem_factory is not None:
+                self.problem = self.problem_factory(F_newton, J_newton)
+            else:
+                self.problem = NonlinearProblem_mod(F_newton, J_newton, self.u_vec,
+                                                    jit_options={"cffi_extra_compile_args": ["-O3", "-march=native", "-ffast-math"]},
+                                                    mat_type=mat_type)
             self.solver = SNESNewtonSolver(self.mesh_obj.mesh.comm, self.problem)
             self.solver.convergence_criterion = "incremental"  # convergence is determined through the norm of the iterative solution update
             self.solver.rtol = 1e-6
@@ -384,9 +634,14 @@ class CompressibleEulerModel():
                     initial_theta = 0.
 
                 from dragonfly_sim.utils.solver_utils import compute_positivity_preserving_theta
-                bs = 2 + self.dimensions
+                bs = self.n_state
 
-                theta = compute_positivity_preserving_theta(self.mesh_obj.mesh.comm, x.array, dx.array, gamma=self.gamma, initial_theta=initial_theta, block_size=bs)
+                if self.n_extra:
+                    theta = compute_positivity_preserving_theta(self.mesh_obj.mesh.comm, x.array, dx.array, gamma=self.gamma, initial_theta=initial_theta, block_size=bs,
+                                                                n_mean=self.n_mean)
+                else:
+                    theta = compute_positivity_preserving_theta(self.mesh_obj.mesh.comm, x.array, dx.array, gamma=self.gamma, initial_theta=initial_theta, block_size=bs)
+                self.last_step_theta = min(self.last_step_theta, theta)
 
                 # Print (density and pressure) positivity-preserving under-relaxation summary
                 PETSc.Sys.Print("dx norm: {}; Initial theta: {}, theta applied: {}".format(dx_norm, initial_theta, theta))
@@ -444,12 +699,19 @@ class CompressibleEulerModel():
             opts[f"{option_prefix}ksp_converged_reason"] = ""
             opts[f"{option_prefix}ksp_monitor"] = ""
 
+        if self.direct_linear_solver:
+            opts[f"{option_prefix}ksp_type"] = "preonly"
+            opts[f"{option_prefix}pc_type"] = "lu"
+            opts[f"{option_prefix}pc_factor_mat_solver_type"] = "mumps"
+            ksp.setFromOptions()
+            return
+
         # Plain gmres, not fgmres: fgmres only earns its double vector
         # storage when the preconditioner itself varies iteration to
         # iteration (e.g. an inner Krylov solve run to a loose, changing
         # tolerance). The PC configured below (ASM+ILU) is fixed, so
         # fgmres was paying for flexibility nothing here uses.
-        opts[f"{option_prefix}ksp_type"] = "gmres"
+        opts[f"{option_prefix}ksp_type"] = self.krylov_type
         opts[f"{option_prefix}ksp_max_it"] = "{}".format(max_it)
         opts[f"{option_prefix}ksp_rtol"] = rtol
         if atol is not None:
@@ -482,16 +744,19 @@ class CompressibleEulerModel():
         # ("natural", i.e. no reordering, per that log's ksp_view).
         opts[f"{option_prefix}sub_pc_factor_mat_ordering_type"] = "rcm"
 
-        opts[f"{option_prefix}ksp_diagonal_scale"] = ""
-        opts[f"{option_prefix}ksp_diagonal_scale_fix"] = ""
+        if self.krylov_diagonal_scale:
+            opts[f"{option_prefix}ksp_diagonal_scale"] = ""
+            opts[f"{option_prefix}ksp_diagonal_scale_fix"] = ""
 
         ksp.setFromOptions()
 
     def _assemble_physical_residual(self):
         """
         Re-assemble F_physical into self.residual_vec_physical and return its
-        norm.
+        norm. Derived fields (e.g. a reconstructed gradient) are brought up
+        to date with the current state first.
         """
+        self.update_derived_fields()
         with self.residual_vec_physical.localForm() as loc:
             loc.set(0.0)
         dolfinx.fem.petsc.assemble_vector(self.residual_vec_physical, self.F_physical_form)
@@ -516,6 +781,36 @@ class CompressibleEulerModel():
         if not np.isfinite(u_norm) or u_norm == 0.0:
             return np.nan
         return full_norm / u_norm
+
+    def solve_linearized(self, rhs, out, transpose=False, prefix="lin_", rtol=1e-10,
+                         atol=1e-11, max_it=1000, gmres_restart=200):
+        """
+        Solve dR/dU x = rhs (or its transpose, for the adjoint) at the
+        current state, for models whose dR/dU is a condensed product
+        (has_condensed_jacobian). FGMRES on the exact operator, right
+        preconditioned with ASM/ILU of the compact A_UU part -- the forward
+        solve's compact_pc pairing -- or MUMPS with direct_linear_solver.
+        The transposes are formed explicitly. Returns the KSP (iterations,
+        residual norm and reason are read off it).
+        """
+        A = self.assemble_dRdu_mat()
+        P = self._dRdu_condensed.A_UU
+        if transpose:
+            # out of place: Mat.transpose() without an argument transposes the
+            # cached matrices themselves
+            A, P = A.transpose(PETSc.Mat()), P.transpose(PETSc.Mat())
+        ksp = PETSc.KSP().create(self.mesh_obj.mesh.comm)
+        ksp.setOptionsPrefix(prefix)
+        ksp.setOperators(A, A if self.direct_linear_solver else P)
+        saved = (self.krylov_type, self.krylov_diagonal_scale)
+        self.krylov_type, self.krylov_diagonal_scale = "fgmres", False
+        try:
+            self.apply_krylov_solver_settings(ksp, max_it=max_it, gmres_restart=gmres_restart,
+                                              monitor_convergence=False, rtol=rtol, atol=atol)
+        finally:
+            self.krylov_type, self.krylov_diagonal_scale = saved
+        ksp.solve(rhs, out)
+        return ksp
 
     def _report_max_residual_location(self):
         """
@@ -581,7 +876,7 @@ class CompressibleEulerModel():
 
         local = locate_positivity_limiting_nodes(
             x.array, dx.array, theta_probe, gamma=self.gamma,
-            block_size=2 + self.dimensions)
+            block_size=self.n_state, n_mean=self.n_mean if self.n_extra else None)
 
         n_density = comm.allreduce(local["n_density"], op=MPI.SUM)
         n_pressure = comm.allreduce(local["n_pressure"], op=MPI.SUM)
@@ -632,11 +927,15 @@ class CompressibleEulerModel():
         SNESNewtonSolver runs in passes of fom_newton_inner_max_it steps, and
         the physical residual is tested after each pass, until it drops below
         residual_conv_limit or the max_newton_iterations budget is spent.
+        With use_ptc it is instead a pseudo-transient continuation solve
+        (TimeIntegrator.solve_steady), max_newton_iterations pseudo steps of
+        one Newton step each.
         Returns the physical residual vector (residual_vec_physical).
         """
-        if not hasattr(self, 'residual_vec_physical'):
-            self.residual_vec_physical = dolfinx.fem.petsc.create_vector(
-                dolfinx.fem.extract_function_spaces(self.F_physical_form))
+        if self.use_ptc:
+            return self.time_integrator.solve_steady()
+
+        self._ensure_residual_vector()
 
         solver = self.solver
 
@@ -692,6 +991,67 @@ class CompressibleEulerModel():
         set_petsc_vec_array(self.u_vec.x.petsc_vec, u_vec_entries)
         self.u_vec.x.petsc_vec.ghostUpdate()
 
+    def _ensure_residual_vector(self):
+        if not hasattr(self, 'residual_vec_physical'):
+            self.residual_vec_physical = dolfinx.fem.petsc.create_vector(
+                dolfinx.fem.extract_function_spaces(self.F_physical_form))
+
+    # ------------------------------------------------------------------
+    # Derived fields (utils/derived_fields.py)
+    # ------------------------------------------------------------------
+    def update_derived_fields(self):
+        """Bring every derived field up to date with the current state.
+        Collective; a no-op without derived fields."""
+        for f in self.derived_fields:
+            f.update()
+
+    def update_geometry_fields(self):
+        """Refresh what depends on the mesh coordinates alone (cell centres,
+        wall distance, the reconstruction's cell volumes). Runs automatically
+        after every Mesh.apply_node_motions / reset_nodes once the model has
+        derived fields (see compute_weakform). A no-op for the plain Euler
+        model."""
+        for f in self.derived_fields:
+            f.update_geometry()
+
+    @property
+    def _chain(self):
+        if getattr(self, "_chain_rule", None) is None:
+            from dragonfly_sim.utils.derived_fields import DerivedFieldChainRule
+            self._chain_rule = DerivedFieldChainRule(
+                self.mesh_obj, self.u_vec, self.derived_fields,
+                alpha_var=getattr(self, "alpha_var", None),
+                jit_options={"cffi_extra_compile_args": ["-O3", "-march=native", "-ffast-math"]})
+        return self._chain_rule
+
+    @property
+    def has_condensed_jacobian(self):
+        """True when dR/dU is a condensed product (a derived field depends on
+        U), which the default ASM/ILU-on-dR/dU solves cannot precondition;
+        the linearized solves then go through solve_linearized."""
+        return any(f.depends_on_state for f in self.derived_fields)
+
+    @staticmethod
+    def _form_key(form):
+        """Cache key of a form: its signature AND the identity of every
+        coefficient and constant in it. The signature alone is the same for
+        two forms that differ only in which Constant they hold (e.g. the lift
+        and drag directions), and a compiled form is bound to its objects."""
+        return (form.signature(), tuple(id(c) for c in form.coefficients()),
+                tuple(id(c) for c in form.constants()))
+
+    def state_derivative(self, form):
+        """dJ/dU of a scalar functional J (rank-0 UFL form), through the
+        derived fields: a Vec in the state layout."""
+        self.update_derived_fields()
+        return self._chain.functional_state(form, self._form_key(form))
+
+    def mesh_derivative(self, form):
+        """dJ/dx of a scalar functional J through the derived fields: a Vec on
+        the mesh's coordinate_space."""
+        self.update_derived_fields()
+        return self._chain.functional_mesh(form, self._form_key(form))
+
     def compute_dRdu_mat(self, u_vec_entries=None):
         """
         The forward Newton Jacobian, dR/du, as a UFL expression.
@@ -705,10 +1065,17 @@ class CompressibleEulerModel():
         The forward Newton Jacobian, assembled.
 
         Caches its own form/matrix, mirroring compute_dRdxmesh_mat's
-        convention.
+        convention. With a reconstructed gradient this is the exact
+        condensed dR/dU of the steady residual (an aij Mat).
         """
         if u_vec_entries is not None:
             self.set_u_vec(u_vec_entries)
+
+        if self.has_condensed_jacobian:
+            self.update_derived_fields()
+            if not hasattr(self, "_dRdu_condensed"):
+                self._dRdu_condensed = self.reconstruction.condensed_jacobian(self.F)
+            return self._dRdu_condensed.assemble()
 
         if not hasattr(self, "dRdu_form"):
             self.dRdu_form = dolfinx.fem.form(self.compute_dRdu_mat())
@@ -722,6 +1089,12 @@ class CompressibleEulerModel():
 
     def compute_dRdxmesh_mat(self, u_vec_entries, V):
         self.set_u_vec(u_vec_entries)
+
+        if self.derived_fields:
+            # dR/dx through the derived fields, as a matrix-free operator
+            # (mult / multTranspose); V must be the mesh's coordinate_space
+            self.update_derived_fields()
+            return self._chain.residual_mesh_operator(self.F, "F")
 
         if not hasattr(self, 'dRdxmesh_form'):
             # test out derivative calculation

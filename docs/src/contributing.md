@@ -15,6 +15,11 @@ Tests live in `tests/`: files named `test_*.py` with functions named `test_*`, r
 any number of MPI ranks: every collective is called by every rank, and assertions are reduced over the entities
 each rank owns.
 
+`tests/cases.py` has small inline cases (a jittered Euler channel, RANS on the unit square, a manufactured RANS
+solution) to build on. `tests/test_euler_regression.py` compares the default Euler forms with a reference
+generated before the RANS work; regenerate it (`tests/data/make_euler_reference.py`) only after a deliberate,
+reviewed change to the Euler discretization.
+
 ## Documentation
 The website is built with Sphinx from the Markdown (MyST) pages in `docs/src/` and published to
 <https://lsdolab.github.io/DRAGonFLy> by the `docs` GitHub Actions workflow on every push to `main`.
