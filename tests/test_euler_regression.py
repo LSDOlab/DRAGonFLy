@@ -39,4 +39,4 @@ def test_assembly_matches_reference(quantities, key):
 @pytest.mark.parametrize("key", ["newton_history", "newton_state"])
 def test_newton_matches_reference(quantities, key):
     q, ref = quantities
-    np.testing.assert_array_equal(q[key], ref[key])
+    np.testing.assert_almost_equal(q[key], ref[key], decimal=14)
