@@ -73,7 +73,7 @@ from dragonfly_sim.core.postprocessor import DG_postprocessor
 
 post = DG_postprocessor(model.mesh, model.sim_model, model.WALL_TAG, np.array([0.25, 0.]), p_inf_dim=101325.)
 ```
-`ref_area_dim` and `ref_chord_dim` override the reference area and chord of the coefficients. `p_inf_dim` and
+The aerodynamic centre argument may be left out (quarter chord). `ref_area_dim` and `ref_chord_dim` override the reference area and chord of the coefficients. `p_inf_dim` and
 `L_ref_dim` only scale the dimensional forces printed to the console.
 
 ## 5. Design variables and model graph
@@ -117,6 +117,29 @@ prob = CSDLAlphaProblem(problem_name='shape_opt', simulator=sim)
 SLSQP(prob, solver_options={'ftol': 1e-8, 'maxiter': 100}).solve()
 ```
 Each flow solve starts from the previous converged solution.
+
+## Forward analysis (no shape variables)
+Leave out `ffd_shape` (and the FFD arguments): `set_up_sim()` then builds no FFD block and no mesh warper
+(`model.ffd` and `model.mesh_warper` stay `None`), the mesh stays fixed, and the angle of attack is the only
+input.
+```python
+model = DG_windtunnel_model(mesh, boundary_dict, mesh_inner_bdry_function=airfoil_inner_bdry_function,
+                            poly_order=0)
+model.set_up_sim()
+
+# one flow solve, no CSDL graph: the state, a convergence flag, and the forces
+u, converged, forces = model.solve_forward(np.radians(2))
+print(forces["c_l"], forces["c_d"], forces["c_m"])
+
+# or a CSDL graph with alpha as its only input
+u = model.evaluate(alpha=alpha)
+out = model.postprocessor.evaluate(u, alpha=alpha)
+```
+`DG_postprocessor` needs no FFD definitions either: `post.forces_and_coefficients(u, alpha)` returns `L`, `D`,
+`M`, `c_l`, `c_d`, `c_m` (and, for a viscous model, the friction drag `D_friction`, `c_d_friction`) of any state,
+outside CSDL, and `post.evaluate(u, alpha=alpha)` leaves out the mesh deformation. `aero_center` defaults to
+the quarter chord, $(0.25, 0[, 0])$. See `examples/airfoil_analysis.py`. Time-dependent runs are set up directly
+from the model classes, as in `examples/flow_analysis.py`.
 
 ## Output files
 Written to the working directory, named with `filename_suffix`:

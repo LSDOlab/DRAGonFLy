@@ -27,6 +27,11 @@ $ OMP_NUM_THREADS=1 mpirun -n 4 python examples/airfoil_opt.py
 | Design variables | as `airfoil_opt.py` |
 | Purpose | `check_totals` of the RANS adjoint (through the reconstructed gradient and the wall distance) |
 
+## `airfoil_analysis.py`: forward analysis through the windtunnel model
+`DG_windtunnel_model` without an FFD block or mesh warper (Euler at $M = 0.8$, or `--model rans` at $M = 0.7$):
+one plain `solve_forward`, then a CSDL graph with the angle of attack as its only input and `check_totals` of
+$dD/d\alpha$ and $dL/d\alpha$.
+
 ## `flow_analysis.py`: steady and unsteady analysis
 Euler, laminar or SA-neg RANS from any mesh, steady (PTC) or unsteady (`--unsteady`, BDF2, optional
 `--dual-time`), with the split, `riemann` or `riemann2` far field. Writes `result.csv` or `history.csv`, wall

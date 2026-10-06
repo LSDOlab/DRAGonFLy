@@ -11,7 +11,12 @@
   (`core/time_integration.py`); opt-in for the Euler model, PTC by default for RANS.
 - Characteristic far field (`define_farfield_bc`, `DG_windtunnel_model(farfield="riemann")`) and its unsteady
   transverse refinement (`TransverseFarfield`, 2D).
-- Partition-independent checkpoints; `examples/flow_analysis.py` and `examples/rans_airfoil_opt.py`.
+- `DG_windtunnel_model` without an FFD block or mesh warper (`ffd_shape=None`): forward analysis on the fixed
+  mesh, with `solve_forward()` outside CSDL or `evaluate(alpha=...)` in a graph; `DG_postprocessor` computes
+  forces and coefficients without FFD definitions (`forces_and_coefficients`, `evaluate` without a mesh
+  deformation).
+- Partition-independent checkpoints; `examples/flow_analysis.py`, `examples/airfoil_analysis.py` and
+  `examples/rans_airfoil_opt.py`.
 - The default Euler path is unchanged (bit-identical residual, Jacobian, derivatives and Newton iterates).
 
 ## 0.1.0 (unreleased)
