@@ -19,6 +19,10 @@ jobs:
     # Add other OSes like windows and macOS if needed.
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      OMP_NUM_THREADS: 1
+      UCX_TLS: tcp  # Force UCX to use TCP instead of UD verbs
+      OMPI_MCA_btl: "^openib"  # Also disable OpenMPI's InfiniBand transport
 
     # Login shell so that the activated conda environment is used by the `run` steps
     defaults:
@@ -42,9 +46,6 @@ jobs:
         python -c "import mpi4py; print('MPI4PY OK')"
 
     - name: Test with pytest
-      env:
-        OMP_NUM_THREADS: 1
-        UCX_TLS: tcp  # Force UCX to use TCP instead of UD verbs
       run: |
         python -c "import dragonfly_sim; print('Import successful')"
         pytest -v --tb=short --cov=dragonfly_sim --cov-report=xml --cov-report=html
