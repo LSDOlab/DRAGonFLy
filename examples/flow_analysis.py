@@ -42,6 +42,7 @@ from dragonfly_sim.core.RANS_model import CompressibleRANSModel
 from dragonfly_sim.core.turbulence_models import Laminar, SpalartAllmarasNeg
 from dragonfly_sim.core.farfield import TransverseFarfield
 from dragonfly_sim.utils.mesh_manager_utils import airfoil_inner_bdry_function, wing_inner_bdry_function
+from dragonfly_sim.utils.mesh_io_utils import load_dolfinx_mesh
 from dragonfly_sim.utils.postprocessor_utils import moment_integrand
 from dragonfly_sim.core.time_integration import StepSizeController, CFLController
 from dragonfly_sim.utils.checkpoint import save_checkpoint, load_checkpoint
@@ -199,7 +200,8 @@ class ForceCoefficients:
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--mesh", required=True, help="XDMF mesh")
+    p.add_argument("--mesh", required=True,
+                   help="XDMF mesh, or a structured CGNS grid one cell thick (2D airfoil)")
     p.add_argument("--mesh-name", default=None, help="XDMF grid name (default per geometry)")
     p.add_argument("--geometry", choices=sorted(GEOMETRIES), default="airfoil")
     p.add_argument("--model", choices=("euler", "laminar", "sa"), default="sa")
@@ -283,12 +285,34 @@ def wall_writer(model, mesh_obj):
     return write
 
 
+def field_writer(model, directory, prefix=""):
+    """write(t=None): VTX files (<prefix>solution, pressure, mach .bp) of the
+    current state in `directory`, one time point per call. Collective."""
+    comm = model.u_vec.function_space.mesh.comm
+    Vs = model.functionspaces["V_scalar"]
+    p_f, M_f = dolfinx.fem.Function(Vs, name="pressure"), dolfinx.fem.Function(Vs, name="mach")
+    U = model.mean_flow(model.u_vec)
+    p_e = pressure(U, model.gamma)
+    vel = ufl.as_vector([U[1 + i] / U[0] for i in range(model.dimensions)])
+    M_e = ufl.sqrt(ufl.dot(vel, vel)) / ufl.sqrt(model.gamma * p_e / U[0])
+    pts = Vs.element.interpolation_points
+    exprs = [(p_f, dolfinx.fem.Expression(p_e, pts)), (M_f, dolfinx.fem.Expression(M_e, pts))]
+    writers = [(FileWriter(os.path.join(directory, prefix + name), comm, f.function_space), f)
+               for name, f in (("solution", model.u_vec), ("pressure", p_f), ("mach", M_f))]
+
+    def write(t=None):
+        for f, e in exprs:
+            f.interpolate(e)
+        for w, f in writers:
+            w.interpolate_and_write(f, write_counter=t)
+    return write
+
+
 def main():
     args = parse_args()
     comm = MPI.COMM_WORLD
     geo = GEOMETRIES[args.geometry]
-    with dolfinx.io.XDMFFile(comm, args.mesh, "r") as xdmf:
-        dolfinx_mesh = xdmf.read_mesh(name=args.mesh_name or geo["mesh_name"])
+    dolfinx_mesh, _ = load_dolfinx_mesh(args.mesh, comm, mesh_name=args.mesh_name or geo["mesh_name"])
     if args.farfield == "riemann2" and not args.unsteady:
         raise SystemExit("--farfield riemann2 is for unsteady runs only")
 
@@ -315,26 +339,12 @@ def main():
               "Re": args.Re, "model": args.model, "farfield": args.farfield}
     coefficients = ForceCoefficients(model, mesh_obj, args.alpha, aero_centre=geo["aero_centre"])
     write_wall = wall_writer(model, mesh_obj)
-    writers = []
-    if args.write_fields:
-        Vs = model.functionspaces["V_scalar"]
-        p_f, M_f = dolfinx.fem.Function(Vs, name="pressure"), dolfinx.fem.Function(Vs, name="mach")
-        U = model.mean_flow(model.u_vec)
-        p_e = pressure(U, model.gamma)
-        vel = ufl.as_vector([U[1 + i] / U[0] for i in range(model.dimensions)])
-        M_e = ufl.sqrt(ufl.dot(vel, vel)) / ufl.sqrt(model.gamma * p_e / U[0])
-        pts = Vs.element.interpolation_points
-        exprs = [(p_f, dolfinx.fem.Expression(p_e, pts)), (M_f, dolfinx.fem.Expression(M_e, pts))]
-        writers = [(FileWriter(os.path.join(run_dir, name), comm, f.function_space), f)
-                   for name, f in (("solution", model.u_vec), ("pressure", p_f), ("mach", M_f))]
+    write_fields = field_writer(model, run_dir) if args.write_fields else None
 
     def write(tag, t=None):
         write_wall(os.path.join(run_dir, "wall_{}.csv".format(tag)))
-        if writers:
-            for f, e in exprs:
-                f.interpolate(e)
-            for w, f in writers:
-                w.interpolate_and_write(f, write_counter=t)
+        if write_fields:
+            write_fields(t)
 
     PETSc.Sys.Print("=" * 72)
     PETSc.Sys.Print("{} {} p=0: {} cells, {} dofs, {} ranks, M={}, alpha={} deg{}, far field {}".format(
