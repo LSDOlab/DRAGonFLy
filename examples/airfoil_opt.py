@@ -11,8 +11,8 @@ from modopt import CSDLAlphaProblem
 from modopt import COBYLA, SLSQP, PySLSQP
 
 from dragonfly_sim.utils.mesh_manager_utils import airfoil_inner_bdry_function
-from dragonfly_sim.core.shape_parameterization import SectionalShape
-from dragonfly_sim.utils.ffd_dv_utils import cp_dv_directions, build_cp_motion_dv, build_sectional_dv, print_cp_motion_bounds, ShapeDVSet
+from dragonfly_sim.core.shape_design import (FFDShapeParameterization, ControlPointMotions,
+                                             SectionalVariables)
 
 from dragonfly_sim.core.windtunnel_model import DG_windtunnel_model
 from dragonfly_sim.core.postprocessor import DG_postprocessor
@@ -49,25 +49,30 @@ if __name__ == '__main__':
 
     ffd_bspline_deg = [2, 2]
     ffd_shape = [5, 3]
-    ffd_center = [int(shape/2) for shape in ffd_shape]
 
-    # Which control point coordinate directions are design variables, and the
-    # bounds on each. Keys are spatial direction indices (0 = x chordwise,
-    # 1 = y vertical); a direction that is absent is frozen at its baseline
-    # coordinate. Values may be a scalar symmetric half-range, a (lower, upper)
-    # pair, or a callable(coords) -> (lower, upper) for bounds that vary over the
-    # FFD block -- see ffd_dv_utils.
-    ffd_dv_spec = {1: 0.01}
-    ffd_coordinate_idxs_opt = cp_dv_directions(ffd_dv_spec)
+    # The shape design variables, as layers on an FFD block around the airfoil
+    # (see shape_design). Raw control-point motions: which coordinate directions
+    # are design variables, and the bounds on each. Keys are spatial direction
+    # indices (0 = x chordwise, 1 = y vertical); a direction that is absent is
+    # frozen at its baseline coordinate. Values may be a scalar symmetric
+    # half-range, a (lower, upper) pair, or a callable(coords) -> (lower, upper)
+    # for bounds that vary over the FFD block -- see ffd_dv_utils. The scaler
+    # makes every direction's box +/-1 in the optimizer's space.
+    layers = [ControlPointMotions({1: 0.01})]
+    # Sectional variables: one value per chordwise column of control points
+    # (ffd_shape[0] of them). camber moves a column vertically; thickness
+    # stretches it (the change in the column's vertical extent). They act on the
+    # baseline before the raw motions (see shape_design). Enable by uncommenting:
+    # layers.insert(0, SectionalVariables(0, {'camber': 0.01, 'thickness': 0.01}))
+    shape = FFDShapeParameterization(ffd_shape, ffd_bspline_deg, layers=layers)
 
     recorder = csdl.Recorder(inline=False)
     recorder.start()
 
-    csdl_euler_model = DG_windtunnel_model(mesh_from_file, boundary_dict, ffd_shape,
+    csdl_euler_model = DG_windtunnel_model(mesh_from_file, boundary_dict, shape,
                                            np.array([0.25, 0.], dtype=np.double),
                                            mesh_inner_bdry_function=airfoil_inner_bdry_function,
-                                           cp_coord_opt_idxs=ffd_coordinate_idxs_opt,
-                                           poly_order=poly_o, gamma=1.4, ffd_degree=ffd_bspline_deg,
+                                           poly_order=poly_o, gamma=1.4,
                                            filename_suffix="derivatives_meshwarping_2D_SLSQP_quadgrid_M=0_8_p=1",
                                            asm_overlap=1, ilu_levels=1)
 
@@ -75,34 +80,9 @@ if __name__ == '__main__':
 
     csdl_coeff_model = DG_postprocessor(csdl_euler_model.mesh, csdl_euler_model.sim_model, csdl_euler_model.WALL_TAG, np.array([0.25, 0.], dtype=np.double), p_inf_dim=101325.)
 
-    ffd = csdl_euler_model.ffd
-
-    # Shape design variables
-    shape_dvs = ShapeDVSet()
-
-    # Raw control-point motions. The bounds and the scaler are per-entry arrays
-    # shaped like cp_motions, so each optimized direction carries its own box.
-    # The scaler makes every direction's box +/-1 in the optimizer's space; pass
-    # scaler_mode=None to reproduce an unscaled run.
-    cp_dv = build_cp_motion_dv(ffd.baseline_coefficients, ffd_dv_spec)
-    assert np.array_equal(cp_dv.coord_idxs, ffd_coordinate_idxs_opt)
-    cp_motions = shape_dvs.add('cp_motions', cp_dv)
-    print_cp_motion_bounds(cp_dv, printer=PETSc.Sys.Print)
-
-    # Sectional variables: one value per chordwise column of control points
-    # (ffd_shape[0] of them), or fewer for a B-spline profile over the columns.
-    # camber moves a column vertically; thickness stretches it (the change in
-    # the column's vertical extent). Enable by uncommenting:
-    sectional = SectionalShape(ffd, principal_dim=0)
-    # camber = shape_dvs.add('camber', build_sectional_dv(ffd_shape[0], 0.01))
-    # sectional.add('camber', camber)
-    # thickness = shape_dvs.add('thickness', build_sectional_dv(ffd_shape[0], 0.01))
-    # sectional.add('thickness', thickness)
-
-    # Sectional layer on the constant baseline first, raw motions on top; see
-    # SectionalShape for why that order is required.
-    ffd_coefficients = sectional.apply(ffd.baseline_variable())
-    ffd_coefficients = ffd.apply_cp_motions(ffd_coefficients, cp_motions, ffd_coordinate_idxs_opt)
+    # Shape design variables first (all of them as one flat vector), then alpha
+    shape_param_vector = shape.declare_design_variables()
+    shape.print_design_variables(printer=PETSc.Sys.Print)
 
     # Angle of attack as a design variable, same bounds convention as the 3D
     # driver. Replicated across ranks; see DG_windtunnel_model.compute_jacvec_product.
@@ -111,12 +91,7 @@ if __name__ == '__main__':
                                  scaler=1./np.radians(1.))
 
     # evaluate mesh deformation
-    bdry_pts_motion_global = ffd.wall_displacement(ffd_coefficients)
-
-    # All shape variables as one vector: the (derivative-free) link that keeps
-    # every rank's reverse chain attached.
-    shape_param_vector = shape_dvs.flat_variable()
-    mesh_nodes_deformation = csdl_euler_model.mesh_warper.evaluate(bdry_pts_motion_global, shape_param_vector)
+    mesh_nodes_deformation = csdl_euler_model.deform_mesh()
 
     u_vec = csdl_euler_model.evaluate(mesh_nodes_deformation, shape_param_vector, alpha)
     outputs = csdl_coeff_model.evaluate(u_vec, mesh_nodes_deformation, alpha, shape_param_vector)
@@ -147,12 +122,12 @@ if __name__ == '__main__':
 
     # Geometric constraints on the deformed wall (see shape_parameterization.
     # WallGeometry). Enable by uncommenting:
-    # wall_geometry = csdl_euler_model.wall_geometry()
-    # area = wall_geometry.enclosed_measure(bdry_pts_motion_global)
+    # wall_geometry = shape.geometry
+    # area = wall_geometry.enclosed_measure(shape.wall_displacement())
     # area.add_name('area')
     # area.set_as_constraint(lower=wall_geometry.baseline_measure)
     # thickness_stations = wall_geometry.add_thickness_stations(np.linspace(0.1, 0.9, 9))
-    # thickness_ratio = wall_geometry.thickness_ratio(ffd_coefficients, thickness_stations)
+    # thickness_ratio = wall_geometry.thickness_ratio(shape.coefficients(), thickness_stations)
     # thickness_ratio.add_name('thickness_ratio')
     # thickness_ratio.set_as_constraint(lower=0.9)
 

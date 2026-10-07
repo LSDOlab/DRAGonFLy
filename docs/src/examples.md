@@ -42,6 +42,6 @@ $C_p$/$c_f$ files, optional VTX fields, and a checkpoint for `--restart`. See `-
 |---|---|
 | Mesh | `wing_vol_L3_xdmf`: hexahedra around the Simple Transonic Wing (half-wing, symmetry plane at $y = 0$); `wing_vol_L3_xdmf_wallmerged` is the same mesh with merged wall layers (fewer cells, lower aspect ratio) |
 | Flow | $M_\infty = 0.8$, $\alpha = 2^\circ$ |
-| Design variables | vertical motion of 3 x 5 x 2 control points of a swept, tapered FFD block (bounds $\pm 0.1$); $\alpha \in [1.5^\circ, 2.5^\circ]$ |
+| Design variables | `WingShape` on a 3 x 5 x 2 swept, tapered FFD block: quarter-chord sweep $\in [20^\circ, 30^\circ]$, aspect ratio $\in [7.5, 10]$, root chord $\in [4.5, 5.5]$, taper ratio $\in [0.2, 0.4]$; thickness ($\pm 10\%$) and camber ($\pm 0.01$ chord) at the 5 spanwise sections; $\alpha \in [1.5^\circ, 2.5^\circ]$ |
 | Objective, constraint | minimize drag $D$ subject to lift $L \ge 10$ |
-| Optional (commented out) | twist and chord variables; volume, thickness and planform-area constraints |
+| Optional (commented out) | raw control-point motions; planform-area, volume and thickness constraints |

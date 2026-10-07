@@ -9,10 +9,11 @@ the deformed wall for geometric constraints. Three pieces:
 * Shape layers that produce the block's coefficients ``C``:
   ``SectionalShape`` (lsdo_geo ``SectionalParameterization``: camber/thickness
   per chordwise station in 2D; twist/chord/sweep/dihedral/span per spanwise
-  section in 3D) and ``WallFFD.apply_cp_motions`` (raw control-point motions).
-  Compose them as ``C = apply_cp_motions(SectionalShape.apply(C0), cp_motions)``
-  -- see ``SectionalShape`` for why the sectional layer must act on the
-  constant baseline.
+  section in 3D; plus additive non-affine sectional modes) and
+  ``WallFFD.apply_cp_motions`` (raw control-point motions). Compose them as
+  ``C = apply_cp_motions(SectionalShape.apply(C0), cp_motions)`` -- see
+  ``SectionalShape`` for why the sectional layer must act on the constant
+  baseline. ``shape_design`` packages these into design-variable layers.
 * ``WallGeometry`` -- geometric constraint quantities of the deformed wall:
   enclosed area (2D) / volume (3D), thickness at stations, and 3D planform
   (section chords, span, planform area).
@@ -20,6 +21,7 @@ the deformed wall for geometric constraints. Three pieces:
 Everything here is csdl_alpha graph code on replicated arrays, so derivatives
 come from csdl's autodiff and every rank computes identical values.
 """
+import contextlib
 import itertools
 
 import numpy as np
@@ -29,6 +31,25 @@ import lsdo_function_spaces as lfs
 import lsdo_geo as lg
 
 from dragonfly_sim.utils.mpi_utils import allgather_numpy
+
+
+@contextlib.contextmanager
+def _inline_recording():
+    """Record the enclosed csdl operations inline (values computed as built).
+
+    lsdo_geo reads intermediate ``.value``'s while building a sectional
+    parameterization (stretch axes and origins, integer-axis directions), which
+    a non-inline recorder -- the drivers' -- leaves as None. Every input of
+    such a subgraph has a value (constant baselines and design variables), so
+    the subgraph alone can be recorded inline.
+    """
+    recorder = csdl.get_current_recorder()
+    was_inline = recorder.inline
+    recorder.inline = True
+    try:
+        yield
+    finally:
+        recorder.inline = was_inline
 
 
 def validate_cp_coord_opt_idxs(cp_coord_opt_idxs, dim):
@@ -289,7 +310,14 @@ class SectionalShape:
     Named presets (``add``), with lsdo_geo's conventions: a stretch is the
     additive change in section extent along the axis (linear across the
     section, zero at the pivot); a rotation is in radians about the axis
-    through the pivot; a translation is a length.
+    through the pivot; a translation is a length. A pivot is a parametric
+    coordinate within the section, either one for all sections or one row per
+    section.
+
+    lsdo_geo's operations are affine within each section. ``add_mode`` adds a
+    non-affine one -- a fixed control-point displacement pattern per section,
+    scaled by a sectional amplitude (e.g. a camber line) -- on top of the
+    lsdo_geo result; it is linear in the amplitude and reads no values.
 
     ========== ======================================== =======
     kind       operation                                 dims
@@ -314,6 +342,8 @@ class SectionalShape:
         # (kind, values, axis, pivot, profile_degree); turned into lsdo_geo
         # SectionalParameters inside apply(), see there for why
         self._specs = []
+        # (values, (n_coefficients, num_sections) map, profile_degree)
+        self._modes = []
 
     def _per_section(self, values, profile_degree=2):
         n = int(np.prod(values.shape))
@@ -331,10 +361,18 @@ class SectionalShape:
         return csdl.matvec(basis, values.reshape((n,)))
 
     def _section_pivot(self, pivot):
+        """One pivot for all sections, (n_section_dims,), or one per section,
+        (num_sections, n_section_dims)."""
         n_section_dims = self.dim - 1
         if pivot is None:
             return None
-        pivot = np.asarray(pivot, dtype=np.float64).reshape(-1)
+        pivot = np.asarray(pivot, dtype=np.float64)
+        if pivot.ndim == 2:
+            if pivot.shape != (self.num_sections, n_section_dims):
+                raise ValueError("per-section pivots must have shape {}, got {}".format(
+                    (self.num_sections, n_section_dims), pivot.shape))
+            return pivot
+        pivot = pivot.reshape(-1)
         if pivot.size != n_section_dims:
             raise ValueError("pivot is a parametric coordinate within the section "
                              "({} entries), got {}".format(n_section_dims, pivot.size))
@@ -365,6 +403,28 @@ class SectionalShape:
         axis = self.principal_dim if parametric_axis is None else int(parametric_axis)
         self._specs.append(('rotation', values, axis, self._section_pivot(pivot), profile_degree))
 
+    def add_mode(self, values, direction, weights, profile_degree=2):
+        """Add ``values[j] * weights[..., j-th section] * direction`` to the
+        control points.
+
+        weights has the block's shape (``ffd.shape``); the entries of section j
+        (index j along principal_dim) are that section's displacement pattern
+        per unit amplitude. direction is a physical vector.
+        """
+        self._check_size(values)
+        weights = np.asarray(weights, dtype=np.float64)
+        if weights.shape != self.ffd.shape:
+            raise ValueError("mode weights must have the block's shape {}, got {}"
+                             .format(self.ffd.shape, weights.shape))
+        direction = np.asarray(direction, dtype=np.float64).reshape(-1)
+        if direction.size != self.dim:
+            raise ValueError("mode direction must have {} entries".format(self.dim))
+        section_index = np.indices(self.ffd.shape)[self.principal_dim]
+        mode_map = np.zeros(self.ffd.shape + (self.dim, self.num_sections))
+        for j in range(self.num_sections):
+            mode_map[..., j] = np.where(section_index == j, weights, 0.)[..., None] * direction
+        self._modes.append((values, mode_map.reshape(-1, self.num_sections), profile_degree))
+
     def add(self, kind, values, pivot=None, profile_degree=2):
         """Add a named sectional variable; see the class docstring."""
         vertical = self.dim - 1
@@ -389,32 +449,30 @@ class SectionalShape:
 
     def apply(self, coefficients):
         """Sectionally deformed coefficients. Pass ``ffd.baseline_variable()``."""
-        if not self._specs:
+        if not self._specs and not self._modes:
             return coefficients
-        # lsdo_geo reads intermediate .value's while building this subgraph
-        # (stretch axes and origins, integer-axis directions), which a
-        # non-inline recorder -- the drivers' -- leaves as None. Every input
-        # here has a value (the baseline and the design variables), so record
-        # just this small subgraph, profiles included, inline.
-        recorder = csdl.get_current_recorder()
-        was_inline = recorder.inline
-        recorder.inline = True
-        try:
-            parameters = lg.SectionalParameters()
-            for kind, values, axis, pivot, profile_degree in self._specs:
+        # lsdo_geo reads values while it builds the subgraph; record it, profiles
+        # included, inline (see _inline_recording).
+        with _inline_recording():
+            updated = coefficients
+            if self._specs:
+                parameters = lg.SectionalParameters()
+                for kind, values, axis, pivot, profile_degree in self._specs:
+                    per_section = self._per_section(values, profile_degree)
+                    if kind == 'translation':
+                        parameters.add_translation(axis, per_section)
+                    elif kind == 'stretch':
+                        parameters.add_stretch(axis, per_section, pivot)
+                    else:
+                        parameters.add_rotation(axis, per_section, pivot)
+                parameterization = lg.SectionalParameterization(
+                    parameterized_points=coefficients,
+                    principal_parametric_dimension=self.principal_dim)
+                updated = parameterization.evaluate(parameters)
+            for values, mode_map, profile_degree in self._modes:
                 per_section = self._per_section(values, profile_degree)
-                if kind == 'translation':
-                    parameters.add_translation(axis, per_section)
-                elif kind == 'stretch':
-                    parameters.add_stretch(axis, per_section, pivot)
-                else:
-                    parameters.add_rotation(axis, per_section, pivot)
-            parameterization = lg.SectionalParameterization(
-                parameterized_points=coefficients,
-                principal_parametric_dimension=self.principal_dim)
-            return parameterization.evaluate(parameters)
-        finally:
-            recorder.inline = was_inline
+                updated = updated + csdl.matvec(mode_map, per_section).reshape(updated.shape)
+            return updated
 
 
 def _selection_matrix(ids, n_cols):
@@ -530,6 +588,13 @@ class WallGeometry:
         if pts.shape[0] == 0:
             raise ValueError("the plane y = {} does not cut the wall".format(y0))
         return pts[np.argmin(pts[:, 0])], pts[np.argmax(pts[:, 0])]
+
+    def section_edges(self, y0):
+        """Baseline leading- and trailing-edge points of the 3D wall's section
+        at span y0 (the min-x and max-x points of the cut y = y0)."""
+        if self.dim != 3:
+            raise ValueError("section_edges is for 3D walls")
+        return self._section_leading_trailing_edges(y0)
 
     def _chord_range(self, y0=None):
         if self.dim == 2:
