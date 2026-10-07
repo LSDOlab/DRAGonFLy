@@ -52,7 +52,7 @@ if __name__ == '__main__':
     boundary_dict = {'inlet': {'rho': 1.0, 'M': mach, 'p': 1.0, 'alpha': attack},
                      'outlet': {'p': 1.0}}
 
-    # No ffd_shape: no FFD block, no mesh warper -- a forward analysis.
+    # No shape parameterization: no FFD block, no mesh warper -- a forward analysis.
     recorder = csdl.Recorder(inline=False)
     recorder.start()
     windtunnel = DG_windtunnel_model(mesh_from_file, boundary_dict,

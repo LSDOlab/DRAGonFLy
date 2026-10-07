@@ -24,7 +24,7 @@ import dolfinx
 import csdl_alpha as csdl
 
 from dragonfly_sim.utils.mesh_manager_utils import airfoil_inner_bdry_function
-from dragonfly_sim.utils.ffd_dv_utils import cp_dv_directions, build_cp_motion_dv, ShapeDVSet
+from dragonfly_sim.core.shape_design import FFDShapeParameterization, ControlPointMotions
 from dragonfly_sim.core.windtunnel_model import DG_windtunnel_model
 from dragonfly_sim.core.postprocessor import DG_postprocessor
 from dragonfly_sim.core.RANS_model import CompressibleRANSModel
@@ -44,17 +44,16 @@ if __name__ == '__main__':
     ffd_bspline_deg = [2, 2]
     ffd_shape = [5, 3]
     # vertical motions of the control points, +/- 0.01 chords
-    ffd_dv_spec = {1: 0.01}
-    ffd_coordinate_idxs_opt = cp_dv_directions(ffd_dv_spec)
+    shape = FFDShapeParameterization(ffd_shape, ffd_bspline_deg,
+                                     layers=[ControlPointMotions({1: 0.01})])
 
     recorder = csdl.Recorder(inline=False)
     recorder.start()
 
-    windtunnel = DG_windtunnel_model(mesh_from_file, boundary_dict, ffd_shape,
+    windtunnel = DG_windtunnel_model(mesh_from_file, boundary_dict, shape,
                                      np.array([0.25, 0.], dtype=np.double),
                                      mesh_inner_bdry_function=airfoil_inner_bdry_function,
-                                     cp_coord_opt_idxs=ffd_coordinate_idxs_opt,
-                                     poly_order=0, gamma=1.4, ffd_degree=ffd_bspline_deg,
+                                     poly_order=0, gamma=1.4,
                                      filename_suffix="rans_airfoil_check_totals",
                                      asm_overlap=1, ilu_levels=2,
                                      model_class=CompressibleRANSModel, model_kwargs={'Re': Re})
@@ -68,18 +67,12 @@ if __name__ == '__main__':
 
     coefficients = DG_postprocessor(windtunnel.mesh, windtunnel.sim_model, windtunnel.WALL_TAG,
                                     np.array([0.25, 0.], dtype=np.double))
-    ffd = windtunnel.ffd
-    shape_dvs = ShapeDVSet()
-    cp_dv = build_cp_motion_dv(ffd.baseline_coefficients, ffd_dv_spec)
-    cp_motions = shape_dvs.add('cp_motions', cp_dv)
-    ffd_coefficients = ffd.apply_cp_motions(ffd.baseline_variable(), cp_motions, ffd_coordinate_idxs_opt)
+    shape_param_vector = shape.declare_design_variables()
 
     alpha = csdl.Variable(name='alpha', value=np.array([attack]))
     alpha.set_as_design_variable(lower=np.radians(1.75), upper=np.radians(2.25), scaler=1. / np.radians(1.))
 
-    bdry_pts_motion_global = ffd.wall_displacement(ffd_coefficients)
-    shape_param_vector = shape_dvs.flat_variable()
-    mesh_nodes_deformation = windtunnel.mesh_warper.evaluate(bdry_pts_motion_global, shape_param_vector)
+    mesh_nodes_deformation = windtunnel.deform_mesh()
 
     u_vec = windtunnel.evaluate(mesh_nodes_deformation, shape_param_vector, alpha)
     outputs = coefficients.evaluate(u_vec, mesh_nodes_deformation, alpha, shape_param_vector)

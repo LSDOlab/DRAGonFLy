@@ -18,7 +18,7 @@ Requirements:
 - **Wall**: identified by a function `mesh_inner_bdry_function(x)` that takes facet midpoints of shape
   `(dim, n)` and returns a boolean mask. `dragonfly_sim.utils.mesh_manager_utils` provides
   `airfoil_inner_bdry_function` and `wing_inner_bdry_function` for the meshes used in the examples. Alternatively,
-  pass `ffd_block_corner_list`, and the wall facets inside that FFD block are used.
+  give the shape parameterization a `block_corner_list`, and the wall facets inside that FFD block are used.
 
 ## 2. Flow conditions
 ```python
@@ -32,20 +32,20 @@ bounds within that range.
 ## 3. Flow model
 ```python
 from dragonfly_sim.core.windtunnel_model import DG_windtunnel_model
+from dragonfly_sim.core.shape_design import FFDShapeParameterization, ControlPointMotions
 from dragonfly_sim.utils.mesh_manager_utils import airfoil_inner_bdry_function
-from dragonfly_sim.utils.ffd_dv_utils import cp_dv_directions
 
-dv_spec = {1: 0.01}   # control points move vertically, within +/-0.01
-model = DG_windtunnel_model(mesh, boundary_dict, ffd_shape=[5, 3], aero_center=np.array([0.25, 0.]),
+# 5 x 3 FFD control points; they move vertically, within +/-0.01
+shape = FFDShapeParameterization([5, 3], [2, 2], layers=[ControlPointMotions({1: 0.01})])
+model = DG_windtunnel_model(mesh, boundary_dict, shape, aero_center=np.array([0.25, 0.]),
                             mesh_inner_bdry_function=airfoil_inner_bdry_function,
-                            cp_coord_opt_idxs=cp_dv_directions(dv_spec),
-                            poly_order=0, ffd_degree=[2, 2],
-                            filename_suffix="my_case", asm_overlap=1, ilu_levels=1)
+                            poly_order=0, filename_suffix="my_case", asm_overlap=1, ilu_levels=1)
 model.set_up_sim()
 ```
-`poly_order=0` is required in this release. `cp_coord_opt_idxs` lists the spatial directions in which control
-points may move (see [Shape parameterization](shape_parameterization.md)). `set_up_sim()` tags the
-boundaries, builds the weak form, the FFD block (`model.ffd`) and the mesh warper (`model.mesh_warper`).
+`poly_order=0` is required in this release. The shape parameterization holds the FFD block and the design
+variables with their bounds (see [Shape parameterization](shape_parameterization.md)); the model does not depend
+on which variables they are. `set_up_sim()` tags the boundaries, builds the weak form and the mesh warper
+(`model.mesh_warper`), and sets up the shape parameterization's FFD block (`model.ffd`).
 
 Solver settings are attributes; change them before `set_up_sim()`:
 
@@ -79,22 +79,16 @@ The aerodynamic centre argument may be left out (quarter chord). `ref_area_dim` 
 ## 5. Design variables and model graph
 Build the CSDL graph between `recorder.start()` and `recorder.stop()`:
 ```python
-from dragonfly_sim.utils.ffd_dv_utils import ShapeDVSet, build_cp_motion_dv
-
 recorder = csdl.Recorder(inline=False)
 recorder.start()
 # ... construct model and post (steps 3 and 4) ...
 
-shape_dvs = ShapeDVSet()
-cp_motions = shape_dvs.add('cp_motions', build_cp_motion_dv(model.ffd.baseline_coefficients, dv_spec))
-coefficients = model.ffd.apply_cp_motions(model.ffd.baseline_variable(), cp_motions,
-                                          cp_dv_directions(dv_spec))
+params = shape.declare_design_variables()   # every shape variable, with its bounds
 
 alpha = csdl.Variable(name='alpha', value=np.array([np.radians(2)]))
 alpha.set_as_design_variable(lower=np.radians(1.75), upper=np.radians(2.25), scaler=1/np.radians(1))
 
-params = shape_dvs.flat_variable()
-mesh_motion = model.mesh_warper.evaluate(model.ffd.wall_displacement(coefficients), params)
+mesh_motion = model.deform_mesh()
 u = model.evaluate(mesh_motion, params, alpha)
 out = post.evaluate(u, mesh_motion, alpha, params)
 
@@ -119,7 +113,7 @@ SLSQP(prob, solver_options={'ftol': 1e-8, 'maxiter': 100}).solve()
 Each flow solve starts from the previous converged solution.
 
 ## Forward analysis (no shape variables)
-Leave out `ffd_shape` (and the FFD arguments): `set_up_sim()` then builds no FFD block and no mesh warper
+Leave out the shape parameterization: `set_up_sim()` then builds no FFD block and no mesh warper
 (`model.ffd` and `model.mesh_warper` stay `None`), the mesh stays fixed, and the angle of attack is the only
 input.
 ```python

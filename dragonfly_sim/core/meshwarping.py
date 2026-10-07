@@ -42,8 +42,8 @@ class IDWarp_jax(csdl.CustomExplicitOperation):
     """IDW mesh deformation via the ``idwarp-jax`` package's kd-tree warper.
 
     Maps the replicated ``(M_global, dim)`` wall-node motions
-    (``evaluate(bdry_motions, cp_motion_inputs)``, usually
-    ``shape_parameterization.WallFFD.wall_displacement``) to rank-local volume
+    (``evaluate(bdry_motions, shape_parameters)``, usually
+    ``shape_design.FFDShapeParameterization.wall_displacement``) to rank-local volume
     node motions, in geometry-node order. Because the map is closed form rather
     than a PDE solve, this is a ``CustomExplicitOperation`` -- CSDL calls
     ``compute`` and ``compute_jacvec_product``.
@@ -521,23 +521,23 @@ class IDWarp_jax(csdl.CustomExplicitOperation):
     # CSDL interface
     # ==================================================================
 
-    def evaluate(self, bdry_motions: "csdl.Variable", cp_motion_inputs: "csdl.Variable"):
+    def evaluate(self, bdry_motions: "csdl.Variable", shape_parameters: "csdl.Variable"):
         """Register the operation.
 
-        ``cp_motion_inputs`` carries no derivative -- it is declared only to keep
+        ``shape_parameters`` carries no derivative -- it is declared only to keep
         every rank's reverse chain attached to the design variables, including
         ranks that own no wall nodes.
         """
         self.name = "IDWarp_jax"
 
         self.declare_input("bdry_motions", bdry_motions)
-        self.declare_input("cp_motion_inputs", cp_motion_inputs)
+        self.declare_input("shape_parameters", shape_parameters)
 
         mesh_node_motions = self.create_output(
             "mesh_node_motions", shape=(self.N_local, self.dimensions))
 
         self.declare_derivative_parameters(
-            of="mesh_node_motions", wrt="cp_motion_inputs", dependent=False)
+            of="mesh_node_motions", wrt="shape_parameters", dependent=False)
 
         return mesh_node_motions
 
