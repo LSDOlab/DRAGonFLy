@@ -24,6 +24,14 @@
   deformation).
 - Partition-independent checkpoints; `examples/flow_analysis.py`, `examples/airfoil_analysis.py` and
   `examples/rans_airfoil_opt.py`.
+- Mesh input from structured multi-block CGNS grids one cell thick (`utils/mesh_io_utils.py`:
+  `load_dolfinx_mesh`, `cgns_to_dolfinx_mesh`), reduced to a 2D quadrilateral mesh in memory;
+  `examples/flow_analysis.py --mesh` accepts them.
+- ONERA OAT15A validation case (`examples/ONERA-OAT15A/`): SA-neg RANS mesh-sensitivity study on the Rizzi grids
+  at $M = 0.73$, $Re = 3\times10^6$ (preliminary results on grids 1-4).
+- `FileWriter` gathers piecewise-constant and continuous fields to rank 0, so VTX output shows no seams at the
+  MPI partition boundaries; new `mesh_deformation` and `time_dependent` keywords. The solution and pressure
+  files of a shape optimization are written on the deformed mesh of each evaluation.
 - The default Euler path is unchanged (bit-identical residual, Jacobian, derivatives and Newton iterates).
 
 ## 0.1.0 (unreleased)

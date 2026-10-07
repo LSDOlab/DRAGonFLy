@@ -18,7 +18,7 @@ from dragonfly_sim.core.windtunnel_model import DG_windtunnel_model
 from dragonfly_sim.core.postprocessor import DG_postprocessor
 
 
-# Meshes are stored with Git LFS in the repository's meshes/ directory
+# Meshes are read from the repository's meshes/ directory
 MESH_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "meshes")
 
 

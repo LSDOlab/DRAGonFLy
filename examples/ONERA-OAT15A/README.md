@@ -4,8 +4,8 @@ Steady RANS of the ONERA OAT15A supercritical airfoil on the structured Rizzi gr
 p = 0 solver. It compares lift, drag and moment coefficients across grid levels at the transonic conditions
 of the OAT15A buffet test case. The cost of each grid is compared too.
 
-> **Status:** the figures below are **preliminary**. They show grids 1–4 only, from earlier limited runs
-> (`data/preliminary_grids1-4.csv`). The full sweep over grids 1–7 has not been run yet. Comparisons with
+> **Status:** the figures below are **preliminary**. They show grids 1–4 only, from earlier limited runs.
+> The full sweep over grids 1–7 has not been run yet. Comparisons with
 > experimental data and other solvers will be added later.
 
 ## Case
