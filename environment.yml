@@ -10,7 +10,6 @@ dependencies:
   - mpich
   - pyvista
   - networkx
-  - git-lfs   # the meshes in meshes/ are stored with Git LFS; run `git lfs install` once after creating the env
   - pip
   - pip:
       - -e .[test,docs]

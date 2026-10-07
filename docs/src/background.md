@@ -2,7 +2,9 @@
 title: Background
 ---
 
-This page summarizes the formulation and the numerical methods. For how to use them, see the
+This page summarizes the formulation and the numerical methods of the default, steady Euler model. The RANS
+model, time integration and the characteristic far fields build on it and are described in
+[RANS, time integration and far fields](flow_models.md). For how to use them, see the
 [user guide](user_guide.md).
 
 ## Governing equations

@@ -11,6 +11,19 @@ Read a DOLFINx mesh, typically from XDMF:
 with dolfinx.io.XDMFFile(MPI.COMM_WORLD, "naca0012_euler_mesh_quad_v2.xdmf", "r") as xdmf:
     mesh = xdmf.read_mesh()
 ```
+`dragonfly_sim.utils.mesh_io_utils.load_dolfinx_mesh(path)` reads either an XDMF file or a structured
+multi-block CGNS grid, chosen by file extension, and returns `(mesh, info)`:
+```python
+from dragonfly_sim.utils.mesh_io_utils import load_dolfinx_mesh
+
+mesh, info = load_dolfinx_mesh("OAT15A_Rizzi_1.cgns")   # info: chord, cell and boundary-edge counts
+```
+A CGNS grid of a 2D case must be one cell thick (or planar). Rank 0 reads it with PyVista, keeps one span plane
+of every block, merges the nodes the blocks share by exact coordinate match, and checks that the boundary edges
+are exactly those of the wall and far-field families (`wall_family="Wall"`, `farfield_family="Farfield"`). By
+default the points are shifted and scaled so that the wall's leading edge is at $x = 0$ and its chord is 1
+(`scale_to_chord`). DOLFINx then distributes the mesh; no converted file is written.
+
 Requirements:
 - **Orientation**: the freestream flows in $+x$. In 2D, y is vertical; in 3D, y is spanwise and z vertical.
 - **3D**: model a half-wing whose root lies on the symmetry plane $y = 0$.
@@ -138,9 +151,17 @@ from the model classes, as in `examples/flow_analysis.py`.
 ## Output files
 Written to the working directory, named with `filename_suffix`:
 - `FOM_solution_*.bp`, `FOM_pressure_*.bp`, `mesh_deformation_*.bp`: solution, pressure and mesh deformation per
-  evaluation, in ADIOS2/VTX format (open in ParaView);
+  evaluation, in ADIOS2/VTX format (open in ParaView). With a shape parameterization, the solution and pressure
+  are written on the deformed mesh they were solved on, and the mesh deformation on the baseline mesh (apply it
+  with *Warp By Vector*); frame $k$ of each file belongs to the same evaluation;
 - `output_meshtags.xdmf`: the boundary tags, to check the inflow/outflow/wall/symmetry split;
 - `memory_logs/`: peak memory per MPI rank.
 
 `model.data_store` collects per-evaluation results;
 `model.data_store.write_store_to_numpy_file(save_folder, save_filename)` saves them to an existing folder.
+
+To write other fields, use `dragonfly_sim.utils.filewriter.FileWriter(filename, comm, function_space,
+mesh_deformation=False, time_dependent=False)` and call `interpolate_and_write(f, write_counter=...)`, or
+`interpolate_and_write(f, time=t)` for a time-dependent writer. With `mesh_deformation=True` each frame is
+written on the mesh geometry at the time of the write. Piecewise-constant and continuous fields are gathered to
+rank 0 and written as one block, so ParaView shows no cracks at the MPI partition boundaries.

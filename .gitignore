@@ -163,5 +163,6 @@ _conf_master.py
 *.snm
 *.vrb
 
-# Meshes are kept out of version control for now
-meshes/
+# Meshes are kept out of version control for now; their README is tracked
+meshes/*
+!meshes/README.md

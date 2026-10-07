@@ -18,7 +18,8 @@ each rank owns.
 `tests/cases.py` has small inline cases (a jittered Euler channel, RANS on the unit square, a manufactured RANS
 solution) to build on. `tests/test_euler_regression.py` compares the default Euler forms with a reference
 generated before the RANS work; regenerate it (`tests/data/make_euler_reference.py`) only after a deliberate,
-reviewed change to the Euler discretization.
+reviewed change to the Euler discretization. `tests/manual/make_paraview_check.py` writes a VTX file set for
+checking `FileWriter` output by eye in ParaView; it is not part of the pytest run.
 
 ## Documentation
 The website is built with Sphinx from the Markdown (MyST) pages in `docs/src/` and published to
