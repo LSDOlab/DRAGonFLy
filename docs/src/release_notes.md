@@ -11,7 +11,14 @@
   (`core/time_integration.py`); opt-in for the Euler model, PTC by default for RANS.
 - Characteristic far field (`define_farfield_bc`, `DG_windtunnel_model(farfield="riemann")`) and its unsteady
   transverse refinement (`TransverseFarfield`, 2D).
-- `DG_windtunnel_model` without an FFD block or mesh warper (`ffd_shape=None`): forward analysis on the fixed
+- Shape design variables as modular layers (`core/shape_design.py`): `DG_windtunnel_model` takes an
+  `FFDShapeParameterization` (FFD block + layers) instead of `ffd_shape`, `ffd_degree`, `ffd_block_corner_list`
+  and `cp_coord_opt_idxs`, and no longer depends on which variables exist; `model.deform_mesh()` gives the
+  mesh motion. Layers: `ControlPointMotions`, `SectionalVariables`, and `WingShape`, which adds wing sweep,
+  aspect ratio, root chord and taper ratio (absolute values with bounds), plus thickness and camber per
+  spanwise station. `examples/wing_opt.py` uses `WingShape`. The model's and the warper's shape input is
+  renamed from `cp_motion_inputs` to `shape_parameters`.
+- `DG_windtunnel_model` without a shape parameterization or mesh warper: forward analysis on the fixed
   mesh, with `solve_forward()` outside CSDL or `evaluate(alpha=...)` in a graph; `DG_postprocessor` computes
   forces and coefficients without FFD definitions (`forces_and_coefficients`, `evaluate` without a mesh
   deformation).

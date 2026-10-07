@@ -1,36 +1,60 @@
 # Shape parameterization
 
-The wall shape is controlled by a B-spline FFD block around the wall nodes (`WallFFD`, created by
-`DG_windtunnel_model.set_up_sim()` as `model.ffd`). Design variables change the block's control points; the wall
-moves with them, and the volume mesh follows through IDWarp.
+The wall shape is controlled by a B-spline FFD block around the wall nodes. Design variables change the block's
+control points; the wall moves with them, and the volume mesh follows through IDWarp.
+
+All of this lives in one object, an `FFDShapeParameterization` (`dragonfly_sim.core.shape_design`), passed to
+`DG_windtunnel_model`. The model does not know which design variables exist. In `set_up_sim()` it hands the wall
+nodes to the parameterization, and `model.deform_mesh()` turns the resulting wall displacement into mesh node
+motions:
+```python
+shape = FFDShapeParameterization(ffd_shape, ffd_degree, block_corner_list, layers=[...])
+model = DG_windtunnel_model(mesh, boundary_dict, shape, aero_center, ...)
+model.set_up_sim()
+shape_parameters = shape.declare_design_variables()   # all shape DVs, with bounds, as one vector
+alpha = ...                                           # declare alpha after the shape variables
+u_vec = model.evaluate(model.deform_mesh(), shape_parameters, alpha)
+```
 
 ## FFD block
 `ffd_shape` sets the number of control points per parametric direction (2 entries in 2D, 3 in 3D) and
 `ffd_degree` the B-spline degree. By default the block is the axis-aligned bounding box of the wall. For a
-tapered or swept wing, pass `ffd_block_corner_list` to `DG_windtunnel_model`: two rectangular end surfaces (root
-and tip), each given by two opposite corners, e.g.
+tapered or swept wing, pass a `block_corner_list`: two rectangular end surfaces (root and tip), each given by
+two opposite corners, e.g.
 `[[(-0.1, 0., 0.32), (5.1, 0., -0.3)], [(7.4, 14.1, 0.32), (9.1, 14.1, -0.3)]]`.
+Without an explicit `mesh_inner_bdry_function`, the model uses the block corners to find the wall facets.
 
-## Control-point motions
+## Layers
+The design variables come from the layers, which are applied in order and declared in order:
+
+| Layer | Design variables |
+|---|---|
+| `ControlPointMotions(dv_spec)` | `cp_motions`: individual control-point motions |
+| `SectionalVariables(principal_dim, {kind: bounds})` | sectional presets (camber, thickness, twist, ...) |
+| `WingShape(planform={...}, sections={...})` | wing sweep, aspect ratio, root chord, taper ratio; thickness and camber per spanwise station |
+
+The coefficients are built as the constant baseline, then one lsdo_geo `SectionalParameterization` holding
+every layer's sectional operations, then additive motions (control-point motions, sectional modes) on top.
+lsdo_geo freezes axes and stretch origins from the points' values when the graph is built, which is why all
+sectional operations act on the constant baseline in one evaluation. Layers with sectional operations must
+therefore share one principal direction. A new layer subclasses `ShapeLayer` (`setup`, `declare`,
+`sectional`, `additive`, `outputs`).
+
+### Control-point motions
 `cp_motions` moves control points individually. Its directions and bounds come from one dictionary keyed by
 spatial direction (0 = x, 1 = y, 2 = z):
 ```python
-dv_spec = {1: 0.01}                     # 2D: vertical motions within +/-0.01
-dv_spec = {0: 0.02, 2: (-0.05, 0.10)}   # 3D: x symmetric, z asymmetric
-dv_spec = {2: spanwise_linear_bounds(base_bound=0.1, scale_at_root=1.0, scale_at_ref=0.5, y_ref=14.1)}
+ControlPointMotions({1: 0.01})                     # 2D: vertical motions within +/-0.01
+ControlPointMotions({0: 0.02, 2: (-0.05, 0.10)})   # 3D: x symmetric, z asymmetric
+ControlPointMotions({2: spanwise_linear_bounds(base_bound=0.1, scale_at_root=1.0, scale_at_ref=0.5, y_ref=14.1)})
 ```
 A bound is a symmetric half-range, a `(lower, upper)` pair, or a callable of the control-point coordinates such
-as `spanwise_linear_bounds`, which varies the bound linearly along the span.
+as `spanwise_linear_bounds`, which varies the bound linearly along the span. Each direction's box is scaled to
+$\pm 1$ in the optimizer's space.
 
-- `cp_dv_directions(dv_spec)` gives the `cp_coord_opt_idxs` that `DG_windtunnel_model` needs.
-- `build_cp_motion_dv(model.ffd.baseline_coefficients, dv_spec)` builds the variable's value, bounds and scaling
-  (each direction's box maps to $\pm 1$).
-- `model.ffd.apply_cp_motions(coefficients, cp_motions, cp_coord_opt_idxs)` adds the motions to the control
-  points.
-
-## Sectional variables
-`SectionalShape(model.ffd, principal_dim)` views the block as a stack of sections: `principal_dim=0` in 2D
-(chordwise stations), `1` for a wing (spanwise stations). Variables are added with `add(kind, values)`:
+### Sectional variables
+`SectionalVariables(principal_dim, {kind: bounds})` views the block as a stack of sections: `principal_dim=0` in
+2D (chordwise stations), `1` for a wing (spanwise stations). The kinds are:
 
 | Kind | Operation | Dimensions |
 |---|---|---|
@@ -42,24 +66,62 @@ as `spanwise_linear_bounds`, which varies the bound linearly along the span.
 | `dihedral` | translation along z | 3D |
 | `span` | translation along y | 3D |
 
-A variable has one value per section, or fewer values, which are then B-spline coefficients of a profile over the
-sections. Create its bounds with `build_sectional_dv(num_values, bounds)`.
-
-Apply the sectional layer to the constant baseline first, then the control-point motions:
+A variable is a delta from the baseline and has one value per section. Its bounds are a scalar, a pair, or
+per-section arrays; pin an entry with `(0., 0.)`. A dict spec, `{'bounds': ..., 'num_values': n, 'pivot': ...}`,
+gives fewer values, which are then the B-spline coefficients of a profile over the sections, and/or a pivot.
 ```python
-sectional = SectionalShape(model.ffd, principal_dim=1)
-twist = shape_dvs.add('twist', build_sectional_dv(5, np.radians(2.)))
-sectional.add('twist', twist)
-coefficients = sectional.apply(model.ffd.baseline_variable())
-coefficients = model.ffd.apply_cp_motions(coefficients, cp_motions, cp_coord_opt_idxs)
+SectionalVariables(0, {'camber': 0.01, 'thickness': 0.01})                       # 2D airfoil
+SectionalVariables(1, {'twist': {'bounds': np.radians(2.), 'pivot': [0.25, 0.5]}})   # 3D wing
 ```
 
+### Wing planform and sections
+`WingShape` parameterizes a straight-tapered half wing whose root lies on the $y = 0$ symmetry plane (x
+chordwise, z up). It needs a lofted block with parametric axes (chord, span, vertical), which is what a
+`block_corner_list` produces. The baseline planform is measured from the wall when the model is set up: straight
+lines are fitted to the leading and trailing edges, and a wall that is not straight-tapered is rejected.
+```python
+WingShape(planform={'sweep': np.radians((20., 30.)),   # sweep of the quarter-chord line [rad]
+                    'aspect_ratio': (7.5, 10.),        # full wing, b^2 / S
+                    'root_chord': (4.5, 5.5),
+                    'taper_ratio': (0.2, 0.4)},        # tip chord / root chord
+          sections={'thickness': 0.1,                  # relative change of t/c
+                    'camber': 0.01},                   # change of max camber / local chord
+          sweep_chord_fraction=0.25)
+```
+- **Planform variables** hold the quantity itself. Each starts at the baseline wing's value, and its
+  `(lower, upper)` bounds must bracket it. A variable that is left out stays at its baseline value.
+- **Semi-span.** It follows from the other planform variables: $s = AR\, c_r (1 + \lambda) / 4$. A larger
+  aspect ratio at a fixed root chord gives a longer wing with more area.
+- **Section variables** have one value per FFD spanwise section, root first. They are deltas that start at zero:
+  - `thickness` scales the section about its chord plane. Chord changes scale the thickness along, so t/c is
+    kept.
+  - `camber` adds a parabolic camber line $\kappa\, c\, 4\xi(1-\xi)$, so the leading and trailing edges stay
+    in place.
+
+The map behind it works per FFD section $j$, at the baseline span fraction $\eta_j = y_j / s_0$:
+1. The section moves to $y_j' = \eta_j s'$.
+2. It is scaled by $c_j'/c_{j,0}$, in x about the reference chord line and in z about the chord plane.
+3. Its reference-line point is placed at $x_{ref,root} + y_j' \tan\Lambda'$, so the root point of that line
+   stays fixed.
+
+These are lsdo_geo sectional stretches and translations; the camber is an additive sectional mode.
+
+With the taper ratio fixed, the map is affine, so the deformed wall is exactly the trapezoid that the
+variables describe. A taper change is exact at the FFD sections and blended between them by the spanwise
+B-spline. Changing the taper ratio from 0.3 to 0.4 on the 5-section test block moves the chords up to 0.25% away
+from the trapezoid.
+
+`shape.outputs()['wing']` holds the planform as CSDL variables, for use as constraints: `sweep`, `aspect_ratio`,
+`root_chord`, `taper_ratio`, `tip_chord`, `semi_span`, `span`, `area` (full wing), and `section_chords`.
+`wing.baseline` holds the measured baseline values as numbers, for constraint bounds.
+
 ## Design-variable set
-`ShapeDVSet` collects all shape variables in declaration order; `shape_dvs.flat_variable()` is the vector
-passed to the mesh warper, flow model and postprocessor.
+`ShapeDVSet` (`shape.dvs`) collects all shape variables in declaration order. `shape.parameter_vector()` is the
+vector passed to the mesh warper, flow model and postprocessor. `shape[name]` returns one variable, and
+`shape.print_design_variables()` lists them with their bounds.
 
 ## Geometric constraints
-`model.wall_geometry()` returns a `WallGeometry` for the deformed wall:
+`shape.geometry` (also `model.wall_geometry()`) is a `WallGeometry` for the deformed wall:
 
 | Method | Quantity |
 |---|---|
@@ -68,9 +130,9 @@ passed to the mesh warper, flow model and postprocessor.
 | `add_planform_stations(span_stations)` then `planform(coefficients, handle)` | section chords, span and planform area (3D) |
 
 ```python
-geometry = model.wall_geometry()
-area = geometry.enclosed_measure(model.ffd.wall_displacement(coefficients))
+geometry = shape.geometry
+area = geometry.enclosed_measure(shape.wall_displacement())
 area.set_as_constraint(lower=geometry.baseline_measure)
 stations = geometry.add_thickness_stations(np.linspace(0.1, 0.9, 9))
-geometry.thickness_ratio(coefficients, stations).set_as_constraint(lower=0.9)
+geometry.thickness_ratio(shape.coefficients(), stations).set_as_constraint(lower=0.9)
 ```

@@ -20,8 +20,10 @@ A value may also be a callable ``f(coords) -> (lower, upper)`` for bounds that
 vary over the block; see spanwise_linear_bounds.
 
 Sectional shape variables (shape_parameterization.SectionalShape) get their
-arrays from build_sectional_dv, and ShapeDVSet collects any mix of these into
-the ordered set of shape design variables a driver declares.
+arrays from build_sectional_dv, scalar planform variables (sweep, aspect ratio,
+...) from build_planform_dv, and ShapeDVSet collects any mix of these into the
+ordered set of shape design variables (shape_design.FFDShapeParameterization
+declares them through its layers).
 
 Numpy-only apart from ShapeDVSet's variable creation, which imports csdl
 lazily -- so the bounds logic can be exercised without an MPI environment.
@@ -252,12 +254,49 @@ def build_sectional_dv(num_values, bounds, scaler_mode='bounds'):
                       lower=lower, upper=upper, scaler=scaler)
 
 
+def build_planform_dv(baseline, bounds, scaler_mode='bounds', name='planform'):
+    """Arrays for one scalar planform variable in absolute units.
+
+    Unlike cp_motions and the sectional variables, a planform variable holds
+    the quantity itself (an aspect ratio of 8.6, a sweep of 0.44 rad), so it
+    starts at its baseline value and bounds is an absolute (lower, upper)
+    pair that must bracket it.
+
+    scaler_mode : 'bounds' scales by 1/half-range about the baseline (the
+        larger side), so the box is about +/-1 around the start in the
+        optimizer's space; None emits no scaler.
+
+    Returns a CPMotionDV of shape (1,) with coord_idxs=None.
+    """
+    baseline = float(baseline)
+    if not isinstance(bounds, (tuple, list, np.ndarray)) or len(bounds) != 2:
+        raise ValueError("bounds for planform variable {!r} must be an absolute "
+                         "(lower, upper) pair, got {!r}".format(name, bounds))
+    lower, upper = (float(b) for b in bounds)
+    if not lower <= baseline <= upper:
+        raise ValueError("bounds ({}, {}) for planform variable {!r} must bracket its "
+                         "baseline value {} (the variable starts there)"
+                         .format(lower, upper, name, baseline))
+    lower, upper = np.array([lower]), np.array([upper])
+
+    if scaler_mode is None:
+        scaler = None
+    elif scaler_mode == 'bounds':
+        half_range = max(upper[0] - baseline, baseline - lower[0])
+        scaler = np.array([1.0 / half_range if half_range > 0. else 1.0])
+    else:
+        raise ValueError("scaler_mode must be 'bounds' or None, got {!r}".format(scaler_mode))
+
+    return CPMotionDV(coord_idxs=None, shape=(1,), value=np.array([baseline]),
+                      lower=lower, upper=upper, scaler=scaler)
+
+
 class ShapeDVSet:
     """The ordered set of shape design variables of a driver.
 
     ``flat_variable`` concatenates them, in declaration order and each variable
     flattened in C order, into the one vector the model takes as its
-    ``cp_motion_inputs``.
+    ``shape_parameters``.
     """
 
     def __init__(self):
@@ -294,7 +333,7 @@ class ShapeDVSet:
     def flat_variable(self):
         """All shape variables as one csdl vector, in declaration order.
 
-        This is what the model takes as its ``cp_motion_inputs``. A single
+        This is what the model takes as its ``shape_parameters``. A single
         variable is returned as is.
         """
         import csdl_alpha as csdl

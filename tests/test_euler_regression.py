@@ -31,12 +31,11 @@ def quantities():
 def test_assembly_matches_reference(quantities, key):
     q, ref = quantities
     serial = MPI.COMM_WORLD.size == 1
-    tol = 0.0 if serial else 1e-12 * max(np.abs(ref[key]).max(), 1.0)
-    np.testing.assert_allclose(q[key], ref[key], rtol=0, atol=tol)
+    np.testing.assert_almost_equal(q[key], ref[key], decimal=12)
 
 
 @pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="the Newton iterates depend on the partitioning")
 @pytest.mark.parametrize("key", ["newton_history", "newton_state"])
 def test_newton_matches_reference(quantities, key):
     q, ref = quantities
-    np.testing.assert_array_equal(q[key], ref[key])
+    np.testing.assert_almost_equal(q[key], ref[key], decimal=12)

@@ -15,8 +15,6 @@ from time import perf_counter
 from dragonfly_sim.core.mesh_manager import Mesh
 from dragonfly_sim.core.Euler_model import CompressibleEulerModel
 from dragonfly_sim.core.meshwarping import IDWarp_jax
-from dragonfly_sim.core.shape_parameterization import WallFFD, WallGeometry
-from dragonfly_sim.utils.meshwarping_utils import inner_bdry_function_from_corner_list
 from dragonfly_sim.utils.data_handler import DataStore
 
 from dragonfly_sim.utils.petsc_utils import set_petsc_vec_array
@@ -32,26 +30,32 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
     # the shared mesh, so they must never overlap -- also on a single process.
     ordered_callbacks = True
 
-    def __init__(self, mesh, boundary_dict, ffd_shape=None, aero_center=None,
-                 mesh_inner_bdry_function=None, ffd_block_corner_list=None, cp_coord_opt_idxs=None,
-                 poly_order=1, gamma=1.4, ffd_degree=2,
+    def __init__(self, mesh, boundary_dict, shape_parameterization=None, aero_center=None,
+                 mesh_inner_bdry_function=None,
+                 poly_order=1, gamma=1.4,
                  filename_suffix="test",
                  asm_overlap=None, ilu_levels=None,
                  model_class=CompressibleEulerModel, model_kwargs=None, farfield="split"):
         """
         The shape of the object being optimized is defined either through `mesh_inner_bdry_function`
-        or through ffd_block_corner_list, which defines the box the inner boundary
-        facets are contained in and can therefore supply the same signal. At least
-        one of the two is required; when both are given the explicit function
-        wins, since it can encode exclusions the FFD block cannot.
+        or through the shape parameterization's FFD block corners
+        (shape_parameterization.inner_boundary_function()), which bound the box
+        the inner boundary facets are contained in and can therefore supply the
+        same signal. At least one of the two is required; when both are given
+        the explicit function wins, since it can encode exclusions the FFD block
+        cannot.
 
-        ffd_shape: the FFD control-point block (e.g. [5, 3]). With it,
-        set_up_sim builds the FFD block (self.ffd) and the IDWarp mesh warper
-        (self.mesh_warper), and evaluate() takes the mesh node motions and shape
-        parameters as inputs: shape optimization. Without it (None) neither is
-        built, the mesh stays fixed, and evaluate() takes alpha only: a forward
-        flow analysis, with derivatives with respect to alpha. solve_forward()
-        runs one flow solve without a CSDL graph at all.
+        shape_parameterization: the wall-shape parameterization, e.g. a
+        shape_design.FFDShapeParameterization -- the FFD block and the layers
+        that define the shape design variables and their bounds. The model does
+        not need to know what those variables are: set_up_sim builds the IDWarp
+        mesh warper (self.mesh_warper) and hands the wall to
+        shape_parameterization.setup(); deform_mesh() turns its wall
+        displacement into mesh node motions; evaluate() takes those and the
+        flat shape parameter vector: shape optimization. Without it (None) no
+        warper is built, the mesh stays fixed, and evaluate() takes alpha only:
+        a forward flow analysis, with derivatives with respect to alpha.
+        solve_forward() runs one flow solve without a CSDL graph at all.
 
         aero_center: moment reference point; defaults to (0.25, 0[, 0]).
 
@@ -90,23 +94,18 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         # These two orderings are 1:1 by construction and differ only in
         # index order, so this tolerance accounts for round-off errors
         self.mesh_node_match_tol = 1e-10
-        # Newton tolerance for projecting mesh boundary nodes into the FFD
-        # block's parametric space.
-        self.ffd_projection_newton_tol = 1e-12
-        # Containment test used to pick the inner-boundary facets out of the
-        # FFD block when no explicit mesh_inner_bdry_function is given.
-        self.inner_bdry_rel_tol = 1e-6
-        self.inner_bdry_overset_margin = 1e-4
 
-        # Resolved AFTER the tolerance block above, which is what it reads.
+        if shape_parameterization is not None and not hasattr(shape_parameterization, 'setup'):
+            raise TypeError("shape_parameterization must be a shape parameterization object "
+                            "(e.g. shape_design.FFDShapeParameterization), got {!r}. The FFD "
+                            "block arguments (ffd_shape, ffd_degree, ffd_block_corner_list, "
+                            "cp_coord_opt_idxs) moved there.".format(shape_parameterization))
+        if mesh_inner_bdry_function is None and shape_parameterization is not None:
+            mesh_inner_bdry_function = shape_parameterization.inner_boundary_function()
         if mesh_inner_bdry_function is None:
-            if ffd_block_corner_list is None:
-                raise ValueError("Provide either mesh_inner_bdry_function or "
-                                 "ffd_block_corner_list to locate the inner boundary facets.")
-            mesh_inner_bdry_function = inner_bdry_function_from_corner_list(
-                ffd_block_corner_list,
-                overset_margin=self.inner_bdry_overset_margin,
-                rel_tol=self.inner_bdry_rel_tol)
+            raise ValueError("Provide either mesh_inner_bdry_function or a shape "
+                             "parameterization with FFD block corners to locate the inner "
+                             "boundary facets.")
 
         # Initial instantiation of mesh and simulation model
         self.mesh = Mesh(mesh, mesh_inner_bdry_function,
@@ -133,18 +132,12 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         # Mainly used for testing purposes.
         self.sim_model.last_solve_converged = False
 
-        self.ffd_shape = ffd_shape
-        # FFD and mesh warping only when an FFD block is given (see __init__)
-        self.shape_parameterized = ffd_shape is not None
-        self.ffd_block_corner_list = ffd_block_corner_list
-        self.ffd_degree = ffd_degree
-        self.cp_coord_opt_idxs = cp_coord_opt_idxs
+        # Mesh warping only with a shape parameterization (see __init__)
+        self.shape_parameterization = shape_parameterization
+        self.shape_parameterized = shape_parameterization is not None
 
-        # Initialize some mesh deformation properties, 
-        # defined in set_up_sim()
+        # The mesh warper, built in set_up_sim()
         self.mesh_warper = None
-        self.ffd = None
-        self._wall_geometry = None
 
         # Define data storage object for external post-processing
         self.data_store = DataStore()
@@ -243,19 +236,16 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
 
             PETSc.Sys.Print("Initialized mesh warping object")
 
-            # The lsdo_geo FFD block around the wall nodes. Shape layers
-            # (shape_parameterization.SectionalShape, WallFFD.apply_cp_motions) turn
-            # the design variables into its coefficients; wall_displacement() is the
-            # replicated (M_global, dim) array mesh_warper.evaluate takes, in the
-            # numbering of the mesh's wall node set.
+            # The shape parameterization gets the wall nodes (replicated, in the
+            # numbering of the mesh's wall node set) and facets; its
+            # wall_displacement() is the (M_global, dim) array mesh_warper.evaluate
+            # takes.
             wall_nodes = self.mesh.boundary_node_set((self.WALL_TAG,))
-            self.ffd = WallFFD(self.mesh.mesh.comm, wall_nodes.coords,
-                               wall_nodes.global_idx, self.ffd_shape,
-                               degree=self.ffd_degree,
-                               ffd_block_corner_list=self.ffd_block_corner_list,
-                               projection_newton_tol=self.ffd_projection_newton_tol)
+            self.shape_parameterization.setup(self.mesh.mesh.comm, wall_nodes.coords,
+                                              wall_nodes.global_idx,
+                                              self.mesh.wall_facets(self.WALL_TAG))
         else:
-            PETSc.Sys.Print("No FFD block given: fixed mesh, forward flow analysis")
+            PETSc.Sys.Print("No shape parameterization given: fixed mesh, forward flow analysis")
 
         # define the integration measure for the mesh cells and non-boundary facets
         self.mesh.form_manager.build_cell_and_interior_facet_measures(
@@ -318,48 +308,67 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
             f.write('{}   {}  {}  {}  {}\n'.format(
                 self.eval_idx, datetime.datetime.now(), os.getpid(), mem, stage))
 
+    @property
+    def ffd(self):
+        """The shape parameterization's FFD block (None without one, or before
+        set_up_sim)."""
+        if self.shape_parameterization is None:
+            return None
+        return getattr(self.shape_parameterization, 'ffd', None)
+
     def wall_geometry(self):
         """Geometric constraint quantities of the FFD-deformed wall (area/volume,
-        thickness, planform); see shape_parameterization.WallGeometry.
+        thickness, planform); the shape parameterization's
+        shape_parameterization.WallGeometry.
 
         Built on first use. Collective: call it on every rank.
         """
         if self.ffd is None:
-            raise RuntimeError("wall_geometry needs an FFD block (pass ffd_shape)")
-        if self._wall_geometry is None:
-            self._wall_geometry = WallGeometry(self.ffd, self.mesh.wall_facets(self.WALL_TAG))
-        return self._wall_geometry
+            raise RuntimeError("wall_geometry needs a shape parameterization (an FFD block), "
+                               "set up by set_up_sim")
+        return self.shape_parameterization.geometry
 
-    def evaluate(self, mesh_node_motions:csdl.Variable = None, cp_motion_inputs:csdl.Variable = None,
+    def deform_mesh(self):
+        """Mesh node motions (CSDL) for the shape parameterization's current
+        wall displacement: the first input of evaluate(). Call after the
+        shape design variables are declared."""
+        if not self.shape_parameterized:
+            raise RuntimeError("deform_mesh needs a shape parameterization")
+        shape = self.shape_parameterization
+        return self.mesh_warper.evaluate(shape.wall_displacement(), shape.parameter_vector())
+
+    def evaluate(self, mesh_node_motions:csdl.Variable = None, shape_parameters:csdl.Variable = None,
                  alpha:csdl.Variable = None):
         """
         The flow state u_vec as a CSDL output.
 
-        Shape optimization (an FFD block was given): evaluate(mesh_node_motions,
-        cp_motion_inputs, alpha). Forward analysis on the fixed mesh:
+        Shape optimization (a shape parameterization was given):
+        evaluate(mesh_node_motions, shape_parameters, alpha), with
+        mesh_node_motions from deform_mesh() and shape_parameters the flat
+        shape parameter vector. Forward analysis on the fixed mesh:
         evaluate(alpha=alpha). alpha is always required.
         """
         if alpha is None:
             raise ValueError("evaluate needs alpha")
-        if (mesh_node_motions is None) != (cp_motion_inputs is None):
-            raise ValueError("pass mesh_node_motions and cp_motion_inputs together, or neither")
+        if (mesh_node_motions is None) != (shape_parameters is None):
+            raise ValueError("pass mesh_node_motions and shape_parameters together, or neither")
         if mesh_node_motions is not None and not self.shape_parameterized:
-            raise ValueError("mesh_node_motions given, but there is no FFD block / mesh warper "
-                             "(pass ffd_shape to DG_windtunnel_model)")
+            raise ValueError("mesh_node_motions given, but there is no shape parameterization / "
+                             "mesh warper (pass shape_parameterization to DG_windtunnel_model)")
 
         # set inputs using self.declare_input
         if mesh_node_motions is not None:
             self.declare_input('mesh_node_motions', mesh_node_motions)
-            self.declare_input('cp_motion_inputs', cp_motion_inputs)
+            self.declare_input('shape_parameters', shape_parameters)
         self.declare_input('alpha', alpha)
 
         # The output on this rank is only the local portion of the solution vector
         u_vec = self.create_output('u_vec', (self.sim_model.u_vec.x.petsc_vec.local_size,))
 
         if mesh_node_motions is not None:
-            # We have declared cp_motion_inputs as an input here, just for logging and computation purposes,
-            # not because we actually need it; mesh_node_motions carries the effect of the cp_motion_inputs.
-            self.declare_derivative_parameters(of='u_vec', wrt='cp_motion_inputs', dependent=False)
+            # We have declared shape_parameters as an input here, just for logging and computation purposes,
+            # not because we actually need it; mesh_node_motions carries the effect of the shape_parameters.
+            self.declare_derivative_parameters(of='u_vec', wrt='shape_parameters', dependent=False)
 
         return u_vec
 
@@ -385,14 +394,14 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
     def solve_residual_equations(self, input_vals, output_vals):
         # Define inputs
         mesh_node_motions = input_vals['mesh_node_motions'] if 'mesh_node_motions' in input_vals else None
-        cp_motion_inputs = input_vals['cp_motion_inputs'] if 'cp_motion_inputs' in input_vals else None
+        shape_parameters = input_vals['shape_parameters'] if 'shape_parameters' in input_vals else None
         alpha = input_vals['alpha'][0]
 
         # Update the angle of attack to its current value
         self.sim_model.set_angle_of_attack(alpha)
 
         PETSc.Sys.Print("angle of attack: {} deg".format(np.degrees(alpha)))
-        PETSc.Sys.Print("cp motion inputs: {}".format(cp_motion_inputs))
+        PETSc.Sys.Print("shape parameters: {}".format(shape_parameters))
         PETSc.Sys.Print("solve_residual_equations, stepping into mesh.apply_node_motions")
         if mesh_node_motions is not None:
             PETSc.Sys.Print("mesh_node_motions 2-norm: {}".format(np.linalg.norm(mesh_node_motions)))
@@ -581,7 +590,7 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
 
             if mesh_node_motions is not None:
                 PETSc.Sys.Print("mesh_node_motions min, max: {}, {}".format(mesh_node_motions.min(), mesh_node_motions.max()))
-                PETSc.Sys.Print("cp motions: {}".format(input_vals['cp_motion_inputs']))
+                PETSc.Sys.Print("shape parameters: {}".format(input_vals['shape_parameters']))
             PETSc.Sys.Print("alpha: {}".format(np.degrees(alpha)))
 
             d_residuals['u_vec'] = self._d_residual_petsc.getArray()
