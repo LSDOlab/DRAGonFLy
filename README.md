@@ -52,6 +52,7 @@ Navier-Stokes (RANS) equations, steady or unsteady. It is distributed as `dragon
 | `examples/wing_opt.py` | Euler drag minimization of a 3D wing with planform and section variables |
 | `examples/airfoil_analysis.py` | forward Euler or RANS analysis without shape variables |
 | `examples/flow_analysis.py` | steady or unsteady Euler, laminar or RANS analysis of any mesh, from the command line |
+| `examples/benchmark_pod.py` | POD reduced-order model against the full-order solve, Euler and RANS at the same design points |
 | `examples/ONERA-OAT15A/` | RANS mesh-sensitivity study of the ONERA OAT15A transonic airfoil ([results](examples/ONERA-OAT15A/README.md)) |
 
 ## Installation

@@ -50,6 +50,18 @@ class DataStore():
         self.ROM_meets_threshold = []
         self.rom_coefficient_errors = []
         self.global_snapshot_sing_vals_per_iteration = []
+        # ROM accuracy against the FOM at the same design (examples/
+        # benchmark_pod.py): (eval_idx, D, L, M, nan) like FOM_forces, whether
+        # the reduced solve converged, the absolute residual norm, and the
+        # absolute and relative L2 errors of the state over the domain and
+        # over the wall
+        self.ROM_forces = []
+        self.rom_converged = []
+        self.rom_twonorm_residuals = []
+        self.absolute_l2_errors_per_iteration = []
+        self.relative_l2_errors_per_iteration = []
+        self.absolute_l2_bdry_errors_per_iteration = []
+        self.relative_l2_bdry_errors_per_iteration = []
 
         # Number of DoFs in simulation
         self.fe_dofs = 0

@@ -27,6 +27,8 @@ from idwarp_jax import build_volume_pts_func
 from idwarp_jax.warp import compute_idwarp_reference_length
 
 import csdl_alpha as csdl
+
+from dragonfly_sim.utils.solver_profiling import PROFILER as _PROF
 # ordered_callbacks needs csdl_alpha with ordered custom-operation callbacks (branch
 # mpi_callback_issue); older versions ignore it, and MPI runs give wrong gradients.
 assert hasattr(csdl.CustomExplicitOperation, "ordered_callbacks"), \
@@ -546,9 +548,10 @@ class IDWarp_jax(csdl.CustomExplicitOperation):
         t0 = perf_counter()
         self._log_memory("before compute")
 
-        wall = self._project(input_vals["bdry_motions"])
-        Xv = self._warp(self._Xs0 + self._expand(wall), _NO_PITCH)
-        motions = self._assemble_motions(wall, Xv - self._Xv0)
+        with _PROF.phase("mesh:warp"):
+            wall = self._project(input_vals["bdry_motions"])
+            Xv = self._warp(self._Xs0 + self._expand(wall), _NO_PITCH)
+            motions = self._assemble_motions(wall, Xv - self._Xv0)
         output_vals["mesh_node_motions"] = motions
 
         local_max = float(np.abs(motions).max()) if motions.size else 0.0
@@ -577,7 +580,8 @@ class IDWarp_jax(csdl.CustomExplicitOperation):
 
             seed = np.zeros_like(self._Xv0)
             seed[:self._n_interior][:, self._cols] = d_out[self._interior_local_idx]
-            d_Xs, _ = self._warp_vjp(Xs, _NO_PITCH, seed)
+            with _PROF.phase("mesh:warp_vjp"):
+                d_Xs, _ = self._warp_vjp(Xs, _NO_PITCH, seed)
 
             # Identity block: the owned wall rows of the output are the wall
             # motions themselves.

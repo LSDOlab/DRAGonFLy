@@ -36,6 +36,7 @@ import dolfinx.fem.petsc
 from dragonfly_sim.utils.derived_fields import (DerivedField, diagonal_mass_inverse,
                                                 mesh_coordinate_argument)
 from dragonfly_sim.utils.gradient_condensation import CondensedGradientProblem
+from dragonfly_sim.utils.solver_profiling import PROFILER as _PROF
 
 _JIT = {"cffi_extra_compile_args": ["-O3", "-march=native", "-ffast-math"]}
 
@@ -296,13 +297,14 @@ class GreenGaussReconstruction:
     def update_gradient(self):
         """G <- M_G^-1 b(U) at the current state and mesh. Collective."""
         self.set_up()
-        b = self._gg_vec
-        with b.localForm() as loc:
-            loc.set(0.0)
-        dolfinx.fem.petsc.assemble_vector(b, self._gg_form)
-        b.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
-        self.G.x.petsc_vec.pointwiseMult(b, self.inv_mass)
-        self.G.x.scatter_forward()
+        with _PROF.phase("assemble:gradient"):
+            b = self._gg_vec
+            with b.localForm() as loc:
+                loc.set(0.0)
+            dolfinx.fem.petsc.assemble_vector(b, self._gg_form)
+            b.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
+            self.G.x.petsc_vec.pointwiseMult(b, self.inv_mass)
+            self.G.x.scatter_forward()
 
     def make_problem(self, F_newton, J_newton):
         self.set_up()

@@ -128,7 +128,9 @@ time for comparison, gave:
 All ROM solves converged, but none met the default `eta_threshold` of $10^{-10}$. On these cases every
 evaluation fell back to the full-order solve, and the ROM added a few seconds per evaluation. Raise
 `eta_threshold` only where the coefficient errors at that $\eta$ are acceptable; `run_fom_every_evaluation=True`
-measures them.
+measures them. `examples/benchmark_pod.py` measures them systematically: Euler and RANS ROMs at the same
+sampled design points (shape, $\alpha$ and $M_\infty$), against the full-order solves (see
+[Examples](examples.md)).
 
 ## Flow models
 

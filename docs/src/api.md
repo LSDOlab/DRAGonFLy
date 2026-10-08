@@ -21,6 +21,8 @@ The main entry points:
 - `dragonfly_sim.utils.mesh_io_utils`: mesh input from XDMF or structured CGNS grids (`load_dolfinx_mesh`,
   `cgns_to_dolfinx_mesh`, `read_cgns_planar`, `read_cgns_volume`)
 - `dragonfly_sim.utils.filewriter.FileWriter`: VTX output for ParaView
+- `dragonfly_sim.utils.solver_profiling`: per-phase wall-time profiling (`PROFILER`; see
+  Profiling in the [user guide](user_guide.md))
 - `dragonfly_sim.utils.checkpoint`: partition-independent checkpoints (`save_checkpoint`, `load_checkpoint`)
 
 ```{toctree}

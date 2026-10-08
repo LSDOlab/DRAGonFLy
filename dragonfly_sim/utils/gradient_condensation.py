@@ -38,6 +38,7 @@ from dolfinx.fem.forms import form as _create_form
 from dolfinx.fem.petsc import assemble_matrix, create_matrix
 
 from dragonfly_sim.utils.Nonlinear_utils import NonlinearProblem_mod
+from dragonfly_sim.utils.solver_profiling import PROFILER as _PROF
 
 
 class CondensedJacobian:
@@ -130,10 +131,11 @@ class CondensedGradientProblem(NonlinearProblem_mod):
 
         def compact(snes_, x, A, P):
             sync(x)
-            self.update_G()
-            self._A_UU.zeroEntries()
-            assemble_matrix(self._A_UU, self._a)
-            self._A_UU.assemble()
+            with _PROF.phase("assemble:jacobian"):
+                self.update_G()
+                self._A_UU.zeroEntries()
+                assemble_matrix(self._A_UU, self._a)
+                self._A_UU.assemble()
         snes.setJacobian(compact, self._A_UU, self._A_UU)
 
     def F(self, x, b):
@@ -141,8 +143,9 @@ class CondensedGradientProblem(NonlinearProblem_mod):
         super().F(x, b)
 
     def J(self, x, A):
-        self.update_G()
-        self._condensed.assemble()
+        with _PROF.phase("assemble:jacobian"):
+            self.update_G()
+            self._condensed.assemble()
         if A.handle != self._A.handle:
             A.assemble()
             self._A.copy(A)

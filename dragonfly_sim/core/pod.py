@@ -299,7 +299,13 @@ class PODBasis:
     WEIGHT_FUNCTIONS = ('Cubic', 'Linear', 'Quadratic', 'InverseDistance')
 
     def __init__(self, comm, n_dofs, basis_mode='global', subtract_mean=False,
-                 mean_weighting='snapshot_weights', IP_matrix=None, max_rank=None, qr_rank_tol=1e-10):
+                 mean_weighting='snapshot_weights', IP_matrix=None, max_rank=None, qr_rank_tol=1e-10,
+                 cubic_cutoff=None):
+        """
+        cubic_cutoff: the default c in [0, 1) of the Cubic weight's support
+        radius for local_weighted bases (see construct_basis); None selects
+        the n_nonzero_weights rule instead.
+        """
         if basis_mode not in self.SUPPORTED_BASIS_MODES:
             raise ValueError("basis_mode must be one of {}, got {!r}".format(
                 self.SUPPORTED_BASIS_MODES, basis_mode))
@@ -316,6 +322,9 @@ class PODBasis:
         self.subtract_mean = subtract_mean
         self.mean_weighting = mean_weighting
         self.IP_matrix = IP_matrix
+        if cubic_cutoff is not None:
+            cubic_dist_hat_fixed(0.0, 1.0, cubic_cutoff)    # validates c
+        self.cubic_cutoff = cubic_cutoff
         self.snapshot_matrix = SnapshotMatrix(comm, n_dofs, W=IP_matrix, qr_rank_tol=qr_rank_tol,
                                               reorthogonalize=True, max_rank=max_rank)
         self.basis = None
@@ -427,7 +436,8 @@ class PODBasis:
           n_nonzero_weights      Cubic: number of nearest snapshots with a
                                  nonzero weight (default rb_size)
           cubic_cutoff           Cubic: instead of n_nonzero_weights, a
-                                 c in [0, 1) with support radius
+                                 c in [0, 1) (default: the one given at
+                                 construction) with support radius
                                  max(c min_dist + (1 - c) max_dist, r_rb),
                                  r_rb the smallest radius that leaves the
                                  rb_size nearest accepted snapshots a nonzero
@@ -463,7 +473,7 @@ class PODBasis:
                 raise ValueError("the local_weighted basis needs local_parametervector")
             weights, parameter_distnorm = self._local_weighted_snapshot_weights(
                 local_parametervector, weightfunction, parameter_weights, n_nonzero_weights, rb_size,
-                cubic_cutoff=cubic_cutoff)
+                cubic_cutoff=self.cubic_cutoff if cubic_cutoff is None else cubic_cutoff)
             PETSc.Sys.Print("snapshot weights: {}".format(weights))
 
             # diagonal weight matrix restricted to the columns above 1e-10

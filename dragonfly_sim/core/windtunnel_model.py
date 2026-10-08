@@ -21,6 +21,7 @@ from dragonfly_sim.utils.petsc_utils import set_petsc_vec_array
 from dragonfly_sim.utils.derived_fields import destroy_chained_operator
 from dragonfly_sim.utils.solver_utils import ksp_converged_reason_name
 from dragonfly_sim.core.postprocessor import DG_postprocessor
+from dragonfly_sim.utils.solver_profiling import PROFILER as _PROF
 
 
 # TODO: Look into using entropy variables instead of conservative variables;
@@ -478,10 +479,11 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
             PETSc.Sys.Print("Writing aligned output frame at eval_idx {} (FOM solution)".format(
                 self.eval_idx))
             # we write the deformation and the solution outputs to the same time step indices
-            if mesh_node_motions is not None:
-                self.mesh.write_deformation_output(mesh_node_motions, self.eval_idx)
-            self.sim_model.write_solution_output(self.eval_idx,
-                                                 solution_array=solution_output)
+            with _PROF.phase("output:solution"):
+                if mesh_node_motions is not None:
+                    self.mesh.write_deformation_output(mesh_node_motions, self.eval_idx)
+                self.sim_model.write_solution_output(self.eval_idx,
+                                                     solution_array=solution_output)
             self._last_written_design = design
 
         self.mesh.reset_nodes()
@@ -549,9 +551,10 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
 
     def _log_rom_solve(self, result):
         # coefficients of the ROM solution, logged like the FOM's
-        _, cl = self.postprocessor.compute_cl(result.solution)
-        _, cd = self.postprocessor.compute_cd(result.solution)
-        _, cm = self.postprocessor.compute_cm(result.solution)
+        with _PROF.phase("post:coefficients"):
+            _, cl = self.postprocessor.compute_cl(result.solution)
+            _, cd = self.postprocessor.compute_cd(result.solution)
+            _, cm = self.postprocessor.compute_cm(result.solution)
         if self.mesh.mesh.comm.Get_rank() == 0:
             self.data_store.ROM_walltime += [(self.eval_idx, result.walltime)]
             self.data_store.rom_relative_residuals += [(self.eval_idx, result.eta)]
@@ -605,10 +608,11 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         fom_post_time = perf_counter()
         PETSc.Sys.Print("FOM wall time: {}".format(fom_post_time - fom_pre_time))
 
-        L_fom, cl_fom = self.postprocessor.compute_cl(solution_fom)
-        D_fom, cd_fom = self.postprocessor.compute_cd(solution_fom)
-        M_fom, cm_fom = self.postprocessor.compute_cm(solution_fom)
-        cma_fom = self._cm_alpha_for_logging(solution_fom)
+        with _PROF.phase("post:coefficients"):
+            L_fom, cl_fom = self.postprocessor.compute_cl(solution_fom)
+            D_fom, cd_fom = self.postprocessor.compute_cd(solution_fom)
+            M_fom, cm_fom = self.postprocessor.compute_cm(solution_fom)
+            cma_fom = self._cm_alpha_for_logging(solution_fom)
         self._last_fom_coefficients = (cd_fom, cl_fom, cm_fom)
 
         if self.mesh.mesh.comm.Get_rank() == 0:

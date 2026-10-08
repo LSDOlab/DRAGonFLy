@@ -521,9 +521,11 @@ class TestPODLocalWeightedBasis:
     N_SNAPSHOTS = 8
 
     @contextlib.contextmanager
-    def _qr_case(self, n_snapshots, seed=20260918):
+    def _qr_case(self, n_snapshots, seed=20260918, orthonormal=True):
         comm = MPI.COMM_WORLD
-        columns, _ = np.linalg.qr(np.random.default_rng(seed).standard_normal((self.N_DOFS, n_snapshots)))
+        columns = np.random.default_rng(seed).standard_normal((self.N_DOFS, n_snapshots))
+        if orthonormal:
+            columns, _ = np.linalg.qr(columns)
         pod = PODBasis(comm, self.N_DOFS, basis_mode='local_weighted')
         template = dense_vec(comm, self.N_DOFS)
         rstart, rend = template.getOwnershipRange()
@@ -576,6 +578,29 @@ class TestPODLocalWeightedBasis:
             pod.construct_basis(rb_size=rb_size, cubic_cutoff=c, n_nonzero_weights=1,
                                 local_parametervector=np.array([0.0]), layout_vec=template)
             assert pod.basis.getSize()[1] == min(rb_size, self.N_SNAPSHOTS)
+
+    def test_cubic_cutoff_set_at_construction(self):
+        """c given to PODBasis() is construct_basis's default: the basis equals
+        the one from passing the same c per call, and differs from the
+        n_nonzero_weights rule (c = 0.5 gives 4 contributing snapshots, the
+        default rule rb_size = 2; the snapshots are not orthogonal, so that
+        changes the leading subspace). An invalid c fails at construction."""
+        with pytest.raises(ValueError):
+            PODBasis(MPI.COMM_WORLD, self.N_DOFS, basis_mode='local_weighted', cubic_cutoff=1.0)
+
+        def basis(c_init, c_call):
+            with self._qr_case(self.N_SNAPSHOTS, orthonormal=False) as (pod, template):
+                pod.cubic_cutoff = c_init            # what PODBasis(..., cubic_cutoff=c_init) stores
+                pod.construct_basis(rb_size=2, cubic_cutoff=c_call,
+                                    local_parametervector=np.array([0.0]), layout_vec=template)
+                return np.vstack(MPI.COMM_WORLD.allgather(pod.basis.getDenseArray().copy()))
+
+        V_init, V_call, V_default = basis(0.5, None), basis(None, 0.5), basis(None, None)
+        assert np.array_equal(V_init, V_call)
+        assert not np.allclose(np.abs(V_init.T @ V_default), np.eye(2), atol=1e-6)
+        pod = PODBasis(MPI.COMM_WORLD, self.N_DOFS, basis_mode='local_weighted', cubic_cutoff=0.5)
+        assert pod.cubic_cutoff == 0.5
+        pod.destroy()
 
     def test_cubic_cutoff_floor_counts_accepted_snapshots_only(self):
         """A duplicate of snapshot 0 (its parameter and state) adds no column,

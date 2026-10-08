@@ -46,6 +46,26 @@ $C_p$/$c_f$ files, optional VTX fields, and a checkpoint for `--restart`. See `-
 | Objective, constraint | minimize drag $D$ subject to lift $L \ge 10$ |
 | Optional (commented out) | raw control-point motions; planform-area, volume and thickness constraints |
 
+## `benchmark_pod.py`: full-order against reduced-order solutions
+The [POD reduced-order model](reduced_order_modeling.md) of the Euler and the RANS model at the same design
+points. Each model trains its own `pod_global` and `pod_local` (local_weighted) ROMs on the full-order solutions
+at a Latin-Hypercube sample of (FFD control-point motions, $\alpha$, $M_\infty$), then compares them with the
+full-order solve at a separate random test set: state L2 errors, lift, drag and moment errors, the ROM residual
+and the wall times, with a per-phase breakdown of every test solve (see Profiling in the [user guide](user_guide.md)). It
+writes one `DataStore` per (model, variant), box plots with Euler and RANS side by side, and stacked bars of where
+the full-order and reduced-order solves spend their time.
+
+| | |
+|---|---|
+| Meshes | 2D (`--dimension 2D`): `naca0012_euler_mesh_quad_v2` (Euler), `naca0012_cgrid_rans_coarse` (RANS); 3D (default): `wing_vol_L3.cgns` for both |
+| Design space | vertical FFD control-point motions (10 x 3 in 2D, $\pm 0.01$; 4 x 5 x 3 in 3D, spanwise-tapered), $\alpha \in [1.75^\circ, 2.25^\circ]$, $M_\infty \in [0.7, 0.9]$ |
+| Defaults | 50 training and 25 test points, `rb_size` 10, Mach continuation for the full-order solves, ROMs started from the free stream |
+
+Every setting is a command-line option (`--help`), e.g. a quick 2D run:
+```sh
+$ OMP_NUM_THREADS=1 mpirun -n 4 python examples/benchmark_pod.py --dimension 2D --n-train 10 --n-test 5
+```
+
 ## Validation
 Validation cases compare DRAGonFLy with experiments and other solvers, and test how the results depend on the
 grid. They need meshes that are not in the repository; each page says where to get them.

@@ -169,6 +169,20 @@ solve runs as usual and its solution is added to the basis. `run_fom_every_evalu
 solve every time, to compare the two. Basis, inner product and stopping rules are described in
 [Reduced-order modeling](reduced_order_modeling.md).
 
+## Profiling
+`utils/solver_profiling.py` times the phases of every solve: assembly, the linear (or reduced) solve, ROM
+projection, the positivity limiter, set-up, mesh deformation and warping, file output and coefficient
+evaluation. It is off by default and then costs nothing.
+```python
+model.sim_model.enable_profiling(enabled=True)    # every solve on this communicator from now on
+...
+model.sim_model.profile_report(title="my run", reset=True)
+```
+The report lists each phase's own time (nested phases subtracted, maximum over the MPI ranks), the totals per
+group (`assemble`, `solve`, `rom`, ...) and the assembly fraction, which bounds the speed-up a projection-only ROM
+can reach per Newton step. MPI barriers at the phase edges (`barriers=True`, the default) charge load imbalance to
+the phase that causes it; they cost a few percent. `examples/benchmark_pod.py` uses it for its wall-time breakdowns.
+
 ## Output files
 Written to the working directory, named with `filename_suffix`:
 - `FOM_solution_*.bp`, `mesh_deformation_*.bp`: solution and mesh deformation per evaluation, in ADIOS2/VTX

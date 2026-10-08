@@ -13,6 +13,7 @@ from dragonfly_sim.utils.mpi_utils import allgather_numpy, assign_global_dof_off
 from dragonfly_sim.utils.meshwarping_utils import find_local_surface_nodes
 from dragonfly_sim.core.form_manager import FormManager
 from dragonfly_sim.utils.filewriter import FileWriter
+from dragonfly_sim.utils.solver_profiling import PROFILER as _PROF
 
 
 @dataclass(frozen=True)
@@ -222,10 +223,11 @@ class Mesh():
 
     def reset_nodes(self, notify=True):
         """Put every local node, ghosts included, back at its baseline position."""
-        gdim = self.mesh.geometry.dim
-        self.mesh.geometry.x[:, :gdim] = self.baseline_nodes[:, :gdim]
-        if notify:
-            self._notify_geometry_listeners()
+        with _PROF.phase("mesh:reset"):
+            gdim = self.mesh.geometry.dim
+            self.mesh.geometry.x[:, :gdim] = self.baseline_nodes[:, :gdim]
+            if notify:
+                self._notify_geometry_listeners()
 
     def apply_node_motions(self, node_motions):
         """Move the mesh to baseline + ``node_motions`` and re-check its cells.
@@ -236,20 +238,24 @@ class Mesh():
         their owners. Sets ``is_valid`` (no inverted or zero-volume cell) and
         returns it. Collective.
         """
-        self.reset_nodes(notify=False)
-        n, gdim = self.n_owned_nodes, self.mesh.geometry.dim
-        x = self.mesh.geometry.x
-        x[:n, :gdim] += node_motions[:, :gdim]
+        # geometry writes, the ghost scatter, the quality metrics and the
+        # geometry listeners (derived fields of a RANS model): per-evaluation
+        # cost in its own "mesh" phase group
+        with _PROF.phase("mesh:deform"):
+            self.reset_nodes(notify=False)
+            n, gdim = self.n_owned_nodes, self.mesh.geometry.dim
+            x = self.mesh.geometry.x
+            x[:n, :gdim] += node_motions[:, :gdim]
 
-        # geometry.x has no scatter_forward of its own: route the owned
-        # coordinates through a dolfinx.la.Vector on the geometry index map.
-        geom_vec = dolfinx.la.vector(self.mesh.geometry.index_map(), bs=3)
-        geom_vec.array[:n * 3] = x[:n, :].ravel()
-        geom_vec.scatter_forward()
-        x[:] = geom_vec.array.reshape(-1, 3)
+            # geometry.x has no scatter_forward of its own: route the owned
+            # coordinates through a dolfinx.la.Vector on the geometry index map.
+            geom_vec = dolfinx.la.vector(self.mesh.geometry.index_map(), bs=3)
+            geom_vec.array[:n * 3] = x[:n, :].ravel()
+            geom_vec.scatter_forward()
+            x[:] = geom_vec.array.reshape(-1, 3)
 
-        self._update_quality()
-        self._notify_geometry_listeners()
+            self._update_quality()
+            self._notify_geometry_listeners()
         return self.is_valid
 
     # ==================================================================

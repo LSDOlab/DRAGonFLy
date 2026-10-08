@@ -15,6 +15,7 @@ from dragonfly_sim.utils.petsc_utils import set_petsc_vec_array
 from dragonfly_sim.utils.solver_utils import (locate_positivity_limiting_nodes, ksp_converged_reason_name,
                                               ksp_norm_type_name, ksp_pc_side_name)
 from dragonfly_sim.core.form_manager import FormManager
+from dragonfly_sim.utils.solver_profiling import PROFILER as _PROF, default_group
 from dragonfly_sim.utils.Euler_utils import primitives, pressure, energy_density, flux, subsonic_inflow_state, subsonic_outflow_state, slip_wall_state, hll_flux, boundary_flux
 from dragonfly_sim.utils.NS_utils import (mean_flow, concat_state, extended_flux, extended_normal_flux,
                                           extended_hll_flux, extended_boundary_flux)
@@ -369,18 +370,19 @@ class CompressibleEulerModel():
             self.initial_conditions = concat_state(self.initial_conditions, extras)
 
     def interpolate_solution_vector(self, interpolant=None):
-        if interpolant is None:
-            interpolant = self.initial_conditions
+        with _PROF.phase("setup:interpolate_ic"):
+            if interpolant is None:
+                interpolant = self.initial_conditions
 
-        if isinstance(interpolant, (np.ndarray, PETSc.Vec)):
-            set_petsc_vec_array(self.u_vec.x.petsc_vec, interpolant)
-        else:
-            for j in range(interpolant.ufl_shape[0]):
-                self.u_vec.sub(j).interpolate(
-                    dolfinx.fem.Expression(interpolant[j], self.functionspaces['V'].sub(j).element.interpolation_points,
-                                           comm=self.mesh_obj.mesh.comm))
+            if isinstance(interpolant, (np.ndarray, PETSc.Vec)):
+                set_petsc_vec_array(self.u_vec.x.petsc_vec, interpolant)
+            else:
+                for j in range(interpolant.ufl_shape[0]):
+                    self.u_vec.sub(j).interpolate(
+                        dolfinx.fem.Expression(interpolant[j], self.functionspaces['V'].sub(j).element.interpolation_points,
+                                               comm=self.mesh_obj.mesh.comm))
 
-        self.u_vec.x.scatter_forward()
+            self.u_vec.x.scatter_forward()
 
     # ------------------------------------------------------------------
     # State layout
@@ -629,69 +631,95 @@ class CompressibleEulerModel():
 
     def set_up_solver(self):
         if not self.solver_is_set_up:
-            mat_type = "baij"
-            F_newton, J_newton = self.newton_forms()
-            if self.problem_factory is not None:
-                self.problem = self.problem_factory(F_newton, J_newton)
-            else:
-                self.problem = NonlinearProblem_mod(F_newton, J_newton, self.u_vec,
-                                                    jit_options={"cffi_extra_compile_args": ["-O3", "-march=native", "-ffast-math"]},
-                                                    mat_type=mat_type)
-            self.solver = SNESNewtonSolver(self.mesh_obj.mesh.comm, self.problem)
-            self.solver.convergence_criterion = "incremental"  # convergence is determined through the norm of the iterative solution update
-            self.solver.rtol = 1e-6
-            # Decoupled from rtol: with ||x|| ~ O(1e4), the old atol=1e-8
-            # floor demanded ~1e-12 RELATIVE precision on ||dx|| -- far
-            # tighter than rtol=1e-6 -- so Newton was burning its full
-            # max_it budget chasing an unreachable absolute target on every
-            # solve instead of stopping once rtol was satisfied. Setting
-            # atol to a floor well below anything reachable makes rtol the
-            # sole criterion carrying the Eisenstat-Walker forcing, as
-            # intended.
-            self.solver.atol = 1e-11
-            self.solver.max_it = int(self.fom_newton_inner_max_it)
+            with _PROF.phase("setup:solver"):
+                mat_type = "baij"
+                F_newton, J_newton = self.newton_forms()
+                if self.problem_factory is not None:
+                    self.problem = self.problem_factory(F_newton, J_newton)
+                else:
+                    self.problem = NonlinearProblem_mod(F_newton, J_newton, self.u_vec,
+                                                        jit_options={"cffi_extra_compile_args": ["-O3", "-march=native", "-ffast-math"]},
+                                                        mat_type=mat_type)
+                self.solver = SNESNewtonSolver(self.mesh_obj.mesh.comm, self.problem)
+                self.solver.convergence_criterion = "incremental"  # convergence is determined through the norm of the iterative solution update
+                self.solver.rtol = 1e-6
+                # Decoupled from rtol: with ||x|| ~ O(1e4), the old atol=1e-8
+                # floor demanded ~1e-12 RELATIVE precision on ||dx|| -- far
+                # tighter than rtol=1e-6 -- so Newton was burning its full
+                # max_it budget chasing an unreachable absolute target on every
+                # solve instead of stopping once rtol was satisfied. Setting
+                # atol to a floor well below anything reachable makes rtol the
+                # sole criterion carrying the Eisenstat-Walker forcing, as
+                # intended.
+                self.solver.atol = 1e-11
+                self.solver.max_it = int(self.fom_newton_inner_max_it)
 
-            self.solver.error_on_nonconvergence = False
+                self.solver.error_on_nonconvergence = False
 
-            def limiter(solver, x, dx):
-                ksp = solver.krylov_solver
+                def limiter(solver, x, dx):
+                    ksp = solver.krylov_solver
 
-                # Print solver summary (number of iterations, current residual norm, reason)
-                PETSc.Sys.Print("nls_solve_ solve: {} iterations, residual norm {} [{}]".format(
-                    ksp.getIterationNumber(), ksp.getResidualNorm(),
-                    ksp_converged_reason_name(ksp.getConvergedReason())))
-                dx_norm = dx.norm()
-                PETSc.Sys.Print("x pre norm: {}".format(x.norm()))
+                    # Print solver summary (number of iterations, current residual norm, reason)
+                    PETSc.Sys.Print("nls_solve_ solve: {} iterations, residual norm {} [{}]".format(
+                        ksp.getIterationNumber(), ksp.getResidualNorm(),
+                        ksp_converged_reason_name(ksp.getConvergedReason())))
+                    dx_norm = dx.norm()
+                    PETSc.Sys.Print("x pre norm: {}".format(x.norm()))
 
-                theta, initial_theta = self.positivity_step_length(x, dx)
-                self.last_step_theta = min(self.last_step_theta, theta)
+                    theta, initial_theta = self.positivity_step_length(x, dx)
+                    self.last_step_theta = min(self.last_step_theta, theta)
 
-                # Print (density and pressure) positivity-preserving under-relaxation summary
-                PETSc.Sys.Print("dx norm: {}; Initial theta: {}, theta applied: {}".format(dx_norm, initial_theta, theta))
-                self._report_positivity_limiting_node(x, dx, theta, initial_theta)
+                    # Print (density and pressure) positivity-preserving under-relaxation summary
+                    PETSc.Sys.Print("dx norm: {}; Initial theta: {}, theta applied: {}".format(dx_norm, initial_theta, theta))
+                    self._report_positivity_limiting_node(x, dx, theta, initial_theta)
 
-                # The solver lands on x - dx, so the limiter's job is to
-                # rescale dx in place; x itself must not be touched.
-                dx.scale(theta)
+                    # The solver lands on x - dx, so the limiter's job is to
+                    # rescale dx in place; x itself must not be touched.
+                    dx.scale(theta)
 
-            self.solver.set_step_limiter(limiter)
+                self.solver.set_step_limiter(limiter)
 
-            ksp = self.solver.krylov_solver
-            self.apply_krylov_solver_settings(ksp, monitor_convergence=False, max_it=300)
-            self.solver_is_set_up = True
+                ksp = self.solver.krylov_solver
+                self.apply_krylov_solver_settings(ksp, monitor_convergence=False, max_it=300)
+                self.solver_is_set_up = True
 
-            # Print Jacobian matrix block size
-            PETSc.Sys.Print("Euler Jacobian matrix type: {}, block size: {}".format(
-                self.solver.A.getType(), self.solver.A.getBlockSize()))
+                # Print Jacobian matrix block size
+                PETSc.Sys.Print("Euler Jacobian matrix type: {}, block size: {}".format(
+                    self.solver.A.getType(), self.solver.A.getBlockSize()))
 
-            # Print summary of various solver parameters
-            rtol, _, _, ksp_max_it = ksp.getTolerances()
-            PETSc.Sys.Print(
-                "Euler forward KSP: type={}, pc={}, norm={}, pc_side={}, "
-                "rtol={:.1e}, max_it={}".format(
-                    ksp.getType(), ksp.getPC().getType(),
-                    ksp_norm_type_name(ksp.getNormType()),
-                    ksp_pc_side_name(ksp.getPCSide()), rtol, ksp_max_it))
+                # Print summary of various solver parameters
+                rtol, _, _, ksp_max_it = ksp.getTolerances()
+                PETSc.Sys.Print(
+                    "Euler forward KSP: type={}, pc={}, norm={}, pc_side={}, "
+                    "rtol={:.1e}, max_it={}".format(
+                        ksp.getType(), ksp.getPC().getType(),
+                        ksp_norm_type_name(ksp.getNormType()),
+                        ksp_pc_side_name(ksp.getPCSide()), rtol, ksp_max_it))
+
+    def enable_profiling(self, enabled=True, barriers=True, reset=True):
+        """
+        Turn the phase timing of utils/solver_profiling.py on (or off) for
+        every solve on this model's communicator, and return the profiler.
+
+        `barriers` synchronizes the ranks at every phase edge, so load
+        imbalance is charged to the phase that caused it rather than to the
+        next collective (unbarriered, almost always the linear solve, which
+        would make assembly look free). It costs a few percent; pass
+        barriers=False to measure undisturbed end-to-end wall time instead.
+        The profiler is shared by every model in the process. Collective.
+        """
+        _PROF.configure(comm=self.mesh_obj.mesh.comm, enabled=enabled, barriers=barriers)
+        if reset:
+            _PROF.reset()
+        return _PROF
+
+    def profile_report(self, title="", reset=False):
+        """Print the accumulated phase breakdown (grouped by phase prefix) and
+        return it; optionally start afresh. Collective."""
+        out = _PROF.report(title=title, group_map=default_group)
+        if reset:
+            _PROF.reset()
+        return out
 
     def positivity_step_length(self, x, dx, tau=1.0):
         """
@@ -702,14 +730,15 @@ class CompressibleEulerModel():
         step limiter and by the reduced-order solve
         (core/reduced_order_model.py). Collective.
         """
-        dx_norm = dx.norm()
-        relative_dx = dx_norm / max(x.norm(), 1.)
-        initial_theta = min((tau / relative_dx)**0.5, 1.0) if dx_norm > 1e-16 else 0.
+        with _PROF.phase("limiter:positivity"):
+            dx_norm = dx.norm()
+            relative_dx = dx_norm / max(x.norm(), 1.)
+            initial_theta = min((tau / relative_dx)**0.5, 1.0) if dx_norm > 1e-16 else 0.
 
-        from dragonfly_sim.utils.solver_utils import compute_positivity_preserving_theta
-        theta = compute_positivity_preserving_theta(
-            self.mesh_obj.mesh.comm, x.array, dx.array, gamma=self.gamma, initial_theta=initial_theta,
-            block_size=self.n_state, n_mean=self.n_mean if self.n_extra else None)
+            from dragonfly_sim.utils.solver_utils import compute_positivity_preserving_theta
+            theta = compute_positivity_preserving_theta(
+                self.mesh_obj.mesh.comm, x.array, dx.array, gamma=self.gamma, initial_theta=initial_theta,
+                block_size=self.n_state, n_mean=self.n_mean if self.n_extra else None)
         return theta, initial_theta
 
     @contextlib.contextmanager
@@ -852,13 +881,14 @@ class CompressibleEulerModel():
         norm. Derived fields (e.g. a reconstructed gradient) are brought up
         to date with the current state first.
         """
-        self.update_derived_fields()
-        with self.residual_vec_physical.localForm() as loc:
-            loc.set(0.0)
-        dolfinx.fem.petsc.assemble_vector(self.residual_vec_physical, self.F_physical_form)
-        self.residual_vec_physical.ghostUpdate(
-            addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
-        return self.residual_vec_physical.norm()
+        with _PROF.phase("assemble:physical_residual"):
+            self.update_derived_fields()
+            with self.residual_vec_physical.localForm() as loc:
+                loc.set(0.0)
+            dolfinx.fem.petsc.assemble_vector(self.residual_vec_physical, self.F_physical_form)
+            self.residual_vec_physical.ghostUpdate(
+                addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
+            return self.residual_vec_physical.norm()
 
     def relative_residual_norm(self, full_norm):
         """
@@ -1065,7 +1095,10 @@ class CompressibleEulerModel():
             return self.residual_vec_physical
 
         for _ in range(max_outer):
-            solver.solve(self.u_vec)
+            # the assembly and the limiter enter their own (nested) phases, so
+            # this phase's self time is the linear solve and SNES overhead
+            with _PROF.phase("solve:linear"):
+                solver.solve(self.u_vec)
             self.u_vec.x.scatter_forward()
             residual_norm = self._assemble_physical_residual()
             self._report_max_residual_location()

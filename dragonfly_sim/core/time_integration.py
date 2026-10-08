@@ -36,6 +36,8 @@ from petsc4py import PETSc
 import ufl
 import dolfinx
 
+from dragonfly_sim.utils.solver_profiling import PROFILER as _PROF
+
 
 # (a0, a1, a2) in (a0 U^{n+1} + a1 U^n + a2 U^{n-1}) / dt at a constant dt.
 BDF_COEFFS = {1: (1.0, -1.0, 0.0), 2: (1.5, -2.0, 0.5)}
@@ -280,7 +282,8 @@ class TimeIntegrator:
             self.term.set_cfl(cfl)
             self._copy(self.term.U_old, m.u_vec)
             m.last_step_theta = 1.0
-            m.solver.solve(m.u_vec)
+            with _PROF.phase("solve:linear"):
+                m.solver.solve(m.u_vec)
             m.u_vec.x.scatter_forward()
             r = m._assemble_physical_residual()
             ksp_ok = m.solver.krylov_solver.getConvergedReason() > 0
@@ -364,7 +367,8 @@ class TimeIntegrator:
         snes = solver.snes
         snes.setConvergenceHistory(reset=True)
         try:
-            n, converged = solver.solve(m.u_vec)
+            with _PROF.phase("solve:linear"):
+                n, converged = solver.solve(m.u_vec)
         finally:
             solver.convergence_criterion, solver.rtol, solver.atol, solver.max_it = crit
         hist, _ = snes.getConvergenceHistory()
@@ -387,7 +391,8 @@ class TimeIntegrator:
             term.set_cfl(ctrl.cfl)
             self._copy(term.U_old, m.u_vec)
             m.last_step_theta = 1.0
-            m.solver.solve(m.u_vec)
+            with _PROF.phase("solve:linear"):
+                m.solver.solve(m.u_vec)
             ksp += m.solver.snes.getLinearSolveIterations()
             r = self._unsteady_residual_norm(b)
             ok_ksp = m.solver.krylov_solver.getConvergedReason() > 0

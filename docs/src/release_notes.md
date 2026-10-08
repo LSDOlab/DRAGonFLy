@@ -40,6 +40,13 @@
   convergence criterion; accepted below a residual threshold, with a fallback to the full-order solve that adds
   a snapshot. The host gains `positivity_step_length`, `steady_residual()`, `state_scales()` and the
   `extra_scales` plug-in.
+- `examples/benchmark_pod.py`: full-order against reduced-order solutions of the Euler and RANS models at the
+  same sampled design points, ported from the project-sandbox POD benchmark (p = 0, POD only). The
+  local_weighted cutoff `c` can be set when the POD is constructed (`PODBasis(cubic_cutoff=...)`).
+- Per-phase wall-time profiling of the solves (`utils/solver_profiling.py`, ported from the project sandbox;
+  `CompressibleEulerModel.enable_profiling` / `profile_report`), instrumenting assembly, the linear and
+  reduced solves, the ROM, the positivity limiter, set-up, mesh deformation and warping, output and
+  coefficient logging. Off by default.
 - The default Euler path is unchanged (bit-identical residual, Jacobian, derivatives and Newton iterates).
 
 ## 0.1.0 (unreleased)
