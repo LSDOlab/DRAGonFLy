@@ -26,6 +26,8 @@ The Python package is distributed as `dragonfly-sim` and imported as `dragonfly_
 - Adjoint-based derivatives of lift, drag and pitching moment with respect to the shape variables and the angle
   of attack, for Euler and RANS, for optimization with [modOpt](https://github.com/LSDOlab/modopt).
 - Forward analysis on a fixed mesh, without shape variables.
+- An optional POD reduced-order model (least-squares Petrov-Galerkin) of the steady flow solve, with a
+  fallback to the full-order solve (see [Reduced-order modeling](src/reduced_order_modeling.md)).
 - Mesh input from XDMF files or structured CGNS grids; VTX output for ParaView.
 
 ```{toctree}
@@ -35,6 +37,7 @@ The Python package is distributed as `dragonfly-sim` and imported as `dragonfly_
 src/getting_started
 src/background
 src/flow_models
+src/reduced_order_modeling
 src/user_guide
 src/shape_parameterization
 src/examples

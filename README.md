@@ -35,6 +35,9 @@ Navier-Stokes (RANS) equations, steady or unsteady. It is distributed as `dragon
   reported for monitoring.
 - **Forward analysis**: the same flow model runs on a fixed mesh without any shape variables, with or without a
   CSDL graph.
+- **Reduced-order modeling**: an optional POD reduced-order model of the steady flow solve, for Euler and RANS.
+  Before every solve it tries a least-squares Petrov-Galerkin (LSPG) solution in a POD basis of the converged
+  solutions so far, and falls back to the full-order solve (adding a snapshot) when the residual is too large.
 - **Mesh input**: DOLFINx meshes from XDMF, and structured multi-block CGNS grids one cell thick (2D), which are
   converted to quadrilateral meshes in memory.
 - **Output files**: flow solution, pressure and mesh deformation in ADIOS2/VTX (`.bp`) format for ParaView,
