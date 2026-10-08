@@ -17,7 +17,7 @@ The main entry points:
 - `dragonfly_sim.core.time_integration`: `TimeIntegrator`, `CFLController`, `StepSizeController`
 - `dragonfly_sim.core.farfield.TransverseFarfield`: the transverse (riemann2) far field
 - `dragonfly_sim.utils.mesh_io_utils`: mesh input from XDMF or structured CGNS grids (`load_dolfinx_mesh`,
-  `cgns_to_dolfinx_mesh`, `read_cgns_planar`)
+  `cgns_to_dolfinx_mesh`, `read_cgns_planar`, `read_cgns_volume`)
 - `dragonfly_sim.utils.filewriter.FileWriter`: VTX output for ParaView
 - `dragonfly_sim.utils.checkpoint`: partition-independent checkpoints (`save_checkpoint`, `load_checkpoint`)
 

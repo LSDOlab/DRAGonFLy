@@ -15,8 +15,8 @@
   `FFDShapeParameterization` (FFD block + layers) instead of `ffd_shape`, `ffd_degree`, `ffd_block_corner_list`
   and `cp_coord_opt_idxs`, and no longer depends on which variables exist; `model.deform_mesh()` gives the
   mesh motion. Layers: `ControlPointMotions`, `SectionalVariables`, and `WingShape`, which adds wing sweep,
-  aspect ratio, root chord and taper ratio (absolute values with bounds), plus thickness and camber per
-  spanwise station. `examples/wing_opt.py` uses `WingShape`. The model's and the warper's shape input is
+  aspect ratio, root chord, span and taper ratio (absolute values with bounds), plus chordwise thickness and
+  camber modes per spanwise station. `examples/wing_opt.py` uses `WingShape`. The model's and the warper's shape input is
   renamed from `cp_motion_inputs` to `shape_parameters`.
 - `DG_windtunnel_model` without a shape parameterization or mesh warper: forward analysis on the fixed
   mesh, with `solve_forward()` outside CSDL or `evaluate(alpha=...)` in a graph; `DG_postprocessor` computes
@@ -26,7 +26,8 @@
   `examples/rans_airfoil_opt.py`.
 - Mesh input from structured multi-block CGNS grids one cell thick (`utils/mesh_io_utils.py`:
   `load_dolfinx_mesh`, `cgns_to_dolfinx_mesh`), reduced to a 2D quadrilateral mesh in memory;
-  `examples/flow_analysis.py --mesh` accepts them.
+  `examples/flow_analysis.py --mesh` accepts them. 3D structured grids are read as hexahedra (`tdim=3`);
+  `examples/wing_opt.py` reads `wing_vol_L3.cgns` this way.
 - ONERA OAT15A validation case (`examples/ONERA-OAT15A/`): SA-neg RANS mesh-sensitivity study on the Rizzi grids
   at $M = 0.73$, $Re = 3\times10^6$ (preliminary results on grids 1-4).
 - `FileWriter` gathers piecewise-constant and continuous fields to rank 0, so VTX output shows no seams at the

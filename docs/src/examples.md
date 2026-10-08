@@ -40,9 +40,9 @@ $C_p$/$c_f$ files, optional VTX fields, and a checkpoint for `--restart`. See `-
 ## `wing_opt.py`: 3D wing
 | | |
 |---|---|
-| Mesh | `wing_vol_L3_xdmf`: hexahedra around the Simple Transonic Wing (half-wing, symmetry plane at $y = 0$); `wing_vol_L3_xdmf_wallmerged` is the same mesh with merged wall layers (fewer cells, lower aspect ratio) |
+| Mesh | `wing_vol_L3.cgns`: 12 structured blocks around the Simple Transonic Wing (half-wing, symmetry plane at $y = 0$), read with PyVista into 181,152 hexahedra; `wing_vol_L3_xdmf_wallmerged` is the same mesh with merged wall layers (fewer cells, lower aspect ratio) |
 | Flow | $M_\infty = 0.8$, $\alpha = 2^\circ$ |
-| Design variables | `WingShape` on a 3 x 5 x 2 swept, tapered FFD block: quarter-chord sweep $\in [20^\circ, 30^\circ]$, aspect ratio $\in [7.5, 10]$, root chord $\in [4.5, 5.5]$, taper ratio $\in [0.2, 0.4]$; thickness ($\pm 10\%$) and camber ($\pm 0.01$ chord) at the 5 spanwise sections; $\alpha \in [1.5^\circ, 2.5^\circ]$ |
+| Design variables | `WingShape` on a 5 x 3 x 2 swept, tapered FFD block (quartic Bezier chordwise): quarter-chord sweep $\in [20^\circ, 30^\circ]$, aspect ratio $\in [7.5, 10]$, span $\in [26, 30]$, taper ratio $\in [0.2, 0.4]$ (root chord follows); at each of the 3 spanwise sections, 4 thickness modes ($\pm 10\%$) and 3 camber modes ($\pm 0.01$ chord); $\alpha \in [1.5^\circ, 2.5^\circ]$ |
 | Objective, constraint | minimize drag $D$ subject to lift $L \ge 10$ |
 | Optional (commented out) | raw control-point motions; planform-area, volume and thickness constraints |
 

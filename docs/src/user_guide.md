@@ -24,6 +24,11 @@ are exactly those of the wall and far-field families (`wall_family="Wall"`, `far
 default the points are shifted and scaled so that the wall's leading edge is at $x = 0$ and its chord is 1
 (`scale_to_chord`). DOLFINx then distributes the mesh; no converted file is written.
 
+A 3D structured grid is read with `tdim=3`, e.g. the Simple Transonic Wing's
+`load_dolfinx_mesh("wing_vol_L3.cgns", tdim=3)`: every block becomes hexahedra, the blocks' shared nodes are merged
+by exact coordinate match, and the mesh is checked for inverted cells and unmerged block interfaces. Its boundary
+conditions are not read (VTK skips them), so the solver finds the boundaries geometrically, as for an XDMF mesh.
+
 Requirements:
 - **Orientation**: the freestream flows in $+x$. In 2D, y is vertical; in 3D, y is spanwise and z vertical.
 - **3D**: model a half-wing whose root lies on the symmetry plane $y = 0$.
