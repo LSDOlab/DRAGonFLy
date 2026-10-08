@@ -79,7 +79,8 @@ templates_path = ['_templates']
 # List of patterns, relative to source directory, that match files and
 # directories to ignore when looking for source files.
 # This pattern also affects html_static_path and html_extra_path.
-exclude_patterns = ['README.md', '_build', 'Thumbs.db', '.DS_Store', 'src/welcome.md']
+exclude_patterns = ['README.md', '_build', 'Thumbs.db', '.DS_Store', 'src/welcome.md',
+                    'src/_temp/**/README.md']  # example READMEs: their content is in the docs pages
 
 
 # -- Options for HTML output -------------------------------------------------
