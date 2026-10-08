@@ -46,28 +46,16 @@ $C_p$/$c_f$ files, optional VTX fields, and a checkpoint for `--restart`. See `-
 | Objective, constraint | minimize drag $D$ subject to lift $L \ge 10$ |
 | Optional (commented out) | raw control-point motions; planform-area, volume and thickness constraints |
 
-## `ONERA-OAT15A/`: transonic RANS validation
-A mesh-sensitivity study of the ONERA OAT15A supercritical airfoil, the conditions of the OAT15A buffet test case.
-The results and figures are on the [OAT15A results page](_temp/examples/ONERA-OAT15A/README.md).
+## Validation
+Validation cases compare DRAGonFLy with experiments and other solvers, and test how the results depend on the
+grid. They need meshes that are not in the repository; each page says where to get them.
 
-| | |
-|---|---|
-| Mesh | ONERA's structured multi-block Rizzi grids 1-7 (CGNS, one cell thick in span; 15,872 to 471,040 cells), reduced to 2D quadrilateral meshes in memory by `dragonfly_sim.utils.mesh_io_utils` |
-| Flow | SA-neg RANS, $M_\infty = 0.73$, $Re = 3\times10^6$, $T_\infty = 300$ K; $\alpha$ = 1.36°, 1.50°, 2.50°, 3.00°, 3.10° |
-| Solver | pseudo-transient continuation from the free stream to a residual of $10^{-9}$ |
-| Outputs | $c_l$, $c_d$ (and its friction part), $c_m$, and wall time per grid and angle of attack (`results.csv`); wall $C_p$ and $c_f$ per case; figures of $c_l$-$\alpha$, $c_l$-$c_d$, $c_m$-$c_l$ and cost against degrees of freedom |
-| Status | preliminary results on grids 1-4; comparisons with experiment and other solvers to follow |
-
-```sh
-$ cd examples/ONERA-OAT15A
-$ OMP_NUM_THREADS=1 mpirun -n 8 python oat15a_analysis.py --out-dir <output folder> [--grids 1 2] [--alphas 2.5]
-$ python oat15a_analysis.py --plot <run folder>/results.csv --figure-dir figures
-```
-The grids are read from `meshes/ONERA-ONERA-OAT15A-Rizzi/gridN/OAT15A_Rizzi_N.cgns` (or `--mesh-dir`). The script
-reuses the model set-up, force coefficients and wall output of `flow_analysis.py`.
+- [ONERA OAT15A airfoil](validation_oat15a.md) (`examples/ONERA-OAT15A/`): mesh-sensitivity study of the OAT15A
+  supercritical airfoil with SA-neg RANS at $M_\infty = 0.73$, $Re = 3\times10^6$, on the structured DPW8 Cadence
+  grids.
 
 ```{toctree}
-:hidden:
+:maxdepth: 1
 
-_temp/examples/ONERA-OAT15A/README
+validation_oat15a
 ```

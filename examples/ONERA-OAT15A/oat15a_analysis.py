@@ -1,10 +1,12 @@
 """
 Mesh sensitivity study of ONERA's OAT15A airfoil: steady SA-neg RANS at p = 0
-on the Rizzi grids 1-7, at M 0.73, Re 3e6 (chord), T 300 K and alpha 1.36,
-1.50, 2.50, 3.00, 3.10 deg.
+on structured grid levels, at M 0.73, Re 3e6 (chord), T 300 K and alpha 1.36,
+1.50, 2.50, 3.00, 3.10 deg. Grid families (--mesh-family): the Cadence grids,
+levels 1-6 (default; meshes/Cadence-ONERA-OAT15A_..._Structured/), or the
+Rizzi grids 1-7 (meshes/ONERA-ONERA-OAT15A-Rizzi/).
 
-The grids are structured multi-block CGNS files one cell thick in span
-(meshes/ONERA-ONERA-OAT15A-Rizzi/gridN/OAT15A_Rizzi_N.cgns, chord 230 mm);
+The grids are structured multi-block CGNS files one cell thick in span (chord
+230 mm);
 utils/mesh_io_utils reduces each to a 2D quad mesh with chord 1 in memory.
 The cases run one at a time, each from the same free stream. A case that
 does not converge is recorded as such and the sweep goes on.
@@ -40,7 +42,13 @@ sys.path.insert(0, os.path.join(HERE, os.pardir))
 from flow_analysis import WALL_TAG, build_model, ForceCoefficients, wall_writer, field_writer  # noqa: E402
 
 MESH_DIR = os.path.join(HERE, os.pardir, os.pardir, "meshes")
-GRID_FILE = os.path.join("ONERA-ONERA-OAT15A-Rizzi", "grid{0}", "OAT15A_Rizzi_{0}.cgns")
+# grid families: (file pattern for level N, levels available)
+_CADENCE = "Cadence-ONERA-OAT15A_230mmChord_780mmSpan_upZ_2024_09_05_Structured"
+GRID_FILES = {
+    "cadence": (os.path.join(_CADENCE, "ONERA-OAT15A_230mmChord_780mmSpan_upZ_2024_09_05_Structured_Level-{0}.cgns"),
+                [1, 2, 3, 4, 5, 6]),
+    "rizzi": (os.path.join("ONERA-ONERA-OAT15A-Rizzi", "grid{0}", "OAT15A_Rizzi_{0}.cgns"), [1, 2, 3, 4, 5, 6, 7]),
+}
 COLUMNS = ("grid", "cells", "dofs", "alpha", "converged", "steps", "res", "wall_s", "case_s",
            "c_l", "c_d", "c_d_friction", "c_m")
 FORMATS = {"grid": "%d", "cells": "%d", "dofs": "%d", "alpha": "%.4f", "converged": "%d", "steps": "%d",
@@ -49,7 +57,10 @@ FORMATS = {"grid": "%d", "cells": "%d", "dofs": "%d", "alpha": "%.4f", "converge
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--grids", type=int, nargs="+", default=[1, 2, 3, 4, 5, 6, 7])
+    p.add_argument("--mesh-family", choices=sorted(GRID_FILES), default="cadence",
+                   help="structured CGNS grid family: Cadence levels 1-6 or Rizzi grids 1-7")
+    p.add_argument("--grids", type=int, nargs="+", default=None,
+                   help="grid levels (default: all levels of the family)")
     p.add_argument("--alphas", type=float, nargs="+", default=[1.36, 1.50, 2.50, 3.00, 3.10],
                    help="angles of attack [deg]")
     p.add_argument("--mach", type=float, default=0.73)
@@ -247,6 +258,8 @@ def rss_gib(comm):
 
 def main():
     args = parse_args()
+    if args.grids is None:
+        args.grids = GRID_FILES[args.mesh_family][1]
     comm = MPI.COMM_WORLD
     if args.plot:
         if comm.rank == 0:
@@ -258,21 +271,22 @@ def main():
     run_dir = None
     if comm.rank == 0:
         os.makedirs(args.out_dir, exist_ok=True)
-        stem = "oat15a_sa_M{}_Re{:g}{}_".format(args.mach, args.Re, "_" + args.label if args.label else "")
+        stem = "oat15a_{}_sa_M{}_Re{:g}{}_".format(args.mesh_family, args.mach, args.Re,
+                                                   "_" + args.label if args.label else "")
         run_dir = tempfile.mkdtemp(prefix=stem + time.strftime("%Y%m%d-%H%M%S_"), dir=args.out_dir)
         with open(os.path.join(run_dir, "config.json"), "w") as f:
             json.dump({**vars(args), "ranks": comm.size}, f, indent=2)
     run_dir = comm.bcast(run_dir, root=0)
     csv_path = os.path.join(run_dir, "results.csv")
     PETSc.Sys.Print("=" * 72)
-    PETSc.Sys.Print("OAT15A: grids {}, alpha {} deg, M={}, Re={:g}, T={} K, far field {}, {} ranks".format(
-        args.grids, args.alphas, args.mach, args.Re, args.T_inf, args.farfield, comm.size))
+    PETSc.Sys.Print("OAT15A: {} grids {}, alpha {} deg, M={}, Re={:g}, T={} K, far field {}, {} ranks".format(
+        args.mesh_family, args.grids, args.alphas, args.mach, args.Re, args.T_inf, args.farfield, comm.size))
     PETSc.Sys.Print("Output: {}".format(run_dir))
     PETSc.Sys.Print("=" * 72)
 
     rows = []
     for g in args.grids:
-        msh, info = load_dolfinx_mesh(os.path.join(args.mesh_dir, GRID_FILE.format(g)), comm)
+        msh, info = load_dolfinx_mesh(os.path.join(args.mesh_dir, GRID_FILES[args.mesh_family][0].format(g)), comm)
         PETSc.Sys.Print("grid {}: {} cells, {} wall edges, chord {} (file units)".format(
             g, info["n_cells"], info["n_wall_edges"], info["chord"]))
         for alpha in args.alphas:

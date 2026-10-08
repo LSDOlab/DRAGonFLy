@@ -166,3 +166,6 @@ _conf_master.py
 # Meshes are kept out of version control for now; their README is tracked
 meshes/*
 !meshes/README.md
+
+# Also ignore the runs folder
+/runs/
