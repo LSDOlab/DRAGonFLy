@@ -18,7 +18,7 @@ coarser Rizzi grids 1–4. Comparisons with experimental data and other solvers 
 | Geometry | ONERA OAT15A, chord 230 mm (scaled to 1 in the solver), blunt trailing edge |
 | Mach number | $M_\infty = 0.73$ |
 | Reynolds number | $Re = 3\times10^6$, based on the chord |
-| Static free-stream temperature | 300 K (Sutherland's law) |
+| Static free-stream temperature | 271 K (Sutherland's law), as in DPW8 test case 1a |
 | Angles of attack | $\alpha$ = 1.36°, 1.50°, 2.50°, 3.00°, 3.10° |
 | Model | SA-neg RANS, cell-centred finite volume ($p = 0$), MUSCL inviscid fluxes |
 | Boundary conditions | adiabatic no-slip wall; subsonic inflow/outflow far field |
@@ -73,7 +73,8 @@ level 6. The far field is about 150 chords from the airfoil.
 
 ### Cadence grids
 
-Level 1, 8 MPI ranks of an Intel Core i7-10700 (8 cores), 8.8 GiB of memory in total:
+Level 1, 8 MPI ranks of an Intel Core i7-10700 (8 cores), 8.8 GiB of memory in total. These two cases were
+run at 300 K; at 271 K the coefficients change by about $10^{-4}$ (tested on Rizzi grid 1):
 
 | $\alpha$ | PTC steps | Solve wall time | $c_l$ | $c_d$ (friction) | $c_m$ |
 |---:|---:|---:|---:|---:|---:|
@@ -124,10 +125,15 @@ $ OMP_NUM_THREADS=1 mpirun -n 8 python oat15a_analysis.py --out-dir <output fold
 Each run writes a new folder under `--out-dir` containing:
 
 - `results.csv`: one row per case, rewritten after every case. Columns: grid, cells, dofs, alpha, converged,
-  steps, residual, `wall_s` (the solve), `case_s` (model set-up + solve), $c_l$, $c_d$, $c_{d,\text{friction}}$,
-  $c_m$.
-- `wall_gridN_aA.csv`: wall $C_p$ and $c_f$ per wall facet.
-- The four figures above, in that same folder.
+  steps, residual, `wall_s` (the solve), `case_s` (model set-up + solve), $c_l$, $c_d$ and its pressure and
+  friction parts (`c_d_pressure` + `c_d_friction` = `c_d`), $c_m$.
+- `wall_gridN_aA.csv`: wall $C_p$ and $c_f$ at the ends and middle of every wall facet.
+- `solution_gridN_aA.npz`: the converged solution of each case, with its settings. It is written with
+  `dragonfly_sim.utils.checkpoint.save_checkpoint` and does not depend on the number of MPI ranks. To
+  post-process a case (for example $C_p$ in the field), rebuild the model on the same grid and fill it with
+  `load_checkpoint`.
+- The four figures above, in that same folder. With `--write-fields`, also VTX files of the solution,
+  pressure and Mach number for ParaView.
 
 Useful options:
 

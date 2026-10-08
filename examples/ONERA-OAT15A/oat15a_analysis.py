@@ -1,24 +1,34 @@
 """
 Mesh sensitivity study of ONERA's OAT15A airfoil: steady SA-neg RANS at p = 0
-on structured grid levels, at M 0.73, Re 3e6 (chord), T 300 K and alpha 1.36,
-1.50, 2.50, 3.00, 3.10 deg. Grid families (--mesh-family): the Cadence grids,
-levels 1-6 (default; meshes/Cadence-ONERA-OAT15A_..._Structured/), or the
-Rizzi grids 1-7 (meshes/ONERA-ONERA-OAT15A-Rizzi/).
+on structured grid levels, at the conditions of DPW8 test case 1a: M 0.73,
+Re 3e6 (chord), static temperature 271 K, alpha 1.36, 1.50, 2.50, 3.00,
+3.10 deg. Grid families (--mesh-family): the Cadence grids, levels 1-6
+(default; meshes/Cadence-ONERA-OAT15A_..._Structured/), or the Rizzi grids 1-7
+(meshes/ONERA-ONERA-OAT15A-Rizzi/).
 
 The grids are structured multi-block CGNS files one cell thick in span (chord
-230 mm);
-utils/mesh_io_utils reduces each to a 2D quad mesh with chord 1 in memory.
-The cases run one at a time, each from the same free stream. A case that
-does not converge is recorded as such and the sweep goes on.
+230 mm); utils/mesh_io_utils reduces each to a 2D quad mesh with chord 1 in
+memory. The cases run one at a time, each from the same free stream. A case
+that does not converge is recorded as such and the sweep goes on.
 
     OMP_NUM_THREADS=1 mpirun -n 8 python oat15a_analysis.py
     OMP_NUM_THREADS=1 mpirun -n 8 python oat15a_analysis.py --grids 1 2 --alphas 2.5
     python oat15a_analysis.py --plot <run folder>/results.csv --figure-dir figures
 
-Every run writes into its own new folder under --out-dir: results.csv
-(rewritten after every case: c_l, c_d, c_m, the solve's wall time, the dof
-count, ...), wall_gridN_aA.csv (C_p, c_f per wall facet), config.json, the
-figures (see plot_results) and optional VTX fields per case.
+Every run writes into its own new folder under --out-dir:
+
+  results.csv               one row per case, rewritten after every case:
+                            c_l, c_d, its pressure and friction parts
+                            (c_d_pressure + c_d_friction = c_d), c_m, the
+                            solve's wall time, the dof count, convergence
+  wall_gridN_aA.csv         C_p and c_f at the ends and middle of every wall
+                            facet
+  solution_gridN_aA.npz     the converged state (utils/checkpoint.save_checkpoint,
+                            partition independent) and its case settings; rebuild
+                            the model on the same grid and fill it with
+                            load_checkpoint to post-process, e.g. field C_p
+  config.json, figures      the settings, and the figures of plot_results
+  grid*_a*_{solution,pressure,mach}.bp   VTX fields, with --write-fields
 
 The model set-up, force coefficients and wall output are those of
 ../flow_analysis.py.
@@ -36,6 +46,7 @@ from mpi4py import MPI
 from petsc4py import PETSc
 
 from dragonfly_sim.utils.mesh_io_utils import load_dolfinx_mesh
+from dragonfly_sim.utils.checkpoint import save_checkpoint
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, os.pardir))
@@ -50,7 +61,7 @@ GRID_FILES = {
     "rizzi": (os.path.join("ONERA-ONERA-OAT15A-Rizzi", "grid{0}", "OAT15A_Rizzi_{0}.cgns"), [1, 2, 3, 4, 5, 6, 7]),
 }
 COLUMNS = ("grid", "cells", "dofs", "alpha", "converged", "steps", "res", "wall_s", "case_s",
-           "c_l", "c_d", "c_d_friction", "c_m")
+           "c_l", "c_d", "c_d_pressure", "c_d_friction", "c_m")
 FORMATS = {"grid": "%d", "cells": "%d", "dofs": "%d", "alpha": "%.4f", "converged": "%d", "steps": "%d",
            "res": "%.6e", "wall_s": "%.1f", "case_s": "%.1f"}
 
@@ -65,7 +76,8 @@ def parse_args():
                    help="angles of attack [deg]")
     p.add_argument("--mach", type=float, default=0.73)
     p.add_argument("--Re", type=float, default=3e6, help="Reynolds number based on the chord")
-    p.add_argument("--T-inf", type=float, default=300.0, help="static free-stream temperature [K] (Sutherland)")
+    p.add_argument("--T-inf", type=float, default=271.0,
+                   help="static free-stream temperature [K] (Sutherland); DPW8 test case 1a: 271 K")
     p.add_argument("--farfield", choices=("split", "riemann"), default="split")
     p.add_argument("--mesh-dir", default=MESH_DIR)
     # steady solver
@@ -75,7 +87,8 @@ def parse_args():
     # output
     p.add_argument("--out-dir", default=".")
     p.add_argument("--label", default="")
-    p.add_argument("--write-fields", action="store_true", help="VTX solution, pressure, Mach per case")
+    p.add_argument("--write-fields", action="store_true",
+                   help="also VTX solution, pressure and Mach fields per case, for ParaView")
     p.add_argument("--plot", default=None, metavar="RESULTS_CSV", help="only plot an existing results.csv")
     p.add_argument("--figure-dir", default=None,
                    help="where --plot writes the figures (default: next to the CSV)")
@@ -245,7 +258,7 @@ def solve_case(msh, args, alpha, n_wall_edges):
     return model, mesh_obj, dict(alpha=alpha, dofs=model.u_vec.x.petsc_vec.getSize(),
                                  converged=int(converged), steps=model.time_integrator.last_steady_steps,
                                  res=r, wall_s=wall, case_s=time.perf_counter() - tic_case,
-                                 c_l=cl, c_d=cd, c_d_friction=cdf, c_m=cm)
+                                 c_l=cl, c_d=cd, c_d_pressure=cd - cdf, c_d_friction=cdf, c_m=cm)
 
 
 def rss_gib(comm):
@@ -286,7 +299,8 @@ def main():
 
     rows = []
     for g in args.grids:
-        msh, info = load_dolfinx_mesh(os.path.join(args.mesh_dir, GRID_FILES[args.mesh_family][0].format(g)), comm)
+        mesh_path = os.path.join(args.mesh_dir, GRID_FILES[args.mesh_family][0].format(g))
+        msh, info = load_dolfinx_mesh(mesh_path, comm)
         PETSc.Sys.Print("grid {}: {} cells, {} wall edges, chord {} (file units)".format(
             g, info["n_cells"], info["n_wall_edges"], info["chord"]))
         for alpha in args.alphas:
@@ -299,12 +313,20 @@ def main():
                            delimiter=",", comments="", header=",".join(COLUMNS),
                            fmt=[FORMATS.get(c, "%.10f") for c in COLUMNS])
             wall_writer(model, mesh_obj)(os.path.join(run_dir, "wall_grid{}_a{}.csv".format(g, alpha)))
+            # the converged state, partition independent: reload it on the same
+            # grid with load_checkpoint to post-process (e.g. C_p) later
+            save_checkpoint(os.path.join(run_dir, "solution_grid{}_a{}.npz".format(g, alpha)), [model.u_vec],
+                            {"mesh_family": args.mesh_family, "grid": g, "mesh": os.path.abspath(mesh_path),
+                             "alpha": alpha, "mach": args.mach, "Re": args.Re, "T_inf": args.T_inf,
+                             "farfield": args.farfield, "chord_file_units": info["chord"],
+                             "converged": bool(rec["converged"])})
             if args.write_fields:
                 field_writer(model, run_dir, prefix="grid{}_a{}_".format(g, alpha))()
             PETSc.Sys.Print("RESULT grid {} alpha {}: converged={} steps={} |R|={:.3e} c_l={:.6f} "
-                            "c_d={:.6f} (friction {:.6f}) c_m={:.6f}  [{:.1f} s, RSS {:.2f} GiB, max rank {:.2f}]"
+                            "c_d={:.6f} (pressure {:.6f}, friction {:.6f}) c_m={:.6f}  [{:.1f} s, RSS {:.2f} GiB, max rank {:.2f}]"
                             .format(g, alpha, bool(rec["converged"]), rec["steps"], rec["res"], rec["c_l"],
-                                    rec["c_d"], rec["c_d_friction"], rec["c_m"], rec["wall_s"], *rss_gib(comm)))
+                                    rec["c_d"], rec["c_d_pressure"], rec["c_d_friction"], rec["c_m"], rec["wall_s"],
+                                    *rss_gib(comm)))
             # Free the case's memory before the next: the SNES holds the
             # solver's bound-method callbacks at C level, out of the garbage
             # collector's sight, so it must be destroyed for the model to be
