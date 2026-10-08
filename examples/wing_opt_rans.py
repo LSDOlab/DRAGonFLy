@@ -2,7 +2,7 @@
 Drag minimization of the Simple Transonic Wing with the SA-neg RANS model: the
 RANS counterpart of wing_opt_euler.py, with the same planform (sweep, aspect
 ratio, span, taper) and section (thickness and camber modes at three spanwise
-stations) design variables plus the angle of attack, at M 0.8.
+stations) design variables plus the angle of attack, at M 0.75.
 
 The flow model is CompressibleRANSModel (p = 0, Green-Gauss gradients
 condensed out of Newton, MUSCL, pseudo-transient continuation from the free
@@ -62,7 +62,7 @@ if __name__ == '__main__':
 
     # Inlet flow conditions
     rho_0 = 1.0
-    M_0 = 0.8
+    M_0 = 0.75
     p_0 = 1.0
     attack = np.radians(2)
 
@@ -146,7 +146,7 @@ if __name__ == '__main__':
                                           np.array([0.25, 0., 0.], dtype=np.double),
                                           mesh_inner_bdry_function=wing_inner_bdry_function,
                                           poly_order=poly_o, gamma=1.4,
-                                          filename_suffix="wing_opt_rans_L3mesh_p=0_M=0_8",
+                                          filename_suffix="wing_opt_rans_L3mesh_p=0_M=0_75",
                                           asm_overlap=1, ilu_levels=2,
                                           model_class=CompressibleRANSModel,
                                           model_kwargs={'Re': Re})
@@ -167,6 +167,13 @@ if __name__ == '__main__':
     # monitoring only, so it is switched off below (it would assemble that
     # Jacobian after every flow solve).
     csdl_flow_model.log_cm_alpha = False
+    # Free the solver's matrices after each forward solve and the adjoint's
+    # after each adjoint, so the two never coexist (rebuilt when next needed).
+    csdl_flow_model.release_solver_memory = True
+    # No per-evaluation mesh_deformation file; the solution files are still written
+    csdl_flow_model.write_mesh_deformation = False
+    # One solution frame per design (CSDL evaluates each design twice)
+    csdl_flow_model.write_once_per_design = True
     csdl_flow_model.set_up_sim()
 
     # D includes the wall friction (D_friction is its viscous part)
@@ -213,9 +220,13 @@ if __name__ == '__main__':
         # (the optimizer never sees a dimensional value, regardless of 
         # p_inf_dim/L_ref_dim -- those only scale the console printout in 
         # compute())
+        # Lower bound: the lift of the undeformed wing at these conditions
+        # (M 0.75, alpha 2 deg, Re_mac 5e6), from a converged forward solve
+        # (2026-10-07: 66 PTC steps to |R| 3.6e-10; c_l 0.42571, c_d 0.017270)
+        L_baseline = 7.633754061772796
         L_constraint = L
         L_constraint.add_name('L_limit')
-        L_constraint.set_as_constraint(lower=10.)
+        L_constraint.set_as_constraint(lower=L_baseline)
 
     # Geometric constraints. The wing's planform quantities follow directly from
     # its variables (shape.outputs()['wing']: area, span, semi_span, root_chord,
@@ -246,23 +257,25 @@ if __name__ == '__main__':
     # PETSc.Sys.Print("finished sim run")
     
     # test accuracy of simulation object
-    print("Starting check_totals...")
-    sim.check_totals(step_size=1e-6)
+    # print("Starting check_totals...")
+    # sim.check_totals(step_size=1e-6)
 
-    # PETSc.Sys.Print("Defining optimization problem...")
+    PETSc.Sys.Print("Defining optimization problem...")
 
-    # prob = CSDLAlphaProblem(problem_name='shape_opt',simulator=sim)
-    # # # optimizer = COBYLA(prob, solver_options={'maxiter':400, 'catol':1e-6, 'rhobeg': 0.025}, turn_off_outputs=True)
+    prob = CSDLAlphaProblem(problem_name='shape_opt',simulator=sim)
+    # optimizer = COBYLA(prob, solver_options={'maxiter':400, 'catol':1e-6, 'rhobeg': 0.025}, turn_off_outputs=True)
 
-    # optimizer = SLSQP(prob, solver_options={'ftol':1e-8, 'maxiter':150})
-    # # # optimizer = PySLSQP(prob, solver_options={'acc':1e-8, 'maxiter':100})
+    # modopt writes its outputs into a timestamped folder that every rank would
+    # create at once (a FileExistsError race): only rank 0 writes them
+    optimizer = SLSQP(prob, solver_options={'ftol':1e-8, 'maxiter':150},
+                      turn_off_outputs=mesh_from_file.comm.Get_rank() != 0)
+    # optimizer = PySLSQP(prob, solver_options={'acc':1e-8, 'maxiter':100})
 
-    # PETSc.Sys.Print("Solving optimization problem...")
+    PETSc.Sys.Print("Solving optimization problem...")
 
-    # optimizer.solve()
+    optimizer.solve()
 
-    # # save data store file
-    # if mesh_from_file.comm.Get_rank() == 0:
-    #     csdl_flow_model.data_store.write_store_to_numpy_file(save_filename="SLSQP_{}.npy".format(csdl_flow_model.filename_suffix))
-    # csdl_flow_model.data_store.write_store_to_numpy_file(save_filename="SLSQP_L3mesh_cpgrid=10x5x2_p=0_test_M=0_85.npy")
-    # optimizer.print_results()
+    # save data store file
+    if mesh_from_file.comm.Get_rank() == 0:
+        csdl_flow_model.data_store.write_store_to_numpy_file(save_filename="SLSQP_{}.npy".format(csdl_flow_model.filename_suffix))
+    optimizer.print_results()

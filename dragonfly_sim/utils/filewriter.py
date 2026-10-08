@@ -66,8 +66,33 @@ def _cell_dof_indices(V, cells):
         len(cells), cell_dofs.shape[1] * bs).astype(np.int32)
 
 
+class _Field:
+    """One named field of a FileWriter: its parent space and output function."""
+
+    def __init__(self, name, V):
+        self.name = name
+        self.V = V
+        tdim = V.mesh.topology.dim
+        owned_cells = np.arange(V.mesh.topology.index_map(tdim).size_local, dtype=np.int32)
+        # Parent dof-array indices of each owned cell, one row per cell
+        self.parent_idx = _cell_dof_indices(V, owned_cells)
+        # Target for UFL expressions, which are interpolated on the parent mesh
+        self.parent_function = dolfinx.fem.Function(V)
+        self.gather = not (V.ufl_element().discontinuous and V.dofmap.dof_layout.num_dofs > 1)
+        self.target_funcspace = None
+        self.function = None
+        self.target_idx = None
+
+
 class FileWriter:
     """Writes dolfinx Functions to VTX (.bp) files for ParaView.
+
+    One writer holds one or more named fields on the same mesh, written to a
+    single file: ``func_space`` is either a function space (one field, named
+    "solution") or a dict ``{name: function space}``, e.g. density, momentum
+    (a vector field), energy and pressure. All fields of a writer must share
+    the mesh and be either all gathered or all per-rank (see below); the mesh
+    is then stored once per frame for all of them.
 
     ParaView's VTX reader concatenates the per-rank blocks of a parallel write
     without merging the points the blocks share. Where neighbouring cells
@@ -78,7 +103,7 @@ class FileWriter:
     written as a single block on a serial copy of the mesh.
 
     Note on the DG0 gather: rank 0 holds the whole mesh (built once per parent
-    mesh and shared by the writers on it) plus one frame of the field, and
+    mesh and shared by the writers on it) plus one frame of the fields, and
     every frame passes through rank 0. Per-frame data is small (one value per
     cell and component); the serial mesh is what bounds the mesh size. Past
     that point, the parallel alternatives are writing DG0 as per-cell-node DG
@@ -91,7 +116,7 @@ class FileWriter:
     writes its own owned cells in parallel; ghost cells are left out because
     they would be written twice.
 
-    Keywords, set per writer to match the simulation and the field:
+    Keywords, set per writer to match the simulation and the fields:
 
     mesh_deformation
         False: frames are written on the geometry the mesh had when the
@@ -108,25 +133,49 @@ class FileWriter:
                  time_dependent=False):
         self.filename = filename
         self.comm = comm_obj
-        self.functionspace = func_space
+        self.single_field = not isinstance(func_space, dict)
+        spaces = {"solution": func_space} if self.single_field else dict(func_space)
+        if not spaces:
+            raise ValueError("FileWriter {}: no fields given".format(filename))
+        self.fields = [_Field(name, V) for name, V in spaces.items()]
+        # the first field's space; the mesh and the gather mode are shared
+        self.functionspace = self.fields[0].V
         self.mesh_deformation = mesh_deformation
         self.time_dependent = time_dependent
 
         self.construct_function_and_writer()
 
+    @property
+    def field_names(self):
+        return [f.name for f in self.fields]
+
+    # The single-field attributes (the first field's), kept for callers and
+    # tests that write one field
+    @property
+    def function(self):
+        return self.fields[0].function
+
+    @property
+    def target_funcspace(self):
+        return self.fields[0].target_funcspace
+
+    @property
+    def parent_idx(self):
+        return self.fields[0].parent_idx
+
     def construct_function_and_writer(self):
-        V = self.functionspace
-        mesh = V.mesh
+        mesh = self.functionspace.mesh
         tdim = mesh.topology.dim
-        num_cells_owned = mesh.topology.index_map(tdim).size_local
-        owned_cells = np.arange(num_cells_owned, dtype=np.int32)
+        if any(f.V.mesh is not mesh for f in self.fields):
+            raise ValueError("FileWriter {}: all fields must be on the same mesh".format(
+                self.filename))
+        gather = {f.gather for f in self.fields}
+        if len(gather) != 1:
+            raise ValueError(
+                "FileWriter {}: fields mix gathered (DG0, continuous) and per-rank (DG p >= 1) "
+                "spaces; write them to separate files".format(self.filename))
+        self.gather = gather.pop()
 
-        # Parent dof-array indices of each owned cell, one row per cell
-        self.parent_idx = _cell_dof_indices(V, owned_cells)
-        # Target for UFL expressions, which are interpolated on the parent mesh
-        self.parent_function = dolfinx.fem.Function(V)
-
-        self.gather = not (V.ufl_element().discontinuous and V.dofmap.dof_layout.num_dofs > 1)
         if self.gather:
             # Serial cell s is input cell original_cell_index[s], which is
             # global parent cell original_cell_index[s] (the gather order);
@@ -137,6 +186,7 @@ class FileWriter:
                 self.target_rows = np.asarray(target_mesh.topology.original_cell_index)
                 self.target_nodes = np.asarray(target_mesh.geometry.input_global_indices)
         else:
+            owned_cells = np.arange(mesh.topology.index_map(tdim).size_local, dtype=np.int32)
             target_mesh, entity_map, _, self.target_nodes = dolfinx.mesh.create_submesh(
                 mesh, tdim, owned_cells)
             writer_comm = self.comm
@@ -147,27 +197,29 @@ class FileWriter:
 
         self.writer = None
         if target_mesh is not None:
-            self.target_funcspace = dolfinx.fem.functionspace(target_mesh, V.ufl_element())
-            self.function = dolfinx.fem.Function(self.target_funcspace, name="solution")
-            self.target_idx = _cell_dof_indices(
-                self.target_funcspace, np.arange(len(self.target_rows), dtype=np.int32))
+            for f in self.fields:
+                f.target_funcspace = dolfinx.fem.functionspace(target_mesh, f.V.ufl_element())
+                f.function = dolfinx.fem.Function(f.target_funcspace, name=f.name)
+                f.target_idx = _cell_dof_indices(
+                    f.target_funcspace, np.arange(len(self.target_rows), dtype=np.int32))
             self.writer = dolfinx.io.VTXWriter(
                 writer_comm,
                 "{}.bp".format(self.filename),
-                self.function,
+                [f.function for f in self.fields],
                 engine="BP5",
             )
         self._check_dof_mapping()
         self.write_counter = 0
         self.last_time = None
 
-    def _copy_cell_values(self, array):
-        """Copy a parent dof array into the output function. Collective."""
-        values = array[self.parent_idx]
+    def _copy_cell_values(self, array, field=None):
+        """Copy a parent dof array into a field's output function. Collective."""
+        field = self.fields[0] if field is None else field
+        values = array[field.parent_idx]
         if self.gather:
             values = _gather_rows(self.comm, values)
         if self.writer is not None:
-            self.function.x.array[self.target_idx] = values[self.target_rows]
+            field.function.x.array[field.target_idx] = values[self.target_rows]
 
     def _sync_geometry(self):
         """Copy the current parent node coordinates onto the output mesh. Collective."""
@@ -185,23 +237,34 @@ class FileWriter:
         break for spaces whose entity dofs depend on cell orientation.
         Collective.
         """
-        V = self.functionspace
-        bs = V.dofmap.bs
-        coords = np.repeat(V.tabulate_dof_coordinates(), bs, axis=0)
         ok = True
-        for d in range(V.mesh.geometry.dim):
-            self._copy_cell_values(coords[:, d])
-            if self.writer is not None:
-                target_coords = np.repeat(
-                    self.target_funcspace.tabulate_dof_coordinates(), bs, axis=0)[:, d]
-                ok &= np.allclose(self.function.x.array, target_coords, rtol=0, atol=1e-10)
+        for f in self.fields:
+            bs = f.V.dofmap.bs
+            coords = np.repeat(f.V.tabulate_dof_coordinates(), bs, axis=0)
+            for d in range(f.V.mesh.geometry.dim):
+                self._copy_cell_values(coords[:, d], f)
+                if self.writer is not None:
+                    target_coords = np.repeat(
+                        f.target_funcspace.tabulate_dof_coordinates(), bs, axis=0)[:, d]
+                    ok &= np.allclose(f.function.x.array, target_coords, rtol=0, atol=1e-10)
         if not self.comm.allreduce(ok, op=MPI.LAND):
             raise RuntimeError(
                 "FileWriter: dof mapping onto the output mesh failed for {}".format(
                     self.filename))
 
+    def _parent_array(self, field, u_interp):
+        if isinstance(u_interp, dolfinx.fem.Function):
+            return u_interp.x.array
+        # UFL expression - interpolate on the parent mesh, then copy
+        field.parent_function.interpolate(
+            dolfinx.fem.Expression(u_interp, field.V.element.interpolation_points))
+        return field.parent_function.x.array
+
     def interpolate_and_write(self, u_interp, write_counter=None, time=None):
-        """Write one frame of `u_interp` (a Function on the writer's space, or a UFL expression).
+        """Write one frame. ``u_interp`` is, for a single-field writer, a
+        Function on the writer's space or a UFL expression; for a multi-field
+        writer, a dict ``{name: Function or UFL expression}`` with one entry
+        per field.
 
         A counter-labelled writer (time_dependent=False) takes an optional
         ``write_counter``; a time-dependent writer requires ``time``.
@@ -220,18 +283,15 @@ class FileWriter:
             raise ValueError(
                 "FileWriter {}: time= needs time_dependent=True".format(self.filename))
 
-        if isinstance(u_interp, dolfinx.fem.Function):
-            parent_array = u_interp.x.array
+        if self.single_field:
+            values = {self.fields[0].name: u_interp}
         else:
-            # UFL expression – interpolate on the parent mesh, then copy
-            self.parent_function.interpolate(
-                dolfinx.fem.Expression(
-                    u_interp,
-                    self.functionspace.element.interpolation_points,
-                )
-            )
-            parent_array = self.parent_function.x.array
-        self._copy_cell_values(parent_array)
+            values = dict(u_interp)
+            if set(values) != set(self.field_names):
+                raise ValueError("FileWriter {}: expected the fields {}, got {}".format(
+                    self.filename, self.field_names, sorted(values)))
+        for f in self.fields:
+            self._copy_cell_values(self._parent_array(f, values[f.name]), f)
         if self.mesh_deformation:
             self._sync_geometry()
 

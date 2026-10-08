@@ -260,6 +260,36 @@ def test_counter_labelled_writer_rejects_time_and_keeps_a_pinned_counter(make_wr
         w.interpolate_and_write(expr, time=1.0)
 
 
+@pytest.mark.parametrize("degree", [0, 1])
+def test_several_named_fields_share_one_file(degree, make_writer):
+    """Scalar and vector fields in one writer: each output function holds its
+    own field at the output dof coordinates, under its own name."""
+    msh = quad_mesh()
+    x = ufl.SpatialCoordinate(msh)
+    Vs = dolfinx.fem.functionspace(msh, ("DG", degree))
+    Vv = dolfinx.fem.functionspace(msh, ("DG", degree, (2,)))
+    (e_s, f_s), (e_v, f_v) = field(x, 1), field(x, 2)
+    w = make_writer("multi", {"density": Vs, "momentum": Vv})
+    assert w.field_names == ["density", "momentum"]
+    u = dolfinx.fem.Function(Vv)
+    u.interpolate(dolfinx.fem.Expression(e_v, Vv.element.interpolation_points))
+    w.interpolate_and_write({"density": e_s, "momentum": u}, write_counter=0)
+    if w.writer is not None:
+        for f, evaluate, bs in zip(w.fields, (f_s, f_v), (1, 2)):
+            assert f.function.name == f.name
+            coords = f.target_funcspace.tabulate_dof_coordinates()
+            assert np.allclose(f.function.x.array.reshape(-1, bs), evaluate(coords), rtol=0, atol=1e-12)
+    with pytest.raises(ValueError, match="expected the fields"):
+        w.interpolate_and_write({"density": e_s}, write_counter=1)
+
+
+def test_fields_of_one_file_must_share_the_write_mode(make_writer):
+    msh = quad_mesh()
+    with pytest.raises(ValueError, match="separate files"):
+        make_writer("mixed", {"a": dolfinx.fem.functionspace(msh, ("DG", 0)),
+                              "b": dolfinx.fem.functionspace(msh, ("DG", 1))})
+
+
 @pytest.mark.skipif(shutil.which("mpirun") is None, reason="mpirun is not available")
 @pytest.mark.skipif(os.environ.get(_MPI_CHILD_ENV) == "1",
                     reason="already running inside the spawned MPI child")

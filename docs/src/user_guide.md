@@ -155,10 +155,13 @@ from the model classes, as in `examples/flow_analysis.py`.
 
 ## Output files
 Written to the working directory, named with `filename_suffix`:
-- `FOM_solution_*.bp`, `FOM_pressure_*.bp`, `mesh_deformation_*.bp`: solution, pressure and mesh deformation per
-  evaluation, in ADIOS2/VTX format (open in ParaView). With a shape parameterization, the solution and pressure
-  are written on the deformed mesh they were solved on, and the mesh deformation on the baseline mesh (apply it
-  with *Warp By Vector*); frame $k$ of each file belongs to the same evaluation;
+- `FOM_solution_*.bp`, `mesh_deformation_*.bp`: solution and mesh deformation per evaluation, in ADIOS2/VTX
+  format (open in ParaView). The solution file holds separate fields: `density`, `momentum` (vector), `energy`
+  ($\rho E$), each transported turbulence variable (e.g. `rho_nu_tilde`), `velocity` (vector) and `pressure`.
+  With a shape parameterization, the solution is written on the deformed mesh it was solved on, and the mesh
+  deformation on the baseline mesh (apply it with *Warp By Vector*); frame $k$ of each file belongs to the same
+  evaluation. `write_mesh_deformation = False` leaves out the mesh deformation file, and
+  `write_once_per_design = True` writes one frame per design when the optimizer evaluates a design twice;
 - `output_meshtags.xdmf`: the boundary tags, to check the inflow/outflow/wall/symmetry split;
 - `memory_logs/`: peak memory per MPI rank.
 

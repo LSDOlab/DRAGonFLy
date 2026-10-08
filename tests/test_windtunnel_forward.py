@@ -85,3 +85,106 @@ def test_forward_csdl_graph_alpha_derivative(in_tmp_dir):
     fd = (Dp - Dm) / (2 * h)
     assert abs(fd - dD) < 1e-5 * max(abs(fd), 1e-12), (fd, dD)
     assert abs(wt.solve_forward(a0)[2]["D"] - D0) < 1e-10
+
+
+def rans_alpha_derivative(release, alphas):
+    """D and dD/dalpha of a laminar-ish RANS flow at each alpha in turn, in one
+    CSDL graph (forward solve, then adjoint, per evaluation)."""
+    from dragonfly_sim.core.RANS_model import CompressibleRANSModel
+    recorder = csdl.Recorder(inline=False)
+    recorder.start()
+    wt = DG_windtunnel_model(jittered_square(8), BC, mesh_inner_bdry_function=bottom_wall,
+                             poly_order=0, filename_suffix="test_release",
+                             model_class=CompressibleRANSModel, model_kwargs={'Re': 1e3})
+    wt.euler_residual_conv_limit = 1e-12
+    wt.max_newton_iterations = 400
+    wt.log_cm_alpha = False
+    wt.release_solver_memory = release
+    wt.set_up_sim()
+    wt.postprocessor.log_cm_alpha = False
+    alpha = csdl.Variable(name='alpha', value=np.array([BC['inlet']['alpha']]))
+    alpha.set_as_design_variable()
+    u_vec = wt.evaluate(alpha=alpha)
+    out = wt.postprocessor.evaluate(u_vec, alpha=alpha)
+    out.D.set_as_objective()
+    recorder.stop()
+    sim = csdl.experimental.JaxSimulator(recorder, gpu=False)
+    results = []
+    for a in alphas:
+        sim[alpha] = np.array([a])
+        sim.run()
+        totals = sim.compute_totals()
+        results.append((float(sim[out.D][0]), float(np.asarray(totals[out.D, alpha]).ravel()[0])))
+    # close the output files here: the graph keeps the model alive past the
+    # test, and a VTX writer closed after leaving the temporary directory fails
+    from dragonfly_sim.utils.filewriter import FileWriter
+    for writer in vars(wt.sim_model.flow).values():
+        if isinstance(writer, FileWriter) and writer.writer is not None:
+            writer.writer.close()
+    return wt, results
+
+
+def test_release_solver_memory_gives_the_same_rans_derivatives(in_tmp_dir):
+    """release_solver_memory frees the flow solver after every forward solve and
+    the condensed dR/dU after every adjoint; both are rebuilt when next needed,
+    so values and adjoint derivatives are unchanged."""
+    alphas = [np.radians(2.0), np.radians(2.5)]
+    _, kept = rans_alpha_derivative(False, alphas)
+    wt, released = rans_alpha_derivative(True, alphas)
+    flow = wt.sim_model.flow
+    assert not flow.solver_is_set_up and not hasattr(flow, "_dRdu_condensed")
+    for (D, dD), (D_r, dD_r) in zip(kept, released):
+        assert abs(D_r - D) <= 1e-10 * abs(D), (D, D_r)
+        assert abs(dD_r - dD) <= 1e-8 * abs(dD), (dD, dD_r)
+
+
+@pytest.mark.parametrize("once", [False, True])
+def test_solution_file_fields_and_write_once_per_design(once, in_tmp_dir, monkeypatch):
+    """The solution file holds the state as separate fields plus velocity and
+    pressure; with write_once_per_design, re-evaluating a design (CSDL re-runs
+    the model for the derivatives) writes no second frame."""
+    from dragonfly_sim.core.RANS_model import CompressibleRANSModel
+    recorder = csdl.Recorder(inline=False)
+    recorder.start()
+    wt = DG_windtunnel_model(jittered_square(6), BC, mesh_inner_bdry_function=bottom_wall,
+                             poly_order=0, filename_suffix="test_fields",
+                             model_class=CompressibleRANSModel, model_kwargs={'Re': 1e3})
+    wt.max_newton_iterations = 400
+    wt.log_cm_alpha = False
+    wt.write_once_per_design = once
+    wt.set_up_sim()
+    wt.postprocessor.log_cm_alpha = False
+    flow = wt.sim_model.flow
+    writer = flow.fom_solution_writer
+    assert writer.field_names == ["density", "momentum", "energy", "rho_nu_tilde",
+                                  "velocity", "pressure"]
+    labels = []
+    monkeypatch.setattr(writer, "interpolate_and_write",
+                        lambda values, write_counter=None, time=None: labels.append(
+                            (write_counter, {k: v.x.array.copy() for k, v in values.items()})))
+    alpha = csdl.Variable(name='alpha', value=np.array([BC['inlet']['alpha']]))
+    alpha.set_as_design_variable()
+    u_vec = wt.evaluate(alpha=alpha)
+    out = wt.postprocessor.evaluate(u_vec, alpha=alpha)
+    out.D.set_as_objective()
+    recorder.stop()
+    sim = csdl.experimental.JaxSimulator(recorder, gpu=False)
+    sim.run()
+    sim.compute_totals()            # evaluates the same design again
+    sim[alpha] = np.array([BC['inlet']['alpha'] + 0.01])
+    sim.run()
+    assert [k for k, _ in labels] == ([0, 2] if once else [0, 1, 2])
+
+    # the fields of the last frame are the components of the state
+    values = labels[-1][1]
+    U = flow.u_vec.x.array.reshape(-1, flow.n_state)
+    np.testing.assert_allclose(values["density"], U[:, 0], rtol=1e-14)
+    np.testing.assert_allclose(values["momentum"].reshape(-1, 2), U[:, 1:3], rtol=1e-14)
+    np.testing.assert_allclose(values["energy"], U[:, 3], rtol=1e-14)
+    np.testing.assert_allclose(values["rho_nu_tilde"], U[:, 4], rtol=1e-14)
+    np.testing.assert_allclose(values["velocity"].reshape(-1, 2), U[:, 1:3] / U[:, :1], rtol=1e-13)
+    p = 0.4 * (U[:, 3] - 0.5 * (U[:, 1] ** 2 + U[:, 2] ** 2) / U[:, 0])
+    np.testing.assert_allclose(values["pressure"], p, rtol=1e-12)
+    for w in (writer, wt.mesh._deformation_writer):
+        if w is not None and w.writer is not None:
+            w.writer.close()
