@@ -10,8 +10,8 @@ by the layers given to the parameterization:
 * ``SectionalVariables`` -- the ``SectionalShape`` presets (2D camber and
   thickness per chordwise station; 3D twist, chord, ... per spanwise section).
 * ``WingShape`` -- a trapezoidal wing: quarter-chord (or any chord-line) sweep,
-  aspect ratio, root chord and taper ratio, plus thickness and camber per
-  spanwise station.
+  aspect ratio, root chord, span and taper ratio, plus chordwise thickness and
+  camber modes per spanwise station.
 
 A driver then reads::
 
@@ -340,6 +340,26 @@ def _invert_monotone_bspline(degree, values, target):
     return brentq(f, 0., 1., xtol=1e-15, rtol=4 * np.finfo(float).eps)
 
 
+def _bernstein(degree, xi):
+    """Bernstein polynomials of `degree` at xi: shape (len(xi), degree + 1)."""
+    from scipy.special import comb
+    xi = np.asarray(xi, dtype=np.float64)[:, None]
+    m = np.arange(degree + 1)[None, :]
+    return comb(degree, m) * xi ** m * (1. - xi) ** (degree - m)
+
+
+def _section_mode_profiles(kind, num_modes, xi):
+    """Chordwise profiles of the WingShape section modes at chord fractions xi:
+    shape (len(xi), num_modes). Thickness: the Bernstein polynomials of degree
+    num_modes - 1 (they sum to one: equal values scale the section uniformly).
+    Camber: 4 xi (1 - xi) times those (zero at the leading and trailing edge;
+    equal values give the parabolic camber line)."""
+    profiles = _bernstein(num_modes - 1, xi)
+    if kind == 'camber':
+        profiles = profiles * (4. * xi * (1. - xi))[:, None]
+    return profiles
+
+
 class WingShape(ShapeLayer):
     """Planform and sectional design variables of a trapezoidal half wing.
 
@@ -353,18 +373,35 @@ class WingShape(ShapeLayer):
                           ``sweep_chord_fraction`` (0.25: quarter chord)
         ``aspect_ratio``  full-wing AR = b^2 / S
         ``root_chord``
+        ``span``          full-wing span b (twice the half wing's semi-span)
         ``taper_ratio``   tip chord / root chord
         Absolute values: each variable starts at the baseline wing's value and
-        its bounds must bracket it. A name left out stays at its baseline.
-    sections : {name: bounds} for ``thickness`` and/or ``camber``, one value
-        per FFD spanwise section (root first); bounds as for
-        ``build_sectional_dv`` (a scalar, a pair, or per-section arrays -- pin
-        an entry with (0., 0.)). Deltas from the baseline, starting at zero:
-        ``thickness``  relative change of the section's thickness (t/c) --
-                       0.1 is 10% thicker
-        ``camber``     change of the maximum camber over local chord, as a
-                       parabolic camber line 4 xi (1 - xi) (xi: chord
-                       fraction), so leading and trailing edge stay put
+        its bounds must bracket it. A name left out stays at its baseline,
+        except the ``derived`` one.
+    sections : {name: spec} for ``thickness`` and/or ``camber``. spec is the
+        bounds, or a dict {'bounds': ..., 'modes': n} for n chordwise modes per
+        FFD spanwise section (default 1). The variable then has n_sections x n
+        entries, section-major (root first: all of the root's modes, then the
+        next section's); bounds as for ``build_sectional_dv`` -- a scalar, a
+        pair, or a pair of arrays of shape (n_sections,) (the same for every
+        mode of a section), (n_sections, n) or (n_sections * n,). Pin an entry
+        with (0., 0.). Deltas from the baseline, starting at zero, with xi the
+        local chord fraction and B_m the Bernstein polynomials of degree n - 1:
+        ``thickness``  relative change of the section's thickness (t/c),
+                       sum_m tau_m B_m(xi) -- 0.1 in every mode is 10% thicker
+        ``camber``     change of camber over local chord, sum_m kappa_m
+                       4 xi (1 - xi) B_m(xi), so the leading and trailing edge
+                       stay put; kappa in every mode is a parabolic camber line
+                       of maximum kappa
+        With one mode these are a uniform thickness change and a parabolic
+        camber line. The modes are least-squares fits on the block's chordwise
+        basis; they are exact when it is a Bezier (n_chord = degree + 1) of
+        degree >= n - 1 for thickness and >= n + 1 for camber (``describe``
+        reports the fit residual).
+    derived : which of ``aspect_ratio``, ``root_chord`` and ``span`` follows from
+        the other two and the taper ratio, s = AR c_r (1 + taper) / 4. Default:
+        ``span``, unless span is a variable -- then whichever of aspect_ratio
+        and root_chord is not (with only span a variable, name it).
     sweep_chord_fraction : chord line the sweep is measured on; sections scale
         about it, and its root point stays fixed.
     semi_span : baseline semi-span; default the wall's largest y (which
@@ -372,39 +409,72 @@ class WingShape(ShapeLayer):
     fit_tol : allowed deviation of the baseline leading/trailing edges from
         straight lines, relative to the root chord.
 
-    The geometry: the semi-span follows as s = AR c_r (1 + taper) / 4. FFD
-    section j, at baseline span fraction eta_j = y_j / s0, moves to
-    y_j' = eta_j s', its chord c_j' = c_r' (1 - (1 - taper') eta_j) scales it by
-    r_j = c_j'/c_j0 about the reference chord line in x and about the chord
-    plane in z (keeping t/c; the thickness variable multiplies on top), and the
-    reference line is placed at x_ref,root + y_j' tan(sweep'). These are lsdo_geo
-    sectional stretches and translations; camber is an additive sectional mode.
-    With the taper ratio fixed the map is affine, so the deformed wall is
-    exactly the trapezoid the variables describe; a taper change is exact at
-    the FFD sections and B-spline-blended between them.
+    The geometry: FFD section j, at baseline span fraction eta_j = y_j / s0,
+    moves to y_j' = eta_j s', its chord c_j' = c_r' (1 - (1 - taper') eta_j)
+    scales it by r_j = c_j'/c_j0 about the reference chord line in x and about
+    the chord plane in z (keeping t/c; the thickness modes act on top), and the
+    reference line is placed at x_ref,root + y_j' tan(sweep'). These are
+    lsdo_geo sectional stretches and translations; thickness and camber are
+    additive sectional modes. With the taper ratio fixed the map is affine, so
+    the deformed wall is exactly the trapezoid the variables describe; a taper
+    change is exact at the FFD sections and B-spline-blended between them.
     """
     name = 'wing'
     principal_dim = 1
-    PLANFORM_KEYS = ('sweep', 'aspect_ratio', 'root_chord', 'taper_ratio')
+    PLANFORM_KEYS = ('sweep', 'aspect_ratio', 'root_chord', 'span', 'taper_ratio')
+    SIZE_KEYS = ('aspect_ratio', 'root_chord', 'span')
     SECTION_KEYS = ('thickness', 'camber')
 
     def __init__(self, planform=None, sections=None, sweep_chord_fraction=0.25,
-                 semi_span=None, fit_tol=1e-3, scaler_mode='bounds', name='wing'):
+                 semi_span=None, derived=None, fit_tol=1e-3, scaler_mode='bounds', name='wing'):
         self.planform_spec = dict(planform or {})
-        self.section_spec = dict(sections or {})
-        for spec, keys, what in ((self.planform_spec, self.PLANFORM_KEYS, 'planform'),
-                                 (self.section_spec, self.SECTION_KEYS, 'section')):
-            unknown = set(spec) - set(keys)
-            if unknown:
-                raise ValueError("unknown {} variable(s) {}; expected any of {}"
-                                 .format(what, sorted(unknown), list(keys)))
+        self.section_spec = {}
+        unknown = set(self.planform_spec) - set(self.PLANFORM_KEYS)
+        if unknown:
+            raise ValueError("unknown planform variable(s) {}; expected any of {}"
+                             .format(sorted(unknown), list(self.PLANFORM_KEYS)))
+        for key, spec in dict(sections or {}).items():
+            if key not in self.SECTION_KEYS:
+                raise ValueError("unknown section variable {!r}; expected any of {}"
+                                 .format(key, list(self.SECTION_KEYS)))
+            if not isinstance(spec, dict):
+                spec = {'bounds': spec}
+            if 'bounds' not in spec or set(spec) - {'bounds', 'modes'}:
+                raise ValueError("section variable {!r}: spec needs 'bounds' and may have "
+                                 "'modes', got {}".format(key, sorted(spec)))
+            modes = int(spec.get('modes', 1))
+            if modes < 1:
+                raise ValueError("section variable {!r} needs at least one mode".format(key))
+            self.section_spec[key] = {'bounds': spec['bounds'], 'modes': modes}
         if not self.planform_spec and not self.section_spec:
             raise ValueError("WingShape needs at least one planform or section variable")
+        self.derived = self._derived_size(derived)
         self.f = float(sweep_chord_fraction)
         self.semi_span_arg = semi_span
         self.fit_tol = fit_tol
         self.scaler_mode = scaler_mode
         self.name = name
+
+    def _derived_size(self, derived):
+        variables = [k for k in self.SIZE_KEYS if k in self.planform_spec]
+        if len(variables) == 3:
+            raise ValueError("aspect_ratio, root_chord and span are related through the taper "
+                             "ratio; at most two of them can be design variables")
+        if derived is None:
+            if 'span' not in variables:
+                return 'span'
+            free = [k for k in ('aspect_ratio', 'root_chord') if k not in variables]
+            if len(free) == 2:
+                raise ValueError("with span a design variable, say which of aspect_ratio and "
+                                 "root_chord follows from it (derived=...); the other stays "
+                                 "at its baseline")
+            return free[0]
+        if derived not in self.SIZE_KEYS:
+            raise ValueError("derived must be one of {}, got {!r}".format(list(self.SIZE_KEYS),
+                                                                          derived))
+        if derived in variables:
+            raise ValueError("{!r} cannot be both a design variable and derived".format(derived))
+        return derived
 
     # ---- baseline (numpy) -----------------------------------------------
     def setup(self, parameterization):
@@ -443,6 +513,7 @@ class WingShape(ShapeLayer):
         return {'sweep': float(np.arctan(ref_slope)),
                 'aspect_ratio': float(4. * s0 / (c_root + c_tip)),
                 'root_chord': float(c_root),
+                'span': 2. * s0,
                 'taper_ratio': float(c_tip / c_root),
                 'semi_span': s0,
                 'area': float((c_root + c_tip) * s0),
@@ -481,20 +552,53 @@ class WingShape(ShapeLayer):
         # control points (SectionalParameterization.helpful_section_b_spline_space),
         # not on the FFD's own basis, so invert that one.
         self.pivots = np.zeros((n1, 2))
-        weights = np.zeros(ffd.shape)
-        u = np.linspace(0., 1., 8 * n0 + 1)
-        basis0 = _bspline_basis(deg0, n0, u)
         for j in range(n1):
             self.pivots[j, 0] = _invert_monotone_bspline(1, C[:, j, 0, 0], self.x_ref0[j])
             self.pivots[j, 1] = _invert_monotone_bspline(1, C[0, j, :, 2], z_ref0[j])
-            # camber mode: control values whose B-spline is 4 xi (1 - xi) of the
-            # wing chord fraction xi (exact for a quadratic chordwise basis)
-            xi = (basis0 @ C[:, j, 0, 0] - x_le0[j]) / self.c0[j]
-            m = np.linalg.lstsq(basis0, 4. * xi * (1. - xi), rcond=None)[0]
-            weights[:, j, :] = m[:, None]
-        self.camber_weights = weights
+
+        # Section modes: chordwise control values whose B-spline is the mode's
+        # profile in the wing chord fraction xi (least squares; exact when the
+        # chordwise basis contains it). Thickness weights also carry the control
+        # points' height above the chord plane, the distance they scale.
+        u = np.linspace(0., 1., 8 * n0 + 1)
+        basis0 = _bspline_basis(deg0, n0, u)
+        self.mode_weights = {}
+        self.mode_fit_residual = 0.
+        for key, spec in self.section_spec.items():
+            weights = np.zeros((spec['modes'],) + ffd.shape)
+            for j in range(n1):
+                xi = (basis0 @ C[:, j, 0, 0] - x_le0[j]) / self.c0[j]
+                profiles = _section_mode_profiles(key, spec['modes'], xi)
+                fit = np.linalg.lstsq(basis0, profiles, rcond=None)[0]       # (n0, modes)
+                self.mode_fit_residual = max(self.mode_fit_residual,
+                                             float(np.abs(basis0 @ fit - profiles).max()))
+                if key == 'thickness':
+                    weights[:, :, j, :] = fit.T[:, :, None] * (C[0, j, :, 2] - z_ref0[j])[None, None, :]
+                else:
+                    weights[:, :, j, :] = fit.T[:, :, None]
+            self.mode_weights[key] = weights
 
     # ---- design variables ---------------------------------------------------
+    def _section_bounds(self, bounds, n1, modes):
+        """Broadcast per-section (n1,) or (n1, modes) bound arrays to the
+        variable's flat (n1 * modes,) layout; scalars pass through."""
+        if not isinstance(bounds, (tuple, list)) or len(bounds) != 2:
+            return bounds
+        resolved = []
+        for bound in bounds:
+            bound = np.asarray(bound, dtype=np.float64)
+            if bound.ndim == 0:
+                resolved.append(float(bound))
+            elif bound.shape == (n1,):
+                resolved.append(np.repeat(bound, modes))
+            elif bound.size == n1 * modes:
+                resolved.append(bound.reshape(-1))
+            else:
+                raise ValueError("section bounds must be scalars or arrays of shape ({0},), "
+                                 "({0}, {1}) or ({2},), got {3}".format(n1, modes, n1 * modes,
+                                                                       bound.shape))
+        return tuple(resolved)
+
     def declare(self, dvs):
         self.variables = {}
         for key in self.PLANFORM_KEYS:
@@ -505,7 +609,9 @@ class WingShape(ShapeLayer):
         n1 = self.parameterization.ffd.shape[1]
         for key in self.SECTION_KEYS:
             if key in self.section_spec:
-                dv = build_sectional_dv(n1, self.section_spec[key], scaler_mode=self.scaler_mode)
+                modes = self.section_spec[key]['modes']
+                bounds = self._section_bounds(self.section_spec[key]['bounds'], n1, modes)
+                dv = build_sectional_dv(n1 * modes, bounds, scaler_mode=self.scaler_mode)
                 self.variables[key] = dvs.add(key, dv)
 
     def _planform_variable(self, key):
@@ -514,25 +620,42 @@ class WingShape(ShapeLayer):
         return csdl.Variable(value=np.array([self.baseline[key]]))
 
     def sectional(self, sectional):
-        sweep, aspect_ratio, root_chord, taper_ratio = (
-            self._planform_variable(k) for k in self.PLANFORM_KEYS)
-        semi_span = aspect_ratio * root_chord * (1. + taper_ratio) / 4.
+        sweep = self._planform_variable('sweep')
+        taper_ratio = self._planform_variable('taper_ratio')
+        if self.derived == 'span':
+            aspect_ratio = self._planform_variable('aspect_ratio')
+            root_chord = self._planform_variable('root_chord')
+            semi_span = aspect_ratio * root_chord * (1. + taper_ratio) / 4.
+        else:
+            semi_span = self._planform_variable('span') / 2.
+            if self.derived == 'root_chord':
+                aspect_ratio = self._planform_variable('aspect_ratio')
+                root_chord = 4. * semi_span / (aspect_ratio * (1. + taper_ratio))
+            else:
+                root_chord = self._planform_variable('root_chord')
+                aspect_ratio = 4. * semi_span / (root_chord * (1. + taper_ratio))
         chord = root_chord * (1. - (1. - taper_ratio) * self.eta)        # c_j'
         ratio = chord / self.c0                                          # r_j
         y_new = semi_span * self.eta
         x_ref = self.baseline['x_ref_root'] + y_new * csdl.tan(sweep)
 
-        # chord: scale about the reference chord line; thickness: scale about
-        # the chord plane, with the chord (t/c kept) times 1 + thickness
+        # chord: scale about the reference chord line, and about the chord
+        # plane (t/c kept)
         sectional.add_stretch((ratio - 1.) * self.extent_x, 0, pivot=self.pivots)
-        z_scale = ratio * (1. + self.variables['thickness']) if 'thickness' in self.variables \
-            else ratio
-        sectional.add_stretch((z_scale - 1.) * self.extent_z, 2, pivot=self.pivots)
+        sectional.add_stretch((ratio - 1.) * self.extent_z, 2, pivot=self.pivots)
         sectional.add_translation(x_ref - self.x_ref0, [1., 0., 0.])
         sectional.add_translation(y_new - self.y, [0., 1., 0.])
-        if 'camber' in self.variables:
-            sectional.add_mode(self.variables['camber'] * chord, [0., 0., 1.],
-                               self.camber_weights)
+        # thickness modes scale the (chord-scaled) height above the chord
+        # plane; camber modes move by a fraction of the new chord
+        n1 = self.parameterization.ffd.shape[1]
+        for key, scale in (('thickness', ratio), ('camber', chord)):
+            if key not in self.variables:
+                continue
+            modes = self.section_spec[key]['modes']
+            values = self.variables[key].reshape((n1, modes))
+            for m in range(modes):
+                sectional.add_mode(values[:, m] * scale, [0., 0., 1.],
+                                   self.mode_weights[key][m])
 
         tip_chord = root_chord * taper_ratio
         self._outputs = {'sweep': sweep, 'aspect_ratio': aspect_ratio,
@@ -550,7 +673,17 @@ class WingShape(ShapeLayer):
 
     def describe(self):
         b = self.baseline
-        return ["  wing baseline: sweep({:.2f} c) {:.4f} deg, AR {:.5g}, root chord {:.5g}, "
-                "taper {:.5g}, semi-span {:.5g}, area {:.5g} (edge fit residual {:.2e})".format(
-                    self.f, np.degrees(b['sweep']), b['aspect_ratio'], b['root_chord'],
-                    b['taper_ratio'], b['semi_span'], b['area'], b['fit_residual'])]
+        lines = ["  wing baseline: sweep({:.2f} c) {:.4f} deg, AR {:.5g}, root chord {:.5g}, "
+                 "taper {:.5g}, span {:.5g}, area {:.5g} (edge fit residual {:.2e}); "
+                 "{} derived".format(self.f, np.degrees(b['sweep']), b['aspect_ratio'],
+                                     b['root_chord'], b['taper_ratio'], b['span'], b['area'],
+                                     b['fit_residual'], self.derived)]
+        if self.section_spec:
+            n1 = self.parameterization.ffd.shape[1]
+            lines.append("  wing sections: {} spanwise stations at y = {}; {} (max chordwise "
+                         "mode fit residual {:.2e})".format(
+                             n1, np.array2string(self.y, precision=3),
+                             ", ".join("{} {} modes".format(key, spec['modes'])
+                                       for key, spec in self.section_spec.items()),
+                             self.mode_fit_residual))
+        return lines

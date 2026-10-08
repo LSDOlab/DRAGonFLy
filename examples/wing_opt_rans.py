@@ -1,3 +1,19 @@
+"""
+Drag minimization of the Simple Transonic Wing with the SA-neg RANS model: the
+RANS counterpart of wing_opt_euler.py, with the same planform (sweep, aspect
+ratio, span, taper) and section (thickness and camber modes at three spanwise
+stations) design variables plus the angle of attack, at M 0.75.
+
+The flow model is CompressibleRANSModel (p = 0, Green-Gauss gradients
+condensed out of Newton, MUSCL, pseudo-transient continuation from the free
+stream), passed to DG_windtunnel_model as model_class; the drag includes the
+wall friction. The wing wall is adiabatic no-slip, the y = 0 symmetry plane
+slip. The L3 grid is wall-resolved (first cell ~9e-6, root chord 5); the
+wall-merged XDMF variant coarsens exactly those layers, so it is not meant
+for RANS.
+
+    OMP_NUM_THREADS=1 mpirun -n 8 python wing_opt_rans.py
+"""
 import os
 
 import numpy as np
@@ -12,6 +28,7 @@ from modopt import COBYLA, SLSQP, PySLSQP
 from dragonfly_sim.utils.mesh_manager_utils import wing_inner_bdry_function
 from dragonfly_sim.utils.mesh_io_utils import load_dolfinx_mesh
 from dragonfly_sim.core.windtunnel_model import DG_windtunnel_model
+from dragonfly_sim.core.RANS_model import CompressibleRANSModel
 from dragonfly_sim.core.postprocessor import DG_postprocessor
 
 from dragonfly_sim.utils.ffd_dv_utils import spanwise_linear_bounds
@@ -45,9 +62,21 @@ if __name__ == '__main__':
 
     # Inlet flow conditions
     rho_0 = 1.0
-    M_0 = 0.8
+    M_0 = 0.75
     p_0 = 1.0
     attack = np.radians(2)
+
+    # Reynolds number. The RANS model's Re is per unit length of the mesh
+    # (mu_inf = rho_inf U_inf / Re), and the mesh is in the wing's own units
+    # (root chord 5), so it is set from the Reynolds number on the baseline
+    # mean aerodynamic chord. It stays fixed per unit length when the planform
+    # changes, i.e. the physical scale of the wing is what is held, not Re_mac.
+    # Re_mac is a chosen value, not one from a reference case; set it to the
+    # flight condition of interest (and check the first-cell y+ for it).
+    Re_mac = 5e6
+    c_root, taper = 5.0, 0.3
+    mac = 2. / 3. * c_root * (1. + taper + taper ** 2) / (1. + taper)    # 3.564
+    Re = Re_mac / mac
 
     # inflow_angle is derived from alpha inside define_inlet_outlet_conditions
     # now, so that alpha is the single source of truth for the freestream
@@ -113,15 +142,43 @@ if __name__ == '__main__':
     recorder = csdl.Recorder(inline=False)
     recorder.start()
 
-    csdl_euler_model = DG_windtunnel_model(mesh_from_file, boundary_dict, shape,
-                                           np.array([0.25, 0., 0.], dtype=np.double),
-                                           mesh_inner_bdry_function=wing_inner_bdry_function,
-                                           poly_order=poly_o, gamma=1.4,
-                                           filename_suffix="wing_opt_L3mesh_p=0_M=0_8",
-                                           asm_overlap=1, ilu_levels=1)
-    csdl_euler_model.set_up_sim()
+    csdl_flow_model = DG_windtunnel_model(mesh_from_file, boundary_dict, shape,
+                                          np.array([0.25, 0., 0.], dtype=np.double),
+                                          mesh_inner_bdry_function=wing_inner_bdry_function,
+                                          poly_order=poly_o, gamma=1.4,
+                                          filename_suffix="wing_opt_rans_L3mesh_p=0_M=0_75",
+                                          asm_overlap=1, ilu_levels=2,
+                                          model_class=CompressibleRANSModel,
+                                          model_kwargs={'Re': Re})
+    # Pseudo-transient continuation from the free stream needs many more steps
+    # than a plain Newton solve (~60 for a 2D airfoil at M 0.7; more for a
+    # transonic wing).
+    csdl_flow_model.max_newton_iterations = 400
+    # The residual tolerance stays at its default (1e-9). check_totals'
+    # finite differences need a tightly converged flow, but on this wing the
+    # Euler residual stalls at ~2.6e-10, and a solve that misses its tolerance
+    # returns the sentinel drag (finite differences 0 for every variable).
+    # Check where the RANS residual levels off before tightening it.
+    # Memory (L3, p = 0, 4 ranks, measured 2026-10-07): the PTC solve peaks at
+    # ~22 GB in total, but one assembly of the exact condensed Jacobian dR/dU
+    # -- what the adjoint (check_totals, optimization) and the c_m_alpha log
+    # solve on -- went past 33 GB, more than a 46 GB workstation had left.
+    # Plan the derivative runs for a larger machine. The c_m_alpha log is
+    # monitoring only, so it is switched off below (it would assemble that
+    # Jacobian after every flow solve).
+    csdl_flow_model.log_cm_alpha = False
+    # Free the solver's matrices after each forward solve and the adjoint's
+    # after each adjoint, so the two never coexist (rebuilt when next needed).
+    csdl_flow_model.release_solver_memory = True
+    # No per-evaluation mesh_deformation file; the solution files are still written
+    csdl_flow_model.write_mesh_deformation = False
+    # One solution frame per design (CSDL evaluates each design twice)
+    csdl_flow_model.write_once_per_design = True
+    csdl_flow_model.set_up_sim()
 
-    csdl_coeff_model = DG_postprocessor(csdl_euler_model.mesh, csdl_euler_model.sim_model, csdl_euler_model.WALL_TAG, np.array([0.25, 0., 0.], dtype=np.double), p_inf_dim=101325.)
+    # D includes the wall friction (D_friction is its viscous part)
+    csdl_coeff_model = DG_postprocessor(csdl_flow_model.mesh, csdl_flow_model.sim_model, csdl_flow_model.WALL_TAG, np.array([0.25, 0., 0.], dtype=np.double), p_inf_dim=101325.)
+    csdl_coeff_model.log_cm_alpha = False
 
     # Shape design variables first (all of them as one flat vector), then alpha
     shape_param_vector = shape.declare_design_variables()
@@ -136,9 +193,9 @@ if __name__ == '__main__':
                                  scaler=1./np.radians(1.))
 
     # These are the mesh node deformations, ordered according to the global mesh node ordering
-    mesh_nodes_deformation = csdl_euler_model.deform_mesh()
+    mesh_nodes_deformation = csdl_flow_model.deform_mesh()
 
-    u_vec = csdl_euler_model.evaluate(mesh_nodes_deformation, shape_param_vector, alpha)
+    u_vec = csdl_flow_model.evaluate(mesh_nodes_deformation, shape_param_vector, alpha)
 
     outputs = csdl_coeff_model.evaluate(u_vec, mesh_nodes_deformation, alpha, shape_param_vector)
 
@@ -163,9 +220,13 @@ if __name__ == '__main__':
         # (the optimizer never sees a dimensional value, regardless of 
         # p_inf_dim/L_ref_dim -- those only scale the console printout in 
         # compute())
+        # Lower bound: the lift of the undeformed wing at these conditions
+        # (M 0.75, alpha 2 deg, Re_mac 5e6), from a converged forward solve
+        # (2026-10-07: 66 PTC steps to |R| 3.6e-10; c_l 0.42571, c_d 0.017270)
+        L_baseline = 7.633754061772796
         L_constraint = L
         L_constraint.add_name('L_limit')
-        L_constraint.set_as_constraint(lower=10.)
+        L_constraint.set_as_constraint(lower=L_baseline)
 
     # Geometric constraints. The wing's planform quantities follow directly from
     # its variables (shape.outputs()['wing']: area, span, semi_span, root_chord,
@@ -196,23 +257,25 @@ if __name__ == '__main__':
     # PETSc.Sys.Print("finished sim run")
     
     # test accuracy of simulation object
-    print("Starting check_totals...")
-    sim.check_totals(step_size=1e-6)
+    # print("Starting check_totals...")
+    # sim.check_totals(step_size=1e-6)
 
-    # PETSc.Sys.Print("Defining optimization problem...")
+    PETSc.Sys.Print("Defining optimization problem...")
 
-    # prob = CSDLAlphaProblem(problem_name='shape_opt',simulator=sim)
-    # # # optimizer = COBYLA(prob, solver_options={'maxiter':400, 'catol':1e-6, 'rhobeg': 0.025}, turn_off_outputs=True)
+    prob = CSDLAlphaProblem(problem_name='shape_opt',simulator=sim)
+    # optimizer = COBYLA(prob, solver_options={'maxiter':400, 'catol':1e-6, 'rhobeg': 0.025}, turn_off_outputs=True)
 
-    # optimizer = SLSQP(prob, solver_options={'ftol':1e-8, 'maxiter':150})
-    # # # optimizer = PySLSQP(prob, solver_options={'acc':1e-8, 'maxiter':100})
+    # modopt writes its outputs into a timestamped folder that every rank would
+    # create at once (a FileExistsError race): only rank 0 writes them
+    optimizer = SLSQP(prob, solver_options={'ftol':1e-8, 'maxiter':150},
+                      turn_off_outputs=mesh_from_file.comm.Get_rank() != 0)
+    # optimizer = PySLSQP(prob, solver_options={'acc':1e-8, 'maxiter':100})
 
-    # PETSc.Sys.Print("Solving optimization problem...")
+    PETSc.Sys.Print("Solving optimization problem...")
 
-    # optimizer.solve()
+    optimizer.solve()
 
-    # # save data store file
-    # if mesh_from_file.comm.Get_rank() == 0:
-    #     csdl_euler_model.data_store.write_store_to_numpy_file(save_filename="SLSQP_{}.npy".format(csdl_euler_model.filename_suffix))
-    # csdl_euler_model.data_store.write_store_to_numpy_file(save_filename="SLSQP_L3mesh_cpgrid=10x5x2_p=0_test_M=0_85.npy")
-    # optimizer.print_results()
+    # save data store file
+    if mesh_from_file.comm.Get_rank() == 0:
+        csdl_flow_model.data_store.write_store_to_numpy_file(save_filename="SLSQP_{}.npy".format(csdl_flow_model.filename_suffix))
+    optimizer.print_results()

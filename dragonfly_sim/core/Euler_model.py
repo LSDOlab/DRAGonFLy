@@ -1,3 +1,5 @@
+import ctypes
+import gc
 import contextlib
 
 import numpy as np
@@ -159,37 +161,68 @@ class CompressibleEulerModel():
         self.asm_overlap = 2
         self.ilu_levels = 2
 
-        self.fom_pressure_writer = None
-        self.pressure_func = None
+        self.fom_solution_writer = None
+        self._output_fields = []
         # False until define_sol_export_files actually opens the writers, which
         # keeps write_solution_output inert for a model that never opened them
         self.export_solutions = False
 
 
-    def define_sol_export_files(self, func_space, file_name_addendum=None, mesh_deformation=False):
-        # FOM_solution_<suffix>.bp is the ALIGNED series: exactly one frame per
-        # design evaluation, written by write_solution_output() at eval_idx, so
-        # step k here is step k in mesh_deformation_<suffix>.bp. It carries the
-        # accepted solution -- see DG_windtunnel_model.solve_residual_equations.
-        # mesh_deformation=True writes each frame on the deformed mesh it was
-        # solved on.
-        self.fom_solution_writer = FileWriter("FOM_solution_{}".format(file_name_addendum), self.mesh_obj.mesh.comm, func_space,
-                                              mesh_deformation=mesh_deformation)
-        self.fom_pressure_writer = FileWriter("FOM_pressure_{}".format(file_name_addendum), self.mesh_obj.mesh.comm, self.functionspaces["V_scalar"],
-                                              mesh_deformation=mesh_deformation)
-        self.pressure_func = dolfinx.fem.Function(self.functionspaces["V_scalar"], name="pressure")
+    def output_field_expressions(self):
+        """The fields of the solution file, as (name, value shape, UFL
+        expression of u_vec): the conservative state as separate fields --
+        density rho, momentum rho*u (a vector), energy rho*E, and each
+        transported scalar under its own name (e.g. rho_nu_tilde) -- then the
+        velocity u (a vector) and the pressure p."""
+        dim = self.dimensions
+        U = self.mean_flow(self.u_vec)
+        momentum = ufl.as_vector([U[1 + i] for i in range(dim)])
+        fields = [("density", (), U[0]),
+                  ("momentum", (dim,), momentum),
+                  ("energy", (), U[1 + dim])]
+        fields += [(name, (), self.u_vec[self.n_mean + k])
+                   for k, name in enumerate(self.extra_variables)]
+        fields += [("velocity", (dim,), momentum / U[0]),
+                   ("pressure", (), pressure(U, self.gamma))]
+        return fields
+
+    def define_sol_export_files(self, func_space=None, file_name_addendum=None, mesh_deformation=False):
+        """Open FOM_solution_<suffix>.bp, one file holding every output field
+        (output_field_expressions) as a separate, named field; the mesh is
+        stored once per frame for all of them. Collective.
+
+        It is the ALIGNED series: exactly one frame per design evaluation,
+        written by write_solution_output() at eval_idx, so step k here is step
+        k in mesh_deformation_<suffix>.bp. It carries the accepted solution --
+        see DG_windtunnel_model.solve_residual_equations. mesh_deformation=True
+        writes each frame on the deformed mesh it was solved on. func_space is
+        unused (the fields define their own spaces); it is kept for callers.
+        """
+        spaces = {}
+        self._output_fields = []
+        for name, shape, expr in self.output_field_expressions():
+            if shape not in spaces:
+                spaces[shape] = (self.functionspaces["V_scalar"] if shape == () else
+                                 dolfinx.fem.functionspace(self.mesh_obj.mesh,
+                                                           ("DG", self.poly_order, shape)))
+            V = spaces[shape]
+            # compiled once here (collective), interpolated at every write
+            self._output_fields.append(
+                (name, dolfinx.fem.Function(V, name=name),
+                 dolfinx.fem.Expression(expr, V.element.interpolation_points)))
+        self.fom_solution_writer = FileWriter(
+            "FOM_solution_{}".format(file_name_addendum), self.mesh_obj.mesh.comm,
+            {name: f.function_space for name, f, _ in self._output_fields},
+            mesh_deformation=mesh_deformation)
         self.export_solutions = True
 
-    def _write_derived_fields(self, solution_writer, pressure_writer, write_counter):
-        """Interpolate the derived fields off the current u_vec and write them.
-
-        u_vec must already hold the state being exported.
-        """
-        p_expr = dolfinx.fem.Expression(pressure(self.mean_flow(self.u_vec), self.gamma), self.functionspaces["V_scalar"].element.interpolation_points)
-        self.pressure_func.interpolate(p_expr)
-
-        solution_writer.interpolate_and_write(self.u_vec, write_counter=write_counter)
-        pressure_writer.interpolate_and_write(self.pressure_func, write_counter=write_counter)
+    def _write_output_fields(self, write_counter):
+        """Interpolate the output fields off the current u_vec and write one
+        frame. u_vec must already hold the state being exported. Collective."""
+        for _, f, expr in self._output_fields:
+            f.interpolate(expr)
+        self.fom_solution_writer.interpolate_and_write(
+            {name: f for name, f, _ in self._output_fields}, write_counter=write_counter)
 
     def write_solution_output(self, write_counter, solution_array=None):
         """Write one aligned output frame at index `write_counter`.
@@ -209,8 +242,7 @@ class CompressibleEulerModel():
         if solution_array is not None:
             self.interpolate_solution_vector(solution_array)
 
-        self._write_derived_fields(
-            self.fom_solution_writer, self.fom_pressure_writer, write_counter)
+        self._write_output_fields(write_counter)
 
     def define_elements_functionspaces(self):
         # Throughout this class we need access to various function spaces; this is where we define them
@@ -847,15 +879,18 @@ class CompressibleEulerModel():
         return full_norm / u_norm
 
     def solve_linearized(self, rhs, out, transpose=False, prefix="lin_", rtol=1e-10,
-                         atol=1e-11, max_it=1000, gmres_restart=200):
+                         atol=1e-11, max_it=1000, gmres_restart=200, release_operands=False):
         """
         Solve dR/dU x = rhs (or its transpose, for the adjoint) at the
         current state, for models whose dR/dU is a condensed product
         (has_condensed_jacobian). FGMRES on the exact operator, right
         preconditioned with ASM/ILU of the compact A_UU part -- the forward
         solve's compact_pc pairing -- or MUMPS with direct_linear_solver.
-        The transposes are formed explicitly. Returns the KSP (iterations,
-        residual norm and reason are read off it).
+        The transposes are formed explicitly. With release_operands and
+        transpose, the condensed dR/dU (and its blocks) is freed once the
+        transposes exist, before the preconditioner is set up: only the
+        transposes are used from then on (release_solver). Returns the KSP
+        (iterations, residual norm and reason are read off it).
         """
         A = self.assemble_dRdu_mat()
         P = self._dRdu_condensed.A_UU
@@ -863,6 +898,9 @@ class CompressibleEulerModel():
             # out of place: Mat.transpose() without an argument transposes the
             # cached matrices themselves
             A, P = A.transpose(PETSc.Mat()), P.transpose(PETSc.Mat())
+            if release_operands:
+                self._release_condensed_jacobian()
+                self._return_freed_memory()
         ksp = PETSc.KSP().create(self.mesh_obj.mesh.comm)
         ksp.setOptionsPrefix(prefix)
         ksp.setOperators(A, A if self.direct_linear_solver else P)
@@ -1087,6 +1125,52 @@ class CompressibleEulerModel():
                 alpha_var=getattr(self, "alpha_var", None),
                 jit_options={"cffi_extra_compile_args": ["-O3", "-march=native", "-ffast-math"]})
         return self._chain_rule
+
+    def release_solver(self):
+        """
+        Free the forward solver (SNES, KSP and its preconditioner), the
+        Newton problem's matrices, and the cached condensed dR/dU of
+        assemble_dRdu_mat. set_up_solver and assemble_dRdu_mat rebuild them
+        when next needed. For memory-bound runs, e.g. a 3D RANS shape
+        optimization: the forward solve's matrices and the adjoint's then
+        never coexist. Collective.
+        """
+        if self.solver_is_set_up:
+            self.solver.destroy()
+            condensed = getattr(self.problem, "_condensed", None)
+            if condensed is not None:
+                self._destroy_condensed(condensed)
+            self.problem._A.destroy()
+            self.problem._b.destroy()
+            self.problem = None
+            self.solver = None
+            self.solver_is_set_up = False
+        self._release_condensed_jacobian()
+        self._return_freed_memory()
+
+    def _return_freed_memory(self):
+        """Collect garbage, flush petsc4py's queue of dropped parallel objects
+        and hand freed heap back to the OS (glibc malloc_trim). Rebuilding the
+        multi-GB 3D RANS matrices on every solve otherwise fragments the heap,
+        and the resident size creeps up ~2 GB per optimization iteration."""
+        gc.collect()
+        PETSc.garbage_cleanup(self.mesh_obj.mesh.comm)
+        try:
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except (OSError, AttributeError):
+            pass                                  # not glibc
+
+    @staticmethod
+    def _destroy_condensed(condensed):
+        # the matrices a CondensedJacobian owns; _inv_mass is the reconstruction's
+        for name in ("A_UU", "A_UG", "B_GU", "_C", "A"):
+            getattr(condensed, name).destroy()
+
+    def _release_condensed_jacobian(self):
+        """Free assemble_dRdu_mat's cached condensed dR/dU; rebuilt when next needed."""
+        if hasattr(self, "_dRdu_condensed"):
+            self._destroy_condensed(self._dRdu_condensed)
+            del self._dRdu_condensed
 
     @property
     def has_condensed_jacobian(self):

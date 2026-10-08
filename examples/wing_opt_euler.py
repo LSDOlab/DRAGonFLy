@@ -1,3 +1,11 @@
+"""
+Drag minimization of the Simple Transonic Wing with the Euler model: planform
+(sweep, aspect ratio, span, taper) and section (thickness and camber modes at
+three spanwise stations) design variables plus the angle of attack, at
+M 0.8. The RANS counterpart is wing_opt_rans.py.
+
+    OMP_NUM_THREADS=1 mpirun -n 8 python wing_opt_euler.py
+"""
 import os
 
 import numpy as np
@@ -12,6 +20,7 @@ from modopt import COBYLA, SLSQP, PySLSQP
 from dragonfly_sim.utils.mesh_manager_utils import wing_inner_bdry_function
 from dragonfly_sim.utils.mesh_io_utils import load_dolfinx_mesh
 from dragonfly_sim.core.windtunnel_model import DG_windtunnel_model
+from dragonfly_sim.core.Euler_model import CompressibleEulerModel
 from dragonfly_sim.core.postprocessor import DG_postprocessor
 
 from dragonfly_sim.utils.ffd_dv_utils import spanwise_linear_bounds
@@ -117,8 +126,9 @@ if __name__ == '__main__':
                                            np.array([0.25, 0., 0.], dtype=np.double),
                                            mesh_inner_bdry_function=wing_inner_bdry_function,
                                            poly_order=poly_o, gamma=1.4,
-                                           filename_suffix="wing_opt_L3mesh_p=0_M=0_8",
-                                           asm_overlap=1, ilu_levels=1)
+                                           filename_suffix="wing_opt_euler_L3mesh_p=0_M=0_8",
+                                           asm_overlap=1, ilu_levels=1,
+                                           model_class=CompressibleEulerModel)
     csdl_euler_model.set_up_sim()
 
     csdl_coeff_model = DG_postprocessor(csdl_euler_model.mesh, csdl_euler_model.sim_model, csdl_euler_model.WALL_TAG, np.array([0.25, 0., 0.], dtype=np.double), p_inf_dim=101325.)

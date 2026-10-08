@@ -34,9 +34,9 @@ def swept_wing(n_span=15):
 
 
 def wing_shape(X, tris, planform=PLANFORM_BOUNDS, sections=None, corners=WING_CORNERS,
-               ffd_shape=(3, 5, 2), **kwargs):
+               ffd_shape=(3, 5, 2), degree=(2, 2, 1), **kwargs):
     wing = WingShape(planform=planform, sections=sections, **kwargs)
-    shape = FFDShapeParameterization(ffd_shape, [2, 2, 1], corners, layers=[wing])
+    shape = FFDShapeParameterization(ffd_shape, list(degree), corners, layers=[wing])
     shape.setup(COMM, X, np.arange(len(X)), tris)
     shape.declare_design_variables()
     return shape, wing
@@ -102,6 +102,35 @@ def test_planform_map_is_exact_with_fixed_taper():
     np.testing.assert_allclose(measured['chord'].value, chords, rtol=1e-12)
 
 
+@pytest.mark.parametrize("derived, size", [("root_chord", "aspect_ratio"),
+                                           ("aspect_ratio", "root_chord")])
+def test_span_variable_is_exact_with_fixed_taper(derived, size):
+    """span plus aspect ratio (or root chord) as variables: the third size
+    follows, and the map is the same affine one."""
+    X, tris = swept_wing()
+    planform = {'sweep': PLANFORM_BOUNDS['sweep'], size: PLANFORM_BOUNDS[size],
+                'span': (24., 32.)}
+    shape, wing = wing_shape(X, tris, planform=planform)
+    assert wing.derived == derived and wing.baseline['span'] == 28.
+    taper = wing.baseline['taper_ratio']
+    span, sweep = 30.5, np.radians(31.)
+    if size == 'aspect_ratio':
+        aspect_ratio = 10.1
+        root_chord = 2. * span / (aspect_ratio * (1. + taper))
+        set_values(shape, dict(sweep=sweep, aspect_ratio=aspect_ratio, span=span))
+    else:
+        root_chord = 5.3
+        aspect_ratio = 2. * span / (root_chord * (1. + taper))
+        set_values(shape, dict(sweep=sweep, root_chord=root_chord, span=span))
+    deformed = shape.wall_displacement().value + X
+    np.testing.assert_allclose(deformed, affine_planform_map(X, wing, sweep, aspect_ratio, root_chord),
+                               rtol=0, atol=1e-11)
+    out = shape.outputs()['wing']
+    np.testing.assert_allclose(out['span'].value, span, rtol=1e-14)
+    np.testing.assert_allclose(out['root_chord'].value, root_chord, rtol=1e-14)
+    np.testing.assert_allclose(out['aspect_ratio'].value, aspect_ratio, rtol=1e-14)
+
+
 def test_taper_change_is_exact_at_the_root_and_close_elsewhere():
     X, tris = swept_wing()
     shape, wing = wing_shape(X, tris)
@@ -139,6 +168,55 @@ def test_thickness_and_camber_on_a_rectangular_wing():
     np.testing.assert_allclose(dz, 0.15 * X[:, 2] + camber, rtol=0, atol=1e-12)
 
 
+def test_chordwise_modes_on_a_rectangular_wing():
+    """Several thickness and camber modes per station: on a rectangular wing
+    with a quartic Bezier chordwise basis they are exact,
+    dz = sum_m tau_m B_m(xi) z + c sum_m kappa_m 4 xi (1 - xi) B_m(xi)."""
+    from scipy.special import comb
+    X, tris = half_wing(span=14., t_over_c=0.12)
+    sections = {'thickness': {'bounds': 0.2, 'modes': 4}, 'camber': {'bounds': 0.05, 'modes': 3}}
+    shape, wing = wing_shape(X, tris, planform={}, sections=sections, corners=None,
+                             ffd_shape=(5, 5, 2), degree=(4, 2, 1))
+    assert shape['thickness'].shape == (20,) and shape['camber'].shape == (15,)
+    assert wing.mode_fit_residual < 1e-12
+    tau = np.array([0.1, -0.05, 0.15, 0.02])
+    kappa = np.array([0.02, -0.01, 0.03])
+    set_values(shape, dict(thickness=np.tile(tau, 5), camber=np.tile(kappa, 5)))
+    xi = X[:, 0] / 5.
+
+    def bernstein(n, m):
+        return comb(n, m) * xi ** m * (1. - xi) ** (n - m)
+    thickness = sum(tau[m] * bernstein(3, m) for m in range(4))
+    camber = 5. * 4. * xi * (1. - xi) * sum(kappa[m] * bernstein(2, m) for m in range(3))
+    dz = shape.wall_displacement().value[:, 2]
+    np.testing.assert_allclose(dz, thickness * X[:, 2] + camber, rtol=0, atol=1e-12)
+
+
+def test_one_mode_matches_equal_mode_values():
+    """Equal values in every mode are the one-mode (uniform thickness,
+    parabolic camber) shape."""
+    X, tris = swept_wing(n_span=8)
+    kw = dict(ffd_shape=(5, 5, 2), degree=(4, 2, 1))
+    one, _ = wing_shape(X, tris, sections={'thickness': 0.2, 'camber': 0.05}, **kw)
+    set_values(one, dict(thickness=np.linspace(-0.1, 0.1, 5), camber=np.linspace(0.02, -0.01, 5)))
+    many, _ = wing_shape(X, tris, sections={'thickness': {'bounds': 0.2, 'modes': 4},
+                                            'camber': {'bounds': 0.05, 'modes': 3}}, **kw)
+    set_values(many, dict(thickness=np.repeat(np.linspace(-0.1, 0.1, 5), 4),
+                          camber=np.repeat(np.linspace(0.02, -0.01, 5), 3)))
+    np.testing.assert_allclose(many.wall_displacement().value, one.wall_displacement().value,
+                               rtol=0, atol=1e-12)
+
+
+def test_section_mode_bounds_broadcast():
+    X, tris = swept_wing(n_span=6)
+    root_pinned = (np.array([0., -0.1, -0.1]), np.array([0., 0.1, 0.1]))
+    shape, _ = wing_shape(X, tris, planform={}, ffd_shape=(5, 3, 2), degree=(4, 2, 1),
+                          sections={'thickness': {'bounds': root_pinned, 'modes': 4}})
+    dv = shape.dvs.dv('thickness')
+    np.testing.assert_array_equal(dv.lower, np.repeat(root_pinned[0], 4))
+    np.testing.assert_array_equal(dv.upper, np.repeat(root_pinned[1], 4))
+
+
 def test_wing_derivatives_match_central_differences():
     X, tris = swept_wing(n_span=8)
     shape, wing = wing_shape(X, tris, sections={'thickness': 0.2, 'camber': 0.05})
@@ -150,6 +228,40 @@ def test_wing_derivatives_match_central_differences():
     out = shape.outputs()['wing']
     probe = disp[::7]
     ofs = [probe, out['area'], out['semi_span'], out['tip_chord']]
+    wrts = [shape[name] for name in point]
+    sim = csdl.experimental.PySimulator(csdl.get_current_recorder())
+    an = sim.compute_totals(ofs, wrts)
+    h = 1e-6
+    for wrt in wrts:
+        base = wrt.value.copy()
+        for k in range(base.size):
+            vals = []
+            for sign in (1., -1.):
+                pert = base.copy()
+                pert[k] += sign * h
+                sim[wrt] = pert
+                sim.run()
+                vals.append(np.concatenate([np.asarray(o.value).ravel() for o in ofs]))
+            sim[wrt] = base
+            fd = (vals[0] - vals[1]) / (2 * h)
+            an_col = np.concatenate([np.asarray(an[o, wrt])[:, k] if np.asarray(an[o, wrt]).ndim > 1
+                                     else np.atleast_1d(an[o, wrt])[k:k + 1] for o in ofs])
+            np.testing.assert_allclose(an_col, fd, rtol=1e-6, atol=1e-8)
+
+
+def test_wing_span_and_mode_derivatives_match_central_differences():
+    X, tris = swept_wing(n_span=8)
+    planform = {'sweep': PLANFORM_BOUNDS['sweep'], 'aspect_ratio': PLANFORM_BOUNDS['aspect_ratio'],
+                'span': (24., 32.), 'taper_ratio': PLANFORM_BOUNDS['taper_ratio']}
+    sections = {'thickness': {'bounds': 0.2, 'modes': 2}, 'camber': {'bounds': 0.05, 'modes': 2}}
+    shape, wing = wing_shape(X, tris, planform=planform, sections=sections, ffd_shape=(4, 3, 2),
+                             degree=(3, 2, 1))
+    rng = np.random.default_rng(7)
+    point = dict(sweep=np.radians(29.), aspect_ratio=9.6, span=29.5, taper_ratio=0.33,
+                 thickness=0.05 * rng.uniform(-1, 1, 6), camber=0.01 * rng.uniform(-1, 1, 6))
+    set_values(shape, point)
+    out = shape.outputs()['wing']
+    ofs = [shape.wall_displacement()[::7], out['area'], out['root_chord']]
     wrts = [shape[name] for name in point]
     sim = csdl.experimental.PySimulator(csdl.get_current_recorder())
     an = sim.compute_totals(ofs, wrts)
@@ -233,9 +345,20 @@ def test_layers_reproduce_the_manual_composition():
 def test_specification_checks():
     X, tris = swept_wing(n_span=6)
     with pytest.raises(ValueError, match="unknown planform"):
-        WingShape(planform={'span': (10., 20.)})
+        WingShape(planform={'dihedral': (0., 0.1)})
     with pytest.raises(ValueError, match="unknown section"):
         WingShape(sections={'twist': 0.1})
+    with pytest.raises(ValueError, match="say which"):
+        WingShape(planform={'span': (24., 32.)})
+    assert WingShape(planform={'span': (24., 32.)}, derived='root_chord').derived == 'root_chord'
+    with pytest.raises(ValueError, match="at most two"):
+        WingShape(planform={k: (0., 1.) for k in ('aspect_ratio', 'root_chord', 'span')})
+    with pytest.raises(ValueError, match="both a design variable and derived"):
+        WingShape(planform={'span': (24., 32.)}, derived='span')
+    with pytest.raises(ValueError, match="at least one mode"):
+        WingShape(sections={'camber': {'bounds': 0.1, 'modes': 0}})
+    with pytest.raises(ValueError, match="'modes'"):
+        WingShape(sections={'camber': {'bounds': 0.1, 'num_modes': 2}})
     with pytest.raises(ValueError, match="bracket"):
         wing_shape(X, tris, planform={'aspect_ratio': (10., 12.)})
     with pytest.raises(ValueError, match="at least one layer"):

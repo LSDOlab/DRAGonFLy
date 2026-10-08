@@ -137,10 +137,12 @@ class DerivedFieldChainRule:
                 continue
             dFdf = self._partial_field(F, key, field)
             if dFdf is None:
+                a.destroy()
                 continue
             A = _assemble_mat(dFdf)
             A.multAdd(a, out, out)
             A.destroy()
+            a.destroy()
         return out
 
     def residual_mesh_operator(self, F, key):
@@ -178,11 +180,13 @@ class DerivedFieldChainRule:
             if B is None:
                 continue
             dJdf = self._partial_field(J, key, field)
-            if dJdf is None:
-                continue
-            v = _assemble_vec(dJdf)
-            B.multTransposeAdd(v, g, g)
-            v.destroy()
+            if dJdf is not None:
+                v = _assemble_vec(dJdf)
+                B.multTransposeAdd(v, g, g)
+                v.destroy()
+            # a fresh matrix per call: free it now, not at the next
+            # PETSc.garbage_cleanup (several GB for a 3D Green-Gauss gradient)
+            B.destroy()
         return g
 
     def functional_mesh(self, J, key):
@@ -232,6 +236,20 @@ def _shell_matrix(A_x, chains):
     M.setPythonContext(ctx)
     M.setUp()
     return M
+
+
+def destroy_chained_operator(M):
+    """Free a residual_mesh_operator result and the matrices it holds now.
+    Left to the garbage collector, a parallel petsc4py object is only queued,
+    and freed at the next PETSc.garbage_cleanup; for a 3D RANS operator that
+    is several GB held into the next adjoint."""
+    ctx = M.getPythonContext()
+    M.destroy()
+    ctx.A_x.destroy()
+    for (A, X), (w_f, w_r) in zip(ctx.chains, ctx._work):
+        for obj in (A, X, w_f, w_r):
+            obj.destroy()
+    ctx.chains, ctx._work = [], []
 
 
 def diagonal_mass_inverse(V, dx):

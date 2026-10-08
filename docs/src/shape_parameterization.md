@@ -31,7 +31,7 @@ The design variables come from the layers, which are applied in order and declar
 |---|---|
 | `ControlPointMotions(dv_spec)` | `cp_motions`: individual control-point motions |
 | `SectionalVariables(principal_dim, {kind: bounds})` | sectional presets (camber, thickness, twist, ...) |
-| `WingShape(planform={...}, sections={...})` | wing sweep, aspect ratio, root chord, taper ratio; thickness and camber per spanwise station |
+| `WingShape(planform={...}, sections={...})` | wing sweep, aspect ratio, root chord, span, taper ratio; chordwise thickness and camber modes per spanwise station |
 
 The coefficients are built as the constant baseline, then one lsdo_geo `SectionalParameterization` holding
 every layer's sectional operations, then additive motions (control-point motions, sectional modes) on top.
@@ -82,21 +82,29 @@ lines are fitted to the leading and trailing edges, and a wall that is not strai
 ```python
 WingShape(planform={'sweep': np.radians((20., 30.)),   # sweep of the quarter-chord line [rad]
                     'aspect_ratio': (7.5, 10.),        # full wing, b^2 / S
-                    'root_chord': (4.5, 5.5),
+                    'span': (26., 30.),                # full wing; root chord follows
                     'taper_ratio': (0.2, 0.4)},        # tip chord / root chord
-          sections={'thickness': 0.1,                  # relative change of t/c
-                    'camber': 0.01},                   # change of max camber / local chord
+          sections={'thickness': {'bounds': 0.1, 'modes': 4},    # relative change of t/c
+                    'camber': {'bounds': 0.01, 'modes': 3}},     # change of camber / local chord
           sweep_chord_fraction=0.25)
 ```
 - **Planform variables** hold the quantity itself. Each starts at the baseline wing's value, and its
   `(lower, upper)` bounds must bracket it. A variable that is left out stays at its baseline value.
-- **Semi-span.** It follows from the other planform variables: $s = AR\, c_r (1 + \lambda) / 4$. A larger
-  aspect ratio at a fixed root chord gives a longer wing with more area.
-- **Section variables** have one value per FFD spanwise section, root first. They are deltas that start at zero:
-  - `thickness` scales the section about its chord plane. Chord changes scale the thickness along, so t/c is
-    kept.
-  - `camber` adds a parabolic camber line $\kappa\, c\, 4\xi(1-\xi)$, so the leading and trailing edges stay
-    in place.
+- **Size variables.** Aspect ratio, root chord and span $b = 2s$ are tied by $s = AR\, c_r (1 + \lambda) / 4$,
+  so at most two of them are variables and the third follows (`derived`). By default the span follows; with
+  `span` a variable, whichever of `aspect_ratio` and `root_chord` is not one follows (with `span` the only one,
+  pass `derived`). A larger aspect ratio at a fixed root chord gives a longer wing with more area.
+- **Section variables** are given at each FFD spanwise section, root first, with `modes` chordwise values per
+  section (default 1; `{'bounds': ..., 'modes': n}`), section-major. They are deltas that start at zero. With
+  $\xi$ the local chord fraction and $B_m$ the Bernstein polynomials of degree $n - 1$:
+  - `thickness` scales the section about its chord plane by $1 + \sum_m \tau_m B_m(\xi)$. Chord changes
+    scale the thickness along, so t/c is kept. Equal values give a uniform change.
+  - `camber` adds $c \sum_m \kappa_m\, 4\xi(1-\xi) B_m(\xi)$, so the leading and trailing edges stay in
+    place. Equal values give a parabolic camber line of maximum $\kappa$.
+
+  The modes are least-squares fits on the block's chordwise basis. They are exact when that basis is a Bezier
+  ($n_{chord} = $ degree + 1) of degree at least $n - 1$ for thickness and $n + 1$ for camber;
+  `print_design_variables` reports the fit residual. Bounds may be per section, `(n_sections,)`, or per entry.
 
 The map behind it works per FFD section $j$, at the baseline span fraction $\eta_j = y_j / s_0$:
 1. The section moves to $y_j' = \eta_j s'$.
@@ -104,12 +112,12 @@ The map behind it works per FFD section $j$, at the baseline span fraction $\eta
 3. Its reference-line point is placed at $x_{ref,root} + y_j' \tan\Lambda'$, so the root point of that line
    stays fixed.
 
-These are lsdo_geo sectional stretches and translations; the camber is an additive sectional mode.
+These are lsdo_geo sectional stretches and translations; thickness and camber are additive sectional modes.
 
 With the taper ratio fixed, the map is affine, so the deformed wall is exactly the trapezoid that the
 variables describe. A taper change is exact at the FFD sections and blended between them by the spanwise
 B-spline. Changing the taper ratio from 0.3 to 0.4 on the 5-section test block moves the chords up to 0.25% away
-from the trapezoid.
+from the trapezoid; with 3 sections, up to 0.9% for taper ratios 0.2 to 0.5.
 
 `shape.outputs()['wing']` holds the planform as CSDL variables, for use as constraints: `sweep`, `aspect_ratio`,
 `root_chord`, `taper_ratio`, `tip_chord`, `semi_span`, `span`, `area` (full wing), and `section_chords`.

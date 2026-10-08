@@ -5,8 +5,10 @@ A structured multi-block CGNS grid of a 2D case is often stored as a 3D grid
 one cell thick in span (e.g. ONERA's OAT15A grids). read_cgns_planar reads it
 with PyVista (VTK's CGNS reader), keeps one span plane of every block as
 quadrilaterals, merges the nodes the blocks share, and finds the wall and far
-field edges from the CGNS boundary condition families. cgns_to_dolfinx_mesh
-turns that into a distributed dolfinx mesh in memory: no intermediate file.
+field edges from the CGNS boundary condition families. read_cgns_volume reads
+a 3D grid (e.g. the Simple Transonic Wing's wing_vol_L*.cgns) into one
+hexahedral mesh the same way. cgns_to_dolfinx_mesh turns either into a
+distributed dolfinx mesh in memory: no intermediate file.
 
 Block interface nodes are merged by EXACT coordinate match, which holds for
 grids whose 1-to-1 interfaces were written point-matched (Pointwise exports
@@ -165,19 +167,143 @@ def read_cgns_planar(cgns_path, plane_index=0, wall_family="Wall", farfield_fami
                 farfield_edges=edges["farfield"], chord=chord, n_raw_points=n_raw)
 
 
-def cgns_to_dolfinx_mesh(cgns_path, comm=MPI.COMM_WORLD, **kwargs):
+# The six faces of a hexahedron in dolfinx ordering, as local node indices
+_HEX_FACES = np.array([[0, 1, 2, 3], [4, 5, 6, 7], [0, 1, 4, 5],
+                       [2, 3, 6, 7], [0, 2, 4, 6], [1, 3, 5, 7]])
+
+
+def _block_hexes(nk, nj, ni, offset):
+    """Hexes of an nk x nj x ni node block in dolfinx ordering (i fastest, then
+    j, then k: [(i,j,k), (i+1,j,k), (i,j+1,k), (i+1,j+1,k), the same at k+1])."""
+    idx = offset + np.arange(nk * nj * ni).reshape(nk, nj, ni)
+    bottom = [idx[:-1, :-1, :-1], idx[:-1, :-1, 1:], idx[:-1, 1:, :-1], idx[:-1, 1:, 1:]]
+    top = [idx[1:, :-1, :-1], idx[1:, :-1, 1:], idx[1:, 1:, :-1], idx[1:, 1:, 1:]]
+    return np.stack(bottom + top, axis=-1).reshape(-1, 8)
+
+
+def _center_jacobians(points, hexes):
+    """Jacobian determinants of the trilinear map at the cell centers, hexes in
+    dolfinx ordering (positive: right-handed; 8x the volume for a parallelepiped)."""
+    v = [points[hexes[:, i]] for i in range(8)]
+    d_i = (v[1] - v[0]) + (v[3] - v[2]) + (v[5] - v[4]) + (v[7] - v[6])
+    d_j = (v[2] - v[0]) + (v[3] - v[1]) + (v[6] - v[4]) + (v[7] - v[5])
+    d_k = (v[4] - v[0]) + (v[5] - v[1]) + (v[6] - v[2]) + (v[7] - v[3])
+    return np.einsum("ij,ij->i", d_i, np.cross(d_j, d_k)) / 64.0
+
+
+def _hex_faces(hexes):
+    """The six faces of every hex, as sorted node quadruples."""
+    return np.sort(hexes[:, _HEX_FACES].reshape(-1, 4), axis=1)
+
+
+def merge_structured_volume_blocks(blocks):
     """
-    A distributed dolfinx quadrilateral mesh from a structured CGNS grid one
-    cell thick: rank 0 reads it (read_cgns_planar, kwargs passed on) and
-    dolfinx partitions it, ghosting cells across shared facets as
+    Merge 3D structured node blocks into one hexahedral mesh.
+
+    blocks: list of (nk, nj, ni, 3) node arrays. Returns (points (N, 3), hexes
+    (M, 8) in dolfinx ordering, right-handed). Nodes shared by blocks are
+    merged by exact coordinate match; a block whose (i, j, k) axes are
+    left-handed has its hexes mirrored in i.
+    """
+    hexes, offset = [], 0
+    raw = np.concatenate([b.reshape(-1, 3) for b in blocks])
+    for b in blocks:
+        nk, nj, ni = b.shape[:3]
+        h = _block_hexes(nk, nj, ni, offset)
+        if _center_jacobians(raw, h).sum() < 0:
+            h = h[:, [1, 0, 3, 2, 5, 4, 7, 6]]
+        hexes.append(h)
+        offset += nk * nj * ni
+    points, inverse = np.unique(raw, axis=0, return_inverse=True)
+    hexes = inverse.reshape(-1)[np.concatenate(hexes)]
+    return points, hexes
+
+
+def read_cgns_volume(cgns_path, interface_rel_tol=1e-10):
+    """
+    Read a structured multi-block 3D CGNS grid into one hexahedral mesh. Serial.
+
+    The blocks' nodes are merged by exact coordinate match (see
+    merge_structured_volume_blocks), in the file's units. The CGNS boundary
+    conditions are not read -- VTK skips BC_t types such as BCWallViscous and
+    BCFarfield -- so the solver finds its boundaries geometrically, as for an
+    untagged XDMF mesh.
+
+    interface_rel_tol: two boundary faces whose centroids are closer than this
+    times the grid's bounding-box diagonal are an unmerged block interface.
+
+    Returns a dict: points (N, 3), hexes (M, 8) (dolfinx ordering,
+    right-handed), boundary_faces (node index quadruples), n_raw_points
+    (before merging), n_blocks.
+
+    Raises ValueError if a cell is inverted or degenerate at its center, a
+    face has more than two cells, or block interfaces did not merge.
+    """
+    import pyvista as pv
+    import vtk
+    from scipy.spatial import cKDTree
+
+    if not os.path.isfile(cgns_path):
+        raise FileNotFoundError(cgns_path)
+    reader = pv.get_reader(cgns_path)
+    # VTK warns once per block and BC that it skips the BC_t node
+    warnings_on = vtk.vtkObject.GetGlobalWarningDisplay()
+    vtk.vtkObject.GlobalWarningDisplayOff()
+    try:
+        bases = reader.read()
+    finally:
+        vtk.vtkObject.SetGlobalWarningDisplay(warnings_on)
+    blocks = []
+    for base in bases:
+        for zone in base:
+            if zone is None:
+                continue
+            grid = zone["Internal"]
+            ni, nj, nk = grid.dimensions
+            if min(ni, nj, nk) < 2:
+                raise ValueError("a block has {} x {} x {} nodes: not a volume grid".format(ni, nj, nk))
+            # VTK structured points run i fastest, then j, then k
+            blocks.append(np.asarray(grid.points, dtype=np.float64).reshape(nk, nj, ni, 3))
+    if not blocks:
+        raise ValueError("no structured blocks in {}".format(cgns_path))
+    points, hexes = merge_structured_volume_blocks(blocks)
+    n_raw = sum(b.shape[0] * b.shape[1] * b.shape[2] for b in blocks)
+
+    jac = _center_jacobians(points, hexes)
+    if not np.all(jac > 0):
+        raise ValueError("{} cells are inverted or degenerate".format(int(np.sum(jac <= 0))))
+    faces, counts = np.unique(_hex_faces(hexes), axis=0, return_counts=True)
+    if counts.max() > 2:
+        raise ValueError("{} faces have more than two cells".format(int(np.sum(counts > 2))))
+    boundary_faces = faces[counts == 1]
+    diagonal = np.linalg.norm(np.ptp(points, axis=0))
+    pairs = cKDTree(points[boundary_faces].mean(axis=1)).query_pairs(interface_rel_tol * diagonal)
+    if pairs:
+        raise ValueError("{} pairs of boundary faces coincide: block interfaces whose nodes do not "
+                         "match exactly".format(len(pairs)))
+    return dict(points=points, hexes=hexes, boundary_faces=boundary_faces, n_raw_points=n_raw,
+                n_blocks=len(blocks))
+
+
+def cgns_to_dolfinx_mesh(cgns_path, comm=MPI.COMM_WORLD, tdim=2, **kwargs):
+    """
+    A distributed dolfinx mesh from a structured CGNS grid: rank 0 reads it
+    and dolfinx partitions it, ghosting cells across shared facets as
     XDMFFile.read_mesh does (the interior-facet forms need it). Collective.
 
-    Returns (mesh, info), info being a dict with chord, n_points, n_cells,
-    n_raw_points, n_wall_edges and n_farfield_edges (the same on every rank).
+    tdim=2: a grid one cell thick, reduced to quadrilaterals (read_cgns_planar,
+    kwargs passed on). info holds chord, n_points, n_cells, n_raw_points,
+    n_wall_edges and n_farfield_edges.
+    tdim=3: a volume grid, as hexahedra (read_cgns_volume, kwargs passed on).
+    info holds n_points, n_cells, n_raw_points, n_blocks and n_boundary_faces.
+
+    Returns (mesh, info), info being the same on every rank.
     """
+    if tdim not in (2, 3):
+        raise ValueError("tdim must be 2 (planar grid) or 3 (volume grid), got {}".format(tdim))
     if comm.rank == 0:
         try:
-            data = read_cgns_planar(cgns_path, **kwargs)
+            data = (read_cgns_planar if tdim == 2 else read_cgns_volume)(cgns_path, **kwargs)
             error = None
         except Exception as e:  # raise on every rank, not only rank 0
             data, error = None, e
@@ -186,30 +312,37 @@ def cgns_to_dolfinx_mesh(cgns_path, comm=MPI.COMM_WORLD, **kwargs):
     error = comm.bcast(error, root=0)
     if error is not None:
         raise error
+    cells_key, nodes_per_cell, cell_name = (("quads", 4, "quadrilateral") if tdim == 2
+                                            else ("hexes", 8, "hexahedron"))
     if comm.rank == 0:
-        cells, x = data["quads"].astype(np.int64), data["points"]
-        info = dict(chord=data["chord"], n_points=len(x), n_cells=len(cells),
-                    n_raw_points=data["n_raw_points"], n_wall_edges=len(data["wall_edges"]),
-                    n_farfield_edges=len(data["farfield_edges"]))
+        cells, x = data[cells_key].astype(np.int64), data["points"]
+        if tdim == 2:
+            info = dict(chord=data["chord"], n_points=len(x), n_cells=len(cells),
+                        n_raw_points=data["n_raw_points"], n_wall_edges=len(data["wall_edges"]),
+                        n_farfield_edges=len(data["farfield_edges"]))
+        else:
+            info = dict(n_points=len(x), n_cells=len(cells), n_raw_points=data["n_raw_points"],
+                        n_blocks=data["n_blocks"], n_boundary_faces=len(data["boundary_faces"]))
     else:
-        cells, x, info = np.empty((0, 4), dtype=np.int64), np.empty((0, 2)), None
+        cells, x, info = (np.empty((0, nodes_per_cell), dtype=np.int64), np.empty((0, tdim)),
+                          None)
     info = comm.bcast(info, root=0)
-    element = basix.ufl.element("Lagrange", "quadrilateral", 1, shape=(2,))
+    element = basix.ufl.element("Lagrange", cell_name, 1, shape=(tdim,))
     partitioner = dolfinx.mesh.create_cell_partitioner(dolfinx.mesh.GhostMode.shared_facet, 2)
     mesh = dolfinx.mesh.create_mesh(comm, cells, element, x, partitioner=partitioner)
     return mesh, info
 
 
-def load_dolfinx_mesh(path, comm=MPI.COMM_WORLD, mesh_name="mesh", **cgns_kwargs):
+def load_dolfinx_mesh(path, comm=MPI.COMM_WORLD, mesh_name="mesh", tdim=2, **cgns_kwargs):
     """
     A dolfinx mesh from an XDMF file (grid `mesh_name`) or a structured CGNS
-    grid (cgns_to_dolfinx_mesh, cgns_kwargs passed on), by file extension.
-    Returns (mesh, info); info is cgns_to_dolfinx_mesh's dict, or {} for XDMF.
-    Collective.
+    grid (cgns_to_dolfinx_mesh with `tdim`, cgns_kwargs passed on), by file
+    extension. Returns (mesh, info); info is cgns_to_dolfinx_mesh's dict, or {}
+    for XDMF. Collective.
     """
     ext = os.path.splitext(path)[1].lower()
     if ext == ".cgns":
-        return cgns_to_dolfinx_mesh(path, comm, **cgns_kwargs)
+        return cgns_to_dolfinx_mesh(path, comm, tdim=tdim, **cgns_kwargs)
     if ext == ".xdmf":
         with dolfinx.io.XDMFFile(comm, path, "r") as xdmf:
             return xdmf.read_mesh(name=mesh_name), {}

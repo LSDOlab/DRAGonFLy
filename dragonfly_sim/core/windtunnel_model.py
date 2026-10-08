@@ -18,6 +18,7 @@ from dragonfly_sim.core.meshwarping import IDWarp_jax
 from dragonfly_sim.utils.data_handler import DataStore
 
 from dragonfly_sim.utils.petsc_utils import set_petsc_vec_array
+from dragonfly_sim.utils.derived_fields import destroy_chained_operator
 from dragonfly_sim.utils.solver_utils import ksp_converged_reason_name
 from dragonfly_sim.core.postprocessor import DG_postprocessor
 
@@ -159,6 +160,24 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         # (costs one extra linear solve per print)
         self.log_cm_alpha = True
 
+        # Free the flow solver's matrices after every forward solve and the
+        # condensed dR/dU after every condensed adjoint
+        # (sim_model.release_solver), so the two never coexist; they are
+        # rebuilt when next needed. For memory-bound runs (3D RANS).
+        self.release_solver_memory = False
+
+        # Write mesh_deformation_<suffix>.bp (the node motions of every design
+        # evaluation). The solution files are written either way.
+        self.write_mesh_deformation = True
+
+        # Write the output frame (solution and mesh deformation) only for the
+        # first evaluation of each design: an optimizer that evaluates the
+        # same design again (CSDL re-runs the model for the derivatives) then
+        # does not duplicate the frame. Frames keep the eval_idx of that first
+        # evaluation, so their labels have gaps.
+        self.write_once_per_design = False
+        self._last_written_design = None
+
 
         # Discretization and physics-related parameters
         self.poly_order:int = poly_order
@@ -233,7 +252,8 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         # characteristic far field has no split to guard.
         self.sim_model.alpha_tagging = alpha_tagging if self.farfield == "split" else None
 
-        self.mesh.configure_output(self.filename_suffix, deformation=self.shape_parameterized)
+        self.mesh.configure_output(self.filename_suffix,
+                                   deformation=self.shape_parameterized and self.write_mesh_deformation)
 
         if self.shape_parameterized:
             # The JAX-based IDWarp implementation as mesh warper
@@ -448,12 +468,21 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         else:
             PETSc.Sys.Print("Not updating warm start solution, using previous value")
 
-        PETSc.Sys.Print("Writing aligned output frame at eval_idx {}".format(self.eval_idx))
-        # we write the deformation and the solution outputs to the same time step indices
-        if mesh_node_motions is not None:
-            self.mesh.write_deformation_output(mesh_node_motions, self.eval_idx)
-        self.sim_model.write_solution_output(self.eval_idx,
-                                             solution_array=solution_output)
+        design = np.concatenate([[alpha], np.ravel(shape_parameters)
+                                 if shape_parameters is not None else []])
+        if (self.write_once_per_design and self._last_written_design is not None
+                and np.array_equal(design, self._last_written_design)):
+            PETSc.Sys.Print("Same design as the last written frame: not writing eval_idx {}".format(
+                self.eval_idx))
+        else:
+            PETSc.Sys.Print("Writing aligned output frame at eval_idx {} (FOM solution)".format(
+                self.eval_idx))
+            # we write the deformation and the solution outputs to the same time step indices
+            if mesh_node_motions is not None:
+                self.mesh.write_deformation_output(mesh_node_motions, self.eval_idx)
+            self.sim_model.write_solution_output(self.eval_idx,
+                                                 solution_array=solution_output)
+            self._last_written_design = design
 
         self.mesh.reset_nodes()
 
@@ -567,6 +596,8 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         fom_converged = self.sim_model.solver_converged
         eta = self.sim_model.relative_residual_norm(residual_norm)
         solution_fom = self.sim_model.u_vec.x.petsc_vec.getArray().copy()
+        if self.release_solver_memory:
+            self.sim_model.release_solver()
 
         self._log_memory("after FOM solve, before doing anything else")
 
@@ -614,6 +645,8 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
 
             if self.sim_model.has_condensed_jacobian:
                 self._condensed_adjoint(d_outputs, d_residuals)
+                if self.release_solver_memory:
+                    self.sim_model.release_solver()
                 self.mesh.reset_nodes()
                 PETSc.garbage_cleanup()
                 PETSc.Sys.Print("apply_inverse_jacobian total time: {}".format(
@@ -693,12 +726,17 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         """The adjoint solve for a model whose dR/dU is a condensed product
         (a reconstructed gradient): the model's own transposed linearized
         solve (CompressibleEulerModel.solve_linearized)."""
+        if self.release_solver_memory:
+            # free queued PETSc objects before the large assembly
+            gc.collect()
+            PETSc.garbage_cleanup(self.mesh.mesh.comm)
         A = self.sim_model.assemble_dRdu_mat()
         rhs, sol = A.createVecLeft(), A.createVecLeft()
         set_petsc_vec_array(rhs, d_outputs['u_vec'])
         ksp = self.sim_model.solve_linearized(
             rhs, sol, transpose=True, prefix="adj_", rtol=self.linear_solver_rtol,
-            atol=self.linear_solver_atol, max_it=self.linear_solver_max_it)
+            atol=self.linear_solver_atol, max_it=self.linear_solver_max_it,
+            release_operands=self.release_solver_memory)
         rnorm = ksp.getResidualNorm()
         PETSc.Sys.Print("adj_ solve: {} iterations, residual norm {} [{}]".format(
             ksp.getIterationNumber(), rnorm, ksp_converged_reason_name(ksp.getConvergedReason())))
@@ -763,6 +801,9 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
                 self._d_input_jvp_petsc.set(0.0)
                 dr_dxmesh.multTranspose(self._d_residual_jvp_petsc, self._d_input_jvp_petsc)
                 d_input = self._d_input_jvp_petsc
+                if self.sim_model.derived_fields:
+                    # a fresh chained operator per call (not cached): free it now
+                    destroy_chained_operator(dr_dxmesh)
 
                 self.mesh.reset_nodes()
 

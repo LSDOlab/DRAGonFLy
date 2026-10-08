@@ -24,6 +24,11 @@ are exactly those of the wall and far-field families (`wall_family="Wall"`, `far
 default the points are shifted and scaled so that the wall's leading edge is at $x = 0$ and its chord is 1
 (`scale_to_chord`). DOLFINx then distributes the mesh; no converted file is written.
 
+A 3D structured grid is read with `tdim=3`, e.g. the Simple Transonic Wing's
+`load_dolfinx_mesh("wing_vol_L3.cgns", tdim=3)`: every block becomes hexahedra, the blocks' shared nodes are merged
+by exact coordinate match, and the mesh is checked for inverted cells and unmerged block interfaces. Its boundary
+conditions are not read (VTK skips them), so the solver finds the boundaries geometrically, as for an XDMF mesh.
+
 Requirements:
 - **Orientation**: the freestream flows in $+x$. In 2D, y is vertical; in 3D, y is spanwise and z vertical.
 - **3D**: model a half-wing whose root lies on the symmetry plane $y = 0$.
@@ -166,10 +171,13 @@ solve every time, to compare the two. Basis, inner product and stopping rules ar
 
 ## Output files
 Written to the working directory, named with `filename_suffix`:
-- `FOM_solution_*.bp`, `FOM_pressure_*.bp`, `mesh_deformation_*.bp`: solution, pressure and mesh deformation per
-  evaluation, in ADIOS2/VTX format (open in ParaView). With a shape parameterization, the solution and pressure
-  are written on the deformed mesh they were solved on, and the mesh deformation on the baseline mesh (apply it
-  with *Warp By Vector*); frame $k$ of each file belongs to the same evaluation;
+- `FOM_solution_*.bp`, `mesh_deformation_*.bp`: solution and mesh deformation per evaluation, in ADIOS2/VTX
+  format (open in ParaView). The solution file holds separate fields: `density`, `momentum` (vector), `energy`
+  ($\rho E$), each transported turbulence variable (e.g. `rho_nu_tilde`), `velocity` (vector) and `pressure`.
+  With a shape parameterization, the solution is written on the deformed mesh it was solved on, and the mesh
+  deformation on the baseline mesh (apply it with *Warp By Vector*); frame $k$ of each file belongs to the same
+  evaluation. `write_mesh_deformation = False` leaves out the mesh deformation file, and
+  `write_once_per_design = True` writes one frame per design when the optimizer evaluates a design twice;
 - `output_meshtags.xdmf`: the boundary tags, to check the inflow/outflow/wall/symmetry split;
 - `memory_logs/`: peak memory per MPI rank.
 
