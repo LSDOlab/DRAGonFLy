@@ -65,6 +65,10 @@ Each Newton system is solved inexactly with GMRES (relative tolerance $10^{-3}$)
 Schwarz (overlap `asm_overlap`) and ILU(`ilu_levels`) on the subdomains. The adjoint and tangent systems use the
 same preconditioner with tight tolerances.
 
+Optionally, a reduced-order model replaces the full-order solve when it is accurate enough: a least-squares
+Petrov-Galerkin solve {cite:p}`carlberg2011efficient` in a POD basis of earlier solutions, see
+[Reduced-order modeling](reduced_order_modeling.md).
+
 ## Shape parameterization
 The wall is embedded in a B-spline free-form deformation (FFD) block {cite:p}`sederberg1986free`, built with
 lsdo_geo. Wall node positions are a linear B-spline map of the FFD control points, so design variables that move

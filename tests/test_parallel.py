@@ -1,5 +1,5 @@
 """
-Re-run the RANS / time-integration / far-field / regression modules under
+Re-run the RANS / time-integration / far-field / regression / POD modules under
 mpirun, so a serial pytest invocation also covers the distributed path
 (ghost cells in the Green-Gauss sums, the gathered wall geometry, the
 partition-independent checkpoints, the shell dR/dx operator).
@@ -14,7 +14,8 @@ import pytest
 _CHILD = "DRAGONFLY_PARALLEL_TEST_CHILD"
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODULES = ["test_euler_regression.py", "test_turbulence_models.py", "test_reconstruction.py",
-           "test_derivatives.py", "test_time_integration.py", "test_windtunnel_forward.py"]
+           "test_derivatives.py", "test_time_integration.py", "test_windtunnel_forward.py",
+           "test_pod.py", "test_reduced_order_model.py"]
 
 
 @pytest.mark.skipif(shutil.which("mpirun") is None, reason="mpirun is not available")
