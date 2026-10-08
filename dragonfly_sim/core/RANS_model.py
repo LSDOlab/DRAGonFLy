@@ -107,6 +107,7 @@ class CompressibleRANSModel:
         flow.wall_bc = self.define_noslip_wall_bc
         flow.wall_traction = self._wall_traction
         flow.time_scale_terms.append(self._viscous_time_scale)
+        flow.extra_scales = self._extra_scales
 
     # ------------------------------------------------------------------
     # Forwarding to the Euler host
@@ -188,13 +189,11 @@ class CompressibleRANSModel:
     def _freestream_extras(self):
         return self.turbulence_model.freestream_values(self.freestream())
 
+    def _extra_scales(self):
+        return list(self.turbulence_model.limiter_scales(self.freestream()))
+
     def _limiter_scales(self):
-        flow = self.flow
-        fs = self.freestream()
-        rho, speed, p = fs["rho"], fs["speed"], fs["p"]
-        scales = ([rho] + [rho * speed] * flow.dimensions
-                  + [p / (flow.gamma - 1.0) + 0.5 * rho * speed**2])
-        return scales + list(self.turbulence_model.limiter_scales(fs))
+        return self.flow.state_scale_expressions()
 
     def _boundary_scalars(self, kind, U, inflow):
         nm = self.flow.n_mean

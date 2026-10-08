@@ -76,6 +76,7 @@ Constructor options select the flow model and the far field:
 |---|---|---|
 | `model_class`, `model_kwargs` | `CompressibleEulerModel`, `{}` | e.g. `CompressibleRANSModel`, `{'Re': 6e6}` for SA-neg RANS (see [RANS, time integration and far fields](flow_models.md)); the body becomes an adiabatic no-slip wall |
 | `farfield` | `"split"` | `"riemann"`: characteristic far field on the whole outer boundary instead of the inflow/outflow split |
+| `reduced_order_model` | `None` | a `ReducedOrderModel` to try before every flow solve (see [Reduced-order modeling](reduced_order_modeling.md)) |
 
 RANS solves use pseudo-transient continuation, so `max_newton_iterations` counts pseudo steps (~60 from the free
 stream on the coarse NACA0012 C-grid at $M = 0.7$); raise it to a few hundred.
@@ -148,6 +149,21 @@ outside CSDL, and `post.evaluate(u, alpha=alpha)` leaves out the mesh deformatio
 the quarter chord, $(0.25, 0[, 0])$. See `examples/airfoil_analysis.py`. Time-dependent runs are set up directly
 from the model classes, as in `examples/flow_analysis.py`.
 
+## Reduced-order model
+Pass a `ReducedOrderModel` to try a POD reduced-order model before every flow solve, in `solve_forward` and in
+the CSDL graph alike:
+```python
+from dragonfly_sim.core.reduced_order_model import ReducedOrderModel
+
+rom = ReducedOrderModel(rb_size=20, eta_threshold=1e-10)
+model = DG_windtunnel_model(mesh, boundary_dict, ..., reduced_order_model=rom)
+```
+Once two converged solutions exist, each evaluation first solves the least-squares Petrov-Galerkin problem in
+their POD basis. Its solution is used if $\eta = \|R\|/\|u\| <$ `eta_threshold`; otherwise the full-order
+solve runs as usual and its solution is added to the basis. `run_fom_every_evaluation=True` runs the full-order
+solve every time, to compare the two. Basis, inner product and stopping rules are described in
+[Reduced-order modeling](reduced_order_modeling.md).
+
 ## Output files
 Written to the working directory, named with `filename_suffix`:
 - `FOM_solution_*.bp`, `FOM_pressure_*.bp`, `mesh_deformation_*.bp`: solution, pressure and mesh deformation per
@@ -157,7 +173,9 @@ Written to the working directory, named with `filename_suffix`:
 - `output_meshtags.xdmf`: the boundary tags, to check the inflow/outflow/wall/symmetry split;
 - `memory_logs/`: peak memory per MPI rank.
 
-`model.data_store` collects per-evaluation results;
+`model.data_store` collects per-evaluation results (with a reduced-order model also its wall times, $\eta$,
+coefficients, acceptance, errors against the full-order solve, and the snapshot singular values: the `ROM_*` and
+`rom_*` entries);
 `model.data_store.write_store_to_numpy_file(save_folder, save_filename)` saves them to an existing folder.
 
 To write other fields, use `dragonfly_sim.utils.filewriter.FileWriter(filename, comm, function_space,

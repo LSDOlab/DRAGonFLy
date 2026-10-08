@@ -35,7 +35,8 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
                  poly_order=1, gamma=1.4,
                  filename_suffix="test",
                  asm_overlap=None, ilu_levels=None,
-                 model_class=CompressibleEulerModel, model_kwargs=None, farfield="split"):
+                 model_class=CompressibleEulerModel, model_kwargs=None, farfield="split",
+                 reduced_order_model=None):
         """
         The shape of the object being optimized is defined either through `mesh_inner_bdry_function`
         or through the shape parameterization's FFD block corners
@@ -68,6 +69,10 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         and outflow perpendicular to the free stream (the default); "riemann"
         puts the characteristic far field (define_farfield_bc) on all of it,
         which needs no split and so no guard on large alpha changes.
+
+        reduced_order_model: a core.reduced_order_model.ReducedOrderModel to
+        try before every flow solve (see _solve), or None for full-order
+        solves only.
         """
         super().__init__()
 
@@ -143,6 +148,9 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         self.data_store = DataStore()
 
         self.previous_solution = None
+
+        # POD reduced-order model (None: full-order solves only)
+        self.reduced_order_model = reduced_order_model
 
         # Naming suffix for exported files
         self.filename_suffix = filename_suffix
@@ -297,6 +305,9 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
             linear_residual_accept_limit=self.linear_residual_accept_limit, 
             p_inf_dim=101325.)
 
+        if self.reduced_order_model is not None:
+            self.reduced_order_model.set_up(self.sim_model)
+
     def _log_memory(self, stage):
         # We write a log file for each MPI rank that documents the peak local memory usage
         # at various points during an optimization run.
@@ -385,7 +396,8 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
             self.sim_model.set_angle_of_attack(alpha)
             self.postprocessor.set_angle_of_attack(alpha)
         self.sim_model.compute_weakform()
-        solution, converged = self._run_fom_solve()
+        solution, converged = self._solve(
+            self._parameter_vector(None, self.sim_model.boundary_conditions['inlet']['alpha']))
         self.sim_model.last_solve_converged = converged
         if np.isfinite(np.linalg.norm(solution)):
             self.previous_solution = solution
@@ -419,27 +431,24 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         # re-define the current weak form if necessary
         self.sim_model.compute_weakform()
 
-        # --- FOM solve ----------------------------------------------------
-        solution_output, fom_converged = self._run_fom_solve()
+        # --- flow solve (ROM, else FOM) -----------------------------------
+        solution_output, solution_converged = self._solve(self._parameter_vector(shape_parameters, alpha))
 
-        PETSc.Sys.Print("Accepting FOM solution")
+        self._log_memory("after flow solve, before setting u_vec output")
 
-        self._log_memory("after FOM solve, before setting u_vec output")
-
-        self.sim_model.last_solve_converged = fom_converged
+        self.sim_model.last_solve_converged = solution_converged
 
         PETSc.Sys.Print("setting u_vec output...")
         output_vals['u_vec'] = solution_output
 
-        # Warm start: keep the FOM solution unless it has blown up
+        # Warm start: keep the accepted solution unless it has blown up
         if np.isfinite(np.linalg.norm(solution_output)):
             PETSc.Sys.Print("Updating warm start solution")
             self.previous_solution = solution_output
         else:
             PETSc.Sys.Print("Not updating warm start solution, using previous value")
 
-        PETSc.Sys.Print("Writing aligned output frame at eval_idx {} (FOM solution)".format(
-            self.eval_idx))
+        PETSc.Sys.Print("Writing aligned output frame at eval_idx {}".format(self.eval_idx))
         # we write the deformation and the solution outputs to the same time step indices
         if mesh_node_motions is not None:
             self.mesh.write_deformation_output(mesh_node_motions, self.eval_idx)
@@ -455,6 +464,79 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         self._log_memory("after Euler PDE solve")
 
         self.eval_idx += 1
+
+    @staticmethod
+    def _parameter_vector(shape_parameters, alpha):
+        """The ROM snapshot parameter vector of an evaluation: the flat shape
+        parameters (if any), then alpha."""
+        parts = [] if shape_parameters is None else [np.asarray(shape_parameters, dtype=float).ravel()]
+        return np.concatenate(parts + [np.array([float(alpha)])])
+
+    def _solve(self, parameter_vector):
+        """
+        The accepted flow solution of one evaluation: (owned solution entries,
+        converged).
+
+        Without a reduced-order model this is the full-order (FOM) solve from
+        the warm start. With one, the ROM is tried first (once it holds enough
+        snapshots), from the warm start projected onto the basis, and its
+        solution is accepted when eta = ||R||/||u|| < eta_threshold. Otherwise
+        the FOM solves from the warm start exactly as without a ROM, and its
+        solution, if converged and finite, becomes a snapshot at
+        `parameter_vector`.
+        """
+        rom = self.reduced_order_model
+        if rom is None:
+            return self._run_fom_solve()
+
+        self.sim_model.interpolate_solution_vector(self.previous_solution)
+        rom_result = rom.solve(self.sim_model, parameter_vector)
+        rom_forces = None
+        if rom_result is not None:
+            rom_forces = self._log_rom_solve(rom_result)
+        accept_rom = rom_result is not None and rom_result.accepted
+        if accept_rom and not rom.run_fom_every_evaluation:
+            PETSc.Sys.Print("Accepting ROM solution")
+            return rom_result.solution, True
+
+        solution_fom, fom_converged = self._run_fom_solve()
+        if rom_forces is not None and fom_converged:
+            self._log_rom_error(rom_forces)
+        if accept_rom:
+            PETSc.Sys.Print("Accepting ROM solution (FOM run for comparison)")
+            return rom_result.solution, True
+
+        PETSc.Sys.Print("Accepting FOM solution")
+        finite = self.mesh.mesh.comm.allreduce(bool(np.all(np.isfinite(solution_fom))), op=MPI.LAND)
+        if fom_converged and finite:
+            self.sim_model.set_u_vec(solution_fom)
+            rom.add_snapshot(self.sim_model, parameter_vector)
+            sigma = rom.snapshot_singular_values()
+            if self.mesh.mesh.comm.Get_rank() == 0 and sigma is not None:
+                self.data_store.global_snapshot_sing_vals_per_iteration += [(self.eval_idx, sigma)]
+        else:
+            PETSc.Sys.Print("Not adding a ROM snapshot: the FOM solve did not converge")
+        return solution_fom, fom_converged
+
+    def _log_rom_solve(self, result):
+        # coefficients of the ROM solution, logged like the FOM's
+        _, cl = self.postprocessor.compute_cl(result.solution)
+        _, cd = self.postprocessor.compute_cd(result.solution)
+        _, cm = self.postprocessor.compute_cm(result.solution)
+        if self.mesh.mesh.comm.Get_rank() == 0:
+            self.data_store.ROM_walltime += [(self.eval_idx, result.walltime)]
+            self.data_store.rom_relative_residuals += [(self.eval_idx, result.eta)]
+            self.data_store.ROM_force_coefficients += [(self.eval_idx, cd, cl, cm, np.nan)]
+            self.data_store.ROM_meets_threshold += [(self.eval_idx, result.accepted)]
+        PETSc.Sys.Print("ROM coefficients: c_d: {}, c_l: {}, c_m: {}".format(cd, cl, cm))
+        return cd, cl, cm
+
+    def _log_rom_error(self, rom_forces):
+        # ROM-vs-FOM coefficient errors against the FOM solve just run
+        errors = tuple(float(r - f) for r, f in zip(rom_forces, self._last_fom_coefficients))
+        if self.mesh.mesh.comm.Get_rank() == 0:
+            self.data_store.rom_coefficient_errors += [(self.eval_idx,) + errors]
+        PETSc.Sys.Print("ROM - FOM coefficient errors: c_d: {:.3e}, c_l: {:.3e}, c_m: {:.3e}".format(*errors))
 
     def _cm_alpha_for_logging(self, solution):
         # Compute d c_m / d alpha: The total derivative of the moment 
@@ -496,6 +578,7 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         D_fom, cd_fom = self.postprocessor.compute_cd(solution_fom)
         M_fom, cm_fom = self.postprocessor.compute_cm(solution_fom)
         cma_fom = self._cm_alpha_for_logging(solution_fom)
+        self._last_fom_coefficients = (cd_fom, cl_fom, cm_fom)
 
         if self.mesh.mesh.comm.Get_rank() == 0:
             self.data_store.FOM_walltime += [(self.eval_idx, fom_post_time - fom_pre_time)]
