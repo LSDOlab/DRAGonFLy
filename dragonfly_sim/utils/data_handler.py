@@ -1,3 +1,4 @@
+import os
 import numpy as np
 from matplotlib import pyplot as plt
 
@@ -66,6 +67,7 @@ class DataStore():
 
     def write_store_to_numpy_file(self, save_folder="Result_dicts", save_filename="POD_deployment.npy"):
         save_location = save_folder + "/" + save_filename
+        os.makedirs(save_folder, exist_ok=True)
         # create dictionary with all data
         data_dict = self.compile_store_in_dict()
         # save data_dict to location

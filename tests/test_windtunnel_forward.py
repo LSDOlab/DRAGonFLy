@@ -188,3 +188,40 @@ def test_solution_file_fields_and_write_once_per_design(once, in_tmp_dir, monkey
     for w in (writer, wt.mesh._deformation_writer):
         if w is not None and w.writer is not None:
             w.writer.close()
+
+
+def test_muscl_euler_alpha_derivative(in_tmp_dir):
+    """MUSCLEulerModel: the Euler model with the Green-Gauss MUSCL
+    reconstruction converges by PTC, takes the condensed path, and its
+    adjoint dD/dalpha matches finite differences of forward solves."""
+    from dragonfly_sim.core.MUSCL_Euler_model import MUSCLEulerModel
+    recorder = csdl.Recorder(inline=False)
+    recorder.start()
+    wt = DG_windtunnel_model(jittered_square(8), BC, mesh_inner_bdry_function=bottom_wall,
+                             poly_order=0, filename_suffix="test_muscl", model_class=MUSCLEulerModel)
+    wt.euler_residual_conv_limit = 1e-12
+    wt.max_newton_iterations = 400
+    wt.log_cm_alpha = False
+    wt.release_solver_memory = True
+    wt.set_up_sim()
+    wt.postprocessor.log_cm_alpha = False
+    assert wt.sim_model.has_condensed_jacobian and wt.sim_model.face_traces is not None
+    alpha = csdl.Variable(name='alpha', value=np.array([BC['inlet']['alpha']]))
+    alpha.set_as_design_variable()
+    u_vec = wt.evaluate(alpha=alpha)
+    out = wt.postprocessor.evaluate(u_vec, alpha=alpha)
+    out.D.set_as_objective()
+    recorder.stop()
+    sim = csdl.experimental.JaxSimulator(recorder, gpu=False)
+    sim.run()
+    assert wt.sim_model.last_solve_converged
+    D0 = float(sim[out.D][0])
+    dD = float(np.asarray(sim.compute_totals()[out.D, alpha]).ravel()[0])
+    h = 1e-6
+    a0 = BC['inlet']['alpha']
+    fd = (wt.solve_forward(a0 + h)[2]["D"] - wt.solve_forward(a0 - h)[2]["D"]) / (2 * h)
+    assert abs(fd - dD) < 1e-5 * max(abs(fd), 1e-12), (fd, dD)
+    assert abs(wt.solve_forward(a0)[2]["D"] - D0) < 1e-10
+    w = wt.sim_model.fom_solution_writer
+    if w.writer is not None:
+        w.writer.close()
