@@ -88,6 +88,12 @@ class CFLController:
     CFL stays within [floor, cfl_max]; the floor is cfl_min_limited after a
     limited step and min(cfl_min, CFL) otherwise, so a CFL below cfl_min
     regrows by the usual rule instead of jumping back to cfl_min.
+
+    exhausted: CFL fell below 1e-6 cfl0 after rejections, or the last
+    max_frozen_steps steps all had theta = 0. A step with theta = 0 leaves the
+    state unchanged, so once a cell sits at the positivity floor every later
+    step repeats it; without this stop PTC spent its whole step budget frozen
+    (OAT15A, Cadence grid level 1: ~950 identical steps at CFL cfl_min_limited).
     """
     cfl0: float = 5.0
     cfl_max: float = 1e12
@@ -99,16 +105,20 @@ class CFLController:
     theta_cut: float = 0.1
     cfl_min_limited: float = 1e-3
     band_growth: float = 1.2
+    max_frozen_steps: int = 5
     cfl: float = field(init=False)
+    frozen_steps: int = field(init=False, default=0)
 
     def __post_init__(self):
         self.reset()
 
     def reset(self):
         self.cfl = float(self.cfl0)
+        self.frozen_steps = 0
 
     def update(self, r_prev, r, ksp_ok=True, theta=1.0):
         """Returns (accept, limited). Updates self.cfl."""
+        self.frozen_steps = self.frozen_steps + 1 if theta <= 0.0 else 0
         limited = theta < self.theta_cut
         if not np.isfinite(r) or r > self.reject_factor * r_prev:
             self.cfl *= self.cut
@@ -132,7 +142,7 @@ class CFLController:
 
     @property
     def exhausted(self):
-        return self.cfl < 1e-6 * self.cfl0
+        return self.cfl < 1e-6 * self.cfl0 or self.frozen_steps >= self.max_frozen_steps
 
 
 @dataclass
@@ -297,6 +307,10 @@ class TimeIntegrator:
                 continue
             m.solver_converged = r < tol
             r_prev = r
+            if ctrl.exhausted:
+                self._print("[ptc]   no update for {} steps (positivity limiter theta = 0); "
+                            "stopping".format(ctrl.frozen_steps))
+                break
         m.solver.max_it = max_it_saved
         if not m.solver_converged:
             self._print("WARNING: PTC stopped after {} steps at |R| = {:.6e}".format(it, r_prev))
