@@ -54,9 +54,10 @@ The tests in `tests/` cover the boundary/interior integration measures, the shap
 shape design-variable layers, the default Euler discretization against a stored reference
 (`tests/data/euler_reference.npz`), the RANS model (closures, Green-Gauss reconstruction, exact Jacobian and
 adjoint derivatives against finite differences, a manufactured-solution convergence rate), time integration,
-checkpoints, the far fields, forward analysis through `DG_windtunnel_model`, the VTX file writer and the mesh
-input. They build their meshes in-process and take about a minute, most of it the first just-in-time compilation
-of the forms. The CGNS test on the OAT15A grid is skipped when the grid is not in `meshes/`.
+checkpoints, the far fields, forward analysis through `DG_windtunnel_model`, the POD snapshot SVD and the
+reduced-order model (Euler and RANS), the VTX file writer and the mesh input. They build their meshes in-process
+and take about a minute, including the first just-in-time compilation of the forms and the re-runs on three MPI
+ranks. The CGNS test on the OAT15A grid is skipped when the grid is not in `meshes/`.
 Some tests re-run their files under `mpirun -n 3`, so `mpirun` and `pytest` must be available in the same
 environment; without `mpirun` those tests are skipped.
 

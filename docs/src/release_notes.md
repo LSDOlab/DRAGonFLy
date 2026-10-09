@@ -33,6 +33,13 @@
 - `FileWriter` gathers piecewise-constant and continuous fields to rank 0, so VTX output shows no seams at the
   MPI partition boundaries; new `mesh_deformation` and `time_dependent` keywords. The solution and pressure
   files of a shape optimization are written on the deformed mesh of each evaluation.
+- POD reduced-order model for the steady forward solves of the Euler and RANS models
+  (`DG_windtunnel_model(reduced_order_model=ReducedOrderModel(...))`, `core/reduced_order_model.py`,
+  `core/pod.py`): LSPG on a global or locally weighted POD basis of converged solutions in a state-scaled
+  inner product (Euclidean by default, optionally with the mass matrix), with the original POD benchmark's
+  convergence criterion; accepted below a residual threshold, with a fallback to the full-order solve that adds
+  a snapshot. The host gains `positivity_step_length`, `steady_residual()`, `state_scales()` and the
+  `extra_scales` plug-in.
 - The default Euler path is unchanged (bit-identical residual, Jacobian, derivatives and Newton iterates).
 
 ## 0.1.0 (unreleased)

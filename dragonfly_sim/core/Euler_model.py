@@ -1,5 +1,6 @@
 import ctypes
 import gc
+import contextlib
 
 import numpy as np
 from mpi4py import MPI
@@ -56,6 +57,10 @@ class CompressibleEulerModel():
                             chain-rule terms.
         problem_factory     (F, J) -> nonlinear problem, replacing
                             NonlinearProblem_mod in set_up_solver
+        extra_scales        () -> list of the extra variables' typical
+                            magnitudes (numbers or UFL expressions of
+                            Constants); required by state_scales when
+                            n_extra > 0
 
     Every boundary condition records (U_b, tag, kind) in boundary_states.
 
@@ -98,6 +103,7 @@ class CompressibleEulerModel():
         self.time_scale_terms = []
         self.derived_fields = []
         self.problem_factory = None
+        self.extra_scales = None
 
         # Time integration (core/time_integration.py). time_integrator is
         # created by set_up_solver when use_ptc is set or by
@@ -648,8 +654,6 @@ class CompressibleEulerModel():
             self.solver.error_on_nonconvergence = False
 
             def limiter(solver, x, dx):
-                tau = 1.0
-                eps = 1e-16
                 ksp = solver.krylov_solver
 
                 # Print solver summary (number of iterations, current residual norm, reason)
@@ -657,23 +661,9 @@ class CompressibleEulerModel():
                     ksp.getIterationNumber(), ksp.getResidualNorm(),
                     ksp_converged_reason_name(ksp.getConvergedReason())))
                 dx_norm = dx.norm()
-                x_norm = x.norm()
-                PETSc.Sys.Print("x pre norm: {}".format(x_norm))
+                PETSc.Sys.Print("x pre norm: {}".format(x.norm()))
 
-                relative_dx = dx_norm / max(x_norm, 1.)
-                if dx_norm > eps:
-                    initial_theta = min((tau/relative_dx)**0.5, 1.0)
-                else:
-                    initial_theta = 0.
-
-                from dragonfly_sim.utils.solver_utils import compute_positivity_preserving_theta
-                bs = self.n_state
-
-                if self.n_extra:
-                    theta = compute_positivity_preserving_theta(self.mesh_obj.mesh.comm, x.array, dx.array, gamma=self.gamma, initial_theta=initial_theta, block_size=bs,
-                                                                n_mean=self.n_mean)
-                else:
-                    theta = compute_positivity_preserving_theta(self.mesh_obj.mesh.comm, x.array, dx.array, gamma=self.gamma, initial_theta=initial_theta, block_size=bs)
+                theta, initial_theta = self.positivity_step_length(x, dx)
                 self.last_step_theta = min(self.last_step_theta, theta)
 
                 # Print (density and pressure) positivity-preserving under-relaxation summary
@@ -702,6 +692,79 @@ class CompressibleEulerModel():
                     ksp.getType(), ksp.getPC().getType(),
                     ksp_norm_type_name(ksp.getNormType()),
                     ksp_pc_side_name(ksp.getPCSide()), rtol, ksp_max_it))
+
+    def positivity_step_length(self, x, dx, tau=1.0):
+        """
+        Step length for the update x - theta dx: (theta, cap), with the
+        step-length cap = min((tau / (||dx|| / max(||x||, 1)))^0.5, 1) and theta
+        <= cap the largest step keeping density and pressure positive in every
+        cell (transported extra variables are not limited). Used by the Newton
+        step limiter and by the reduced-order solve
+        (core/reduced_order_model.py). Collective.
+        """
+        dx_norm = dx.norm()
+        relative_dx = dx_norm / max(x.norm(), 1.)
+        initial_theta = min((tau / relative_dx)**0.5, 1.0) if dx_norm > 1e-16 else 0.
+
+        from dragonfly_sim.utils.solver_utils import compute_positivity_preserving_theta
+        theta = compute_positivity_preserving_theta(
+            self.mesh_obj.mesh.comm, x.array, dx.array, gamma=self.gamma, initial_theta=initial_theta,
+            block_size=self.n_state, n_mean=self.n_mean if self.n_extra else None)
+        return theta, initial_theta
+
+    @contextlib.contextmanager
+    def steady_residual(self):
+        """
+        Within this block the Newton problem (self.problem) assembles the
+        steady residual and its Jacobian: the pseudo-time and physical time
+        terms of core/time_integration.py are switched off (their Constants
+        set to zero) and restored on exit. A no-op without time terms.
+        """
+        term = None if self.time_integrator is None else self.time_integrator.term
+        if term is None:
+            yield
+            return
+        saved = (float(term.inv_cfl.value), float(term.inv_dt.value))
+        term.inv_cfl.value, term.inv_dt.value = 0.0, 0.0
+        try:
+            yield
+        finally:
+            term.inv_cfl.value, term.inv_dt.value = saved
+
+    def state_scale_expressions(self):
+        """
+        Typical magnitudes of the state components: the free-stream
+        [rho, rho U (per direction), p/(gamma - 1) + rho U^2/2] of the mean
+        flow, then the extra_scales plug-in's values for the extra variables
+        (numbers or UFL expressions of Constants).
+        """
+        inlet = self.boundary_conditions['inlet']
+        rho, p = inlet['rho'], inlet['p']
+        speed = inlet['M'] * inlet['c']
+        scales = ([rho] + [rho * speed] * self.dimensions
+                  + [p / (self.gamma - 1.0) + 0.5 * rho * speed**2])
+        if self.n_extra:
+            if self.extra_scales is None:
+                raise RuntimeError("{} extra variables but no extra_scales plug-in".format(self.n_extra))
+            scales += list(self.extra_scales())
+        return scales
+
+    def state_scales(self):
+        """state_scale_expressions evaluated to floats, one per state
+        component. Collective (UFL expressions are evaluated by assembly)."""
+        msh = self.mesh_obj.mesh
+        dx = ufl.dx(domain=msh)
+        volume = None
+        values = []
+        for s in self.state_scale_expressions():
+            if isinstance(s, ufl.core.expr.Expr):
+                if volume is None:
+                    volume = msh.comm.allreduce(
+                        dolfinx.fem.assemble_scalar(dolfinx.fem.form(1.0 * dx)), op=MPI.SUM)
+                s = msh.comm.allreduce(dolfinx.fem.assemble_scalar(dolfinx.fem.form(s * dx)),
+                                       op=MPI.SUM) / volume
+            values.append(float(s))
+        return values
 
     def apply_krylov_solver_settings(self, ksp, max_it=100, gmres_restart=None,
                                      monitor_convergence=True,
