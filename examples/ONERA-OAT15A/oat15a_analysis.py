@@ -84,6 +84,11 @@ def parse_args():
     p.add_argument("--cfl0", type=float, default=5.0)
     p.add_argument("--steady-tol", type=float, default=1e-9)
     p.add_argument("--max-steps", type=int, default=1000, help="PTC step budget per case")
+    p.add_argument("--limiter", choices=("none", "vanalbada"), default="none",
+                   help="slope limiter of the MUSCL reconstruction")
+    p.add_argument("--limiter-eps", type=float, default=1e-2, help="Van Albada smoothness parameter")
+    p.add_argument("--report-limiter", action="store_true",
+                   help="print which cells block the Newton step whenever the positivity limiter cuts it")
     # output
     p.add_argument("--out-dir", default=".")
     p.add_argument("--label", default="")
@@ -239,12 +244,14 @@ def solve_case(msh, args, alpha, n_wall_edges):
     stream. Returns (model, mesh_obj, record dict)."""
     tic_case = time.perf_counter()
     mesh_obj, model, _ = build_model(msh, model="sa", mach=args.mach, alpha_deg=alpha, Re=args.Re,
-                                     T_inf=args.T_inf, farfield=args.farfield)
+                                     T_inf=args.T_inf, farfield=args.farfield,
+                                     limiter=None if args.limiter == "none" else args.limiter,
+                                     limiter_eps=args.limiter_eps)
     n_wall = count_wall_facets(mesh_obj)
     if n_wall != n_wall_edges:
         raise RuntimeError("the solver's wall has {} facets, the CGNS Wall family {} edges"
                            .format(n_wall, n_wall_edges))
-    model.report_positivity_limiter = False
+    model.report_positivity_limiter = args.report_limiter
     model.use_ptc = True
     model.ptc_settings = {**model.ptc_settings, "cfl0": args.cfl0}
     model.max_newton_iterations = args.max_steps

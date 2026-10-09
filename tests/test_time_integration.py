@@ -54,6 +54,21 @@ def test_cfl_controller_decisions():
     assert c.cfl == 10.0
 
 
+def test_cfl_controller_stops_when_frozen():
+    # theta = 0 leaves the state unchanged: max_frozen_steps of them in a row exhaust the controller
+    c = CFLController(cfl0=5.0, max_frozen_steps=3)
+    for _ in range(2):
+        assert c.update(1.0, 1.0, theta=0.0) == (True, True)
+        assert not c.exhausted
+    c.update(1.0, 1.0, theta=1e-3)                                     # any update restarts the count
+    assert c.frozen_steps == 0
+    for _ in range(3):
+        c.update(1.0, 1.0, theta=0.0)
+    assert c.exhausted
+    c.reset()
+    assert not c.exhausted and c.frozen_steps == 0
+
+
 def test_step_size_controller():
     s = StepSizeController(dt=0.05, dt_start=1e-3, growth=1.5)
     assert s.first(None) == 1e-3 and s.first(1e-3) == pytest.approx(1.5e-3) and s.first(0.04) == 0.05
