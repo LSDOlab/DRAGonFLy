@@ -32,6 +32,7 @@ builds them at all (the plain Newton solve is unchanged).
 from dataclasses import dataclass, field
 
 import numpy as np
+from mpi4py import MPI
 from petsc4py import PETSc
 import ufl
 import dolfinx
@@ -250,6 +251,8 @@ class TimeIntegrator:
         self.step_index = 0
         self.dt_prev = None
         self.verbose = True
+        # (state, CFL) at the end of the last converged steady solve
+        self._steady_end = None
 
     # -- helpers ---------------------------------------------------------
     def _print(self, *args):
@@ -261,10 +264,28 @@ class TimeIntegrator:
         dst.x.scatter_forward()
 
     # -- steady PTC ------------------------------------------------------
+    def _warm_start_cfl(self):
+        """The final CFL of the last converged steady solve if the state now in
+        u_vec is that solve's end state (the warm start of an optimization
+        step), else None. Collective."""
+        end = self._steady_end
+        if end is None:
+            return None
+        u = self.model.u_vec.x.array
+        same = end[0].shape == u.shape and bool(np.array_equal(end[0], u))
+        return end[1] if self.model.mesh_obj.mesh.comm.allreduce(same, op=MPI.MIN) else None
+
     def solve_steady(self, controller=None, max_steps=None, tol=None):
         """
         Pseudo-transient continuation to the steady state from the current
         u_vec. Returns the model's physical residual Vec.
+
+        With model.ptc_warm_start (default) and no explicit controller, a
+        start from the end state of the previous converged steady solve
+        continues at that solve's final CFL: the design (or alpha) has moved
+        a little, so the flow is near its new steady state, and ramping the
+        CFL up from cfl0 again would only repeat the early steps. A step
+        that is too bold is rejected and the CFL cut, as always.
         """
         m = self.model
         if self.term.physical:
@@ -275,6 +296,11 @@ class TimeIntegrator:
         if self.boundary_updaters:
             raise RuntimeError("time-dependent boundary conditions (riemann2) have no steady state")
         ctrl = controller if controller is not None else CFLController(**m.ptc_settings)
+        if controller is None and getattr(m, "ptc_warm_start", False):
+            warm_cfl = self._warm_start_cfl()
+            if warm_cfl is not None:
+                ctrl.cfl = float(min(max(warm_cfl, ctrl.cfl), ctrl.cfl_max))
+                self._print("[ptc] warm start: continuing at CFL {:.3e}".format(ctrl.cfl))
         tol = m.residual_conv_limit if tol is None else tol
         max_steps = int(m.max_newton_iterations if max_steps is None else max_steps)
         m._ensure_residual_vector()
@@ -315,6 +341,7 @@ class TimeIntegrator:
         if not m.solver_converged:
             self._print("WARNING: PTC stopped after {} steps at |R| = {:.6e}".format(it, r_prev))
         self.last_steady_steps = it
+        self._steady_end = ((m.u_vec.x.array.copy(), ctrl.cfl) if m.solver_converged else None)
         m._assemble_physical_residual()
         m.u_vec.x.scatter_forward()
         return m.residual_vec_physical

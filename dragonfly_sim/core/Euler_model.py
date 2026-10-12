@@ -110,6 +110,10 @@ class CompressibleEulerModel():
         # enable_time_stepping(); ptc_settings are CFLController keywords.
         self.use_ptc = False
         self.ptc_settings = {}
+        # a steady PTC solve that starts from the end state of the previous
+        # converged steady solve continues at that solve's final CFL instead
+        # of ramping up from cfl0 (TimeIntegrator.solve_steady)
+        self.ptc_warm_start = True
         self.time_integrator = None
         self._time_stepping = None
         # Smallest positivity step length applied since the caller last
@@ -1022,6 +1026,26 @@ class CompressibleEulerModel():
             "d_rhoE = {:.6e}".format(
                 info["d_rho"], info["d_rhou_norm"], info["d_rhoE"]))
 
+    def incoming_state_converged(self):
+        """
+        True, with solver_converged set, if the current u_vec already
+        satisfies residual_conv_limit. Needs only the residual form, not the
+        solver: the caller can skip set_up_solver and solve_system. The
+        incoming state routinely is converged, since every evaluation that
+        re-solves at an unchanged design arrives here converged, and a full
+        Newton step would walk it backwards. Leaves the residual in
+        residual_vec_physical either way. Collective.
+        """
+        self._ensure_residual_vector()
+        residual_norm = self._assemble_physical_residual()
+        self.solver_converged = bool(residual_norm < self.residual_conv_limit)
+        if self.solver_converged:
+            PETSc.Sys.Print(
+                "Incoming state already converged ({:.6e} < {:.1e}); "
+                "skipping the solve.".format(residual_norm, self.residual_conv_limit))
+            self.u_vec.x.scatter_forward()
+        return self.solver_converged
+
     def solve_system(self):
         """
         Newton solve of the Euler system, starting from the current u_vec.
@@ -1037,11 +1061,12 @@ class CompressibleEulerModel():
         if self.use_ptc:
             return self.time_integrator.solve_steady()
 
-        self._ensure_residual_vector()
+        if self.incoming_state_converged():
+            return self.residual_vec_physical
 
         solver = self.solver
 
-        conv_limit = (self.residual_conv_limit)
+        conv_limit = self.residual_conv_limit
         # FOM: max_newton_iterations is a TOTAL Newton-step budget, and each
         # outer pass now runs fom_newton_inner_max_it steps, so divide to hold
         # the product fixed -- otherwise raising the inner count silently
@@ -1049,20 +1074,8 @@ class CompressibleEulerModel():
         max_outer = (max(1, int(self.max_newton_iterations)
                               // max(1, int(self.fom_newton_inner_max_it))))
 
-        residual_norm = self._assemble_physical_residual()
+        residual_norm = self.residual_vec_physical.norm()
         self.solver_converged = False
-
-        # The incoming state may ALREADY satisfy conv_limit, and routinely
-        # does: every evaluation that re-solves at an unchanged design arrives
-        # here converged. Without this test the loop still runs a full Newton
-        # step and can walk a converged state backwards.
-        if residual_norm < conv_limit:
-            self.solver_converged = True
-            PETSc.Sys.Print(
-                "Incoming state already converged ({:.6e} < {:.1e}); "
-                "skipping the solve.".format(residual_norm, conv_limit))
-            self.u_vec.x.scatter_forward()
-            return self.residual_vec_physical
 
         for _ in range(max_outer):
             solver.solve(self.u_vec)
