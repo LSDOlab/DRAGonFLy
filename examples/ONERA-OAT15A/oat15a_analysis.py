@@ -2,9 +2,12 @@
 Mesh sensitivity study of ONERA's OAT15A airfoil: steady SA-neg RANS at p = 0
 on structured grid levels, at the conditions of DPW8 test case 1a: M 0.73,
 Re 3e6 (chord), static temperature 271 K, alpha 1.36, 1.50, 2.50, 3.00,
-3.10 deg. Grid families (--mesh-family): the Cadence grids, levels 1-6
-(default; meshes/Cadence-ONERA-OAT15A_..._Structured/), or the Rizzi grids 1-7
-(meshes/ONERA-ONERA-OAT15A-Rizzi/).
+3.10 deg. Grid families (--mesh-family): the Cadence REV02 grids of DPW8 test
+case 1c, levels 1-6, far field at 1000 chords (cadence_rev02, the default;
+meshes/ONERA-OAT15A_Cadence_Structured_REV02/), the Cadence REV01 grids,
+levels 1-6, far field at 150 chords (cadence;
+meshes/Cadence-ONERA-OAT15A_..._Structured/), or the Rizzi grids 1-7 (rizzi;
+meshes/ONERA-ONERA-OAT15A-Rizzi/).
 
 The grids are structured multi-block CGNS files one cell thick in span (chord
 230 mm); utils/mesh_io_utils reduces each to a 2D quad mesh with chord 1 in
@@ -59,6 +62,9 @@ GRID_FILES = {
     "cadence": (os.path.join(_CADENCE, "ONERA-OAT15A_230mmChord_780mmSpan_upZ_2024_09_05_Structured_Level-{0}.cgns"),
                 [1, 2, 3, 4, 5, 6]),
     "rizzi": (os.path.join("ONERA-ONERA-OAT15A-Rizzi", "grid{0}", "OAT15A_Rizzi_{0}.cgns"), [1, 2, 3, 4, 5, 6, 7]),
+    # DPW8 test case 1c grids: far field at 1000 chords (REV01: 150)
+    "cadence_rev02": (os.path.join("ONERA-OAT15A_Cadence_Structured_REV02", "ONERA-OAT15A_Cadence_Structured_REV02",
+                                   "CGNS", "ONERA-OAT15A_Cadence_Structured_REV02_Level-{0}.cgns"), [1, 2, 3, 4, 5, 6]),
 }
 COLUMNS = ("grid", "cells", "dofs", "alpha", "converged", "steps", "res", "wall_s", "case_s",
            "c_l", "c_d", "c_d_pressure", "c_d_friction", "c_m")
@@ -68,8 +74,9 @@ FORMATS = {"grid": "%d", "cells": "%d", "dofs": "%d", "alpha": "%.4f", "converge
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--mesh-family", choices=sorted(GRID_FILES), default="cadence",
-                   help="structured CGNS grid family: Cadence levels 1-6 or Rizzi grids 1-7")
+    p.add_argument("--mesh-family", choices=sorted(GRID_FILES), default="cadence_rev02",
+                   help="structured CGNS grid family: Cadence REV02 levels 1-6 (default), Cadence REV01 "
+                        "levels 1-6, or Rizzi grids 1-7")
     p.add_argument("--grids", type=int, nargs="+", default=None,
                    help="grid levels (default: all levels of the family)")
     p.add_argument("--alphas", type=float, nargs="+", default=[1.36, 1.50, 2.50, 3.00, 3.10],
@@ -82,6 +89,8 @@ def parse_args():
     p.add_argument("--mesh-dir", default=MESH_DIR)
     # steady solver
     p.add_argument("--cfl0", type=float, default=5.0)
+    p.add_argument("--cfl-max", type=float, default=None,
+                   help="upper bound of the PTC CFL number (default: the controller's, 1e12)")
     p.add_argument("--steady-tol", type=float, default=1e-9)
     p.add_argument("--max-steps", type=int, default=1000, help="PTC step budget per case")
     p.add_argument("--limiter", choices=("none", "vanalbada"), default="none",
@@ -253,7 +262,8 @@ def solve_case(msh, args, alpha, n_wall_edges):
                            .format(n_wall, n_wall_edges))
     model.report_positivity_limiter = args.report_limiter
     model.use_ptc = True
-    model.ptc_settings = {**model.ptc_settings, "cfl0": args.cfl0}
+    model.ptc_settings = {**model.ptc_settings, "cfl0": args.cfl0,
+                          **({} if args.cfl_max is None else {"cfl_max": args.cfl_max})}
     model.max_newton_iterations = args.max_steps
     model.residual_conv_limit = args.steady_tol
     model.set_up_solver()
