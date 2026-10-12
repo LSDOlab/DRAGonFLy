@@ -55,6 +55,9 @@ class Mesh():
         self.n_owned_nodes = int(self.mesh.geometry.index_map().size_local)
         self.node_match_tol = node_match_tol
         self.is_valid = True
+        # design-parameter vector the current node coordinates were built for
+        # (see apply_node_motions); None at baseline or when it is unknown
+        self._deformation_design = None
         self._coordinate_space = None
         self._dof_to_node_map = None
         self._nodal_function = None
@@ -211,8 +214,9 @@ class Mesh():
     # ==================================================================
 
     def add_geometry_listener(self, callback):
-        """Run `callback()` (collective) after every reset_nodes and
-        apply_node_motions, e.g. to refresh fields computed from the node
+        """Run `callback()` (collective) after every reset_nodes and every
+        apply_node_motions that moves the nodes (not one skipped for an
+        unchanged design), e.g. to refresh fields computed from the node
         coordinates (cell centres, wall distance)."""
         self._geometry_listeners.append(callback)
 
@@ -220,14 +224,36 @@ class Mesh():
         for callback in self._geometry_listeners:
             callback()
 
+    @property
+    def deformation_design(self):
+        """Copy of the design vector the mesh is currently deformed for, or None."""
+        return None if self._deformation_design is None else self._deformation_design.copy()
+
     def reset_nodes(self, notify=True):
-        """Put every local node, ghosts included, back at its baseline position."""
+        """Put every local node, ghosts included, back at its baseline position.
+
+        The callbacks no longer call this: the mesh stays deformed until
+        apply_node_motions is given a different design.
+        """
         gdim = self.mesh.geometry.dim
         self.mesh.geometry.x[:, :gdim] = self.baseline_nodes[:, :gdim]
+        self._deformation_design = None
         if notify:
             self._notify_geometry_listeners()
 
-    def apply_node_motions(self, node_motions):
+    def _is_deformed_for(self, design):
+        """True on every rank if the mesh already holds the deformation of ``design``.
+
+        ``design`` is replicated across ranks, but the comparison is reduced
+        anyway: apply_node_motions is collective, so the ranks must agree on
+        whether to skip it.
+        """
+        stored = self._deformation_design
+        same = (stored is not None and stored.shape == design.shape
+                and bool(np.array_equal(stored, design)))
+        return bool(self.mesh.comm.allreduce(same, op=MPI.MIN))
+
+    def apply_node_motions(self, node_motions, design=None):
         """Move the mesh to baseline + ``node_motions`` and re-check its cells.
 
         ``node_motions`` is (n_owned_nodes, gdim) in geometry-node order.
@@ -235,7 +261,23 @@ class Mesh():
         so repeated calls do not accumulate. Ghost nodes are updated from
         their owners. Sets ``is_valid`` (no inverted or zero-volume cell) and
         returns it. Collective.
+
+        ``design`` is the (replicated) design-parameter vector that
+        ``node_motions`` was computed from. The mesh stays deformed after this
+        call and remembers ``design``; a later call with an equal ``design``
+        returns the current ``is_valid`` without touching the mesh, so the
+        deformation is built once per design. A different ``design`` resets
+        the nodes and warps again. ``design=None`` always warps.
         """
+        if design is not None:
+            design = np.array(design, dtype=np.float64, copy=True).ravel()
+            if self._is_deformed_for(design):
+                PETSc.Sys.Print("Mesh already deformed for this design: reusing it")
+                return self.is_valid
+
+        # unknown until the new deformation is complete, so a failure part-way
+        # never leaves a key that matches a half-moved mesh
+        self._deformation_design = None
         self.reset_nodes(notify=False)
         n, gdim = self.n_owned_nodes, self.mesh.geometry.dim
         x = self.mesh.geometry.x
@@ -250,6 +292,7 @@ class Mesh():
 
         self._update_quality()
         self._notify_geometry_listeners()
+        self._deformation_design = design
         return self.is_valid
 
     # ==================================================================
@@ -395,7 +438,7 @@ class Mesh():
 
         offset, n_global = assign_global_dof_offset(comm, local_idx.size)
         coords = allgather_numpy(
-            comm, msh.geometry.x[:self.n_owned_nodes, :gdim][local_idx].ravel(),
+            comm, self.baseline_nodes[:self.n_owned_nodes, :gdim][local_idx].ravel(),
             n_global * gdim).reshape(n_global, gdim)
         # comm.allgather rather than allgather_numpy: these are int64 global
         # ids and allgather_numpy is float64-only.
@@ -489,12 +532,12 @@ class Mesh():
         return conn, facets
 
     def facet_cell_midpoints(self, facets):
-        """(n_facets, 3) midpoint of the single cell attached to each exterior facet."""
+        """(n_facets, 3) baseline midpoint of the single cell attached to each exterior facet."""
         msh = self.mesh
         tdim = msh.topology.dim
         f_to_c = msh.topology.connectivity(tdim - 1, tdim)
         c_to_g = msh.geometry.dofmap
-        x = msh.geometry.x
+        x = self.baseline_nodes
         mids = np.empty((facets.size, 3), dtype=np.float64)
         for k, f in enumerate(facets):
             mids[k] = x[c_to_g[f_to_c.links(int(f))[0]]].mean(axis=0)

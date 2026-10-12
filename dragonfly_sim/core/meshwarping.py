@@ -128,6 +128,9 @@ class IDWarp_jax(csdl.CustomExplicitOperation):
         the wall nodes' centroid to a wall node. The package takes ``Ldef0``
         over every prescribed node, anchors included -- the farfield radius --
         so the factor is rescaled before it is passed on.
+    reuse_tol : the forward warp is not repeated when the wall displacement is
+        within this absolute tolerance (largest entry) of the one the last
+        warp used; see ``compute``. Finite-difference steps must exceed it.
     err_tol : kd-tree pruning tolerance, see above. Measured against
         ``err_tol=0`` on the 2D NACA0012 mesh: 1e-6 gives 1.2e-3 relative
         motion error at half the cost; 1e-10 prunes almost nothing (cost of
@@ -166,12 +169,18 @@ class IDWarp_jax(csdl.CustomExplicitOperation):
         extrusion_width: float = None,
         LdefFact: float = 1.0,
         err_tol: float = 1.0e-6,
+        reuse_tol: float = 1.0e-12,
         **idwarp_kwargs,
     ):
         super().__init__()
 
         self.mesh = mesh_obj
         comm = self.mesh.mesh.comm
+        # the last forward warp: its input and output, reused when CSDL
+        # re-evaluates the same design (see compute)
+        self.reuse_tol = float(reuse_tol)
+        self._last_bdry_motions = None
+        self._last_motions = None
 
         self.dimensions = self.mesh.mesh.geometry.dim
         self.wall_meshtag_val = wall_meshtag_val
@@ -542,14 +551,41 @@ class IDWarp_jax(csdl.CustomExplicitOperation):
         return mesh_node_motions
 
     def compute(self, input_vals, output_vals):
-        """Forward warp. No collectives: every rank already has the whole surface."""
-        t0 = perf_counter()
-        self._log_memory("before compute")
+        """Forward warp. The only collective is the equality check and the log line:
+        every rank already has the whole surface.
 
-        wall = self._project(input_vals["bdry_motions"])
+        CSDL runs the model again for each derivative evaluation of a design,
+        so the same wall displacement arrives several times; the output of the
+        last warp is returned when no entry of the wall displacement differs
+        from the one that warp used by more than ``reuse_tol`` (absolute,
+        default 1e-12). The reference stays the displacement actually warped,
+        so small changes cannot add up unnoticed: once the displacement has
+        moved more than ``reuse_tol`` from it, it is warped again.
+        """
+        t0 = perf_counter()
+        bdry_motions = np.asarray(input_vals["bdry_motions"])
+
+        # bdry_motions is replicated, but reduce the comparison anyway: the
+        # ranks must agree on whether to warp
+        last = self._last_bdry_motions
+        same = (last is not None and last.shape == bdry_motions.shape
+                and bool(np.all(np.abs(bdry_motions - last) <= self.reuse_tol)))
+        if self.mesh.mesh.comm.allreduce(same, op=MPI.MIN):
+            output_vals["mesh_node_motions"] = self._last_motions.copy()
+            PETSc.Sys.Print("[IDWarp_jax] forward warp: wall displacement within {:.0e} of the last "
+                            "warp's, reusing it ({:.2f} s)".format(self.reuse_tol, perf_counter() - t0))
+            return
+
+        self._log_memory("before compute")
+        # unknown until the new warp is complete
+        self._last_bdry_motions = self._last_motions = None
+
+        wall = self._project(bdry_motions)
         Xv = self._warp(self._Xs0 + self._expand(wall), _NO_PITCH)
         motions = self._assemble_motions(wall, Xv - self._Xv0)
         output_vals["mesh_node_motions"] = motions
+        self._last_bdry_motions = bdry_motions.copy()
+        self._last_motions = motions.copy()
 
         local_max = float(np.abs(motions).max()) if motions.size else 0.0
         PETSc.Sys.Print(

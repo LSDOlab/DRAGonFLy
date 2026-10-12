@@ -383,13 +383,14 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
         u_vec = input_vals['u_vec']
         alpha = input_vals['alpha'][0]
         deform_array = input_vals['mesh_deformation'] if 'mesh_deformation' in input_vals else None
+        shape_parameters = input_vals['shape_param_inputs'] if 'shape_param_inputs' in input_vals else None
 
         # Update the angle of attack and downstream quantities
         self.set_angle_of_attack(alpha)
 
         # Apply the mesh deformations to the mesh (none in a forward analysis)
         if deform_array is not None:
-            self.mesh_obj.apply_node_motions(deform_array)
+            self.mesh_obj.apply_node_motions(deform_array, design=shape_parameters)
 
         # check whether the mesh and solution on it are valid
         if (self.mesh_obj.is_valid and self.sim_model.last_solve_converged and not np.isnan(np.linalg.norm(u_vec))) or self.testing_mode:
@@ -423,9 +424,6 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
             output_vals['M'], output_vals['c_m'] = 0.0, 0.0
             output_vals['c_m_alpha'] = 0.0
 
-        # reset the mesh to its undeformed state
-        self.mesh_obj.reset_nodes()
-
     def compute_derivatives(self, input_vals, outputs_vals, derivatives):
         # Compute the derivatives of the output quantities w.r.t. the inputs
         PETSc.Sys.Print("starting compute_derivatives in DG_postprocessor...")
@@ -433,13 +431,14 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
         u_vec = input_vals['u_vec']
         alpha = input_vals['alpha'][0]
         deform_array = input_vals['mesh_deformation'] if 'mesh_deformation' in input_vals else None
+        shape_parameters = input_vals['shape_param_inputs'] if 'shape_param_inputs' in input_vals else None
 
         # Update the angle of attack and downstream quantities
         self.set_angle_of_attack(alpha)
 
         # Apply the mesh deformations to the mesh and update geometry-dependent quantities
         if deform_array is not None:
-            self.mesh_obj.apply_node_motions(deform_array)
+            self.mesh_obj.apply_node_motions(deform_array, design=shape_parameters)
         self.refresh_geometry_dependent_reference_quantities()
 
         # Compute all force and moment derivatives w.r.t. the nondimensional state and mesh vertex movement
@@ -458,5 +457,3 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
         derivatives['L', 'alpha'] = np.array([[-D_val]], dtype=np.float64)
         derivatives['D', 'alpha'] = np.array([[ L_val]], dtype=np.float64)
         derivatives['M', 'alpha'] = np.array([[0.0]], dtype=np.float64)
-
-        self.mesh_obj.reset_nodes()

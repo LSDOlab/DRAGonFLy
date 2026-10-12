@@ -199,3 +199,48 @@ def test_dual_time_steps_match_newton_steps():
             assert rec.accepted
         states.append(model.u_vec.x.array.copy())
     np.testing.assert_allclose(states[1], states[0], rtol=0, atol=1e-8)
+
+
+def _ptc_channel(warm_start):
+    model = euler_channel_model(n=6)
+    seed_mean_flow(model, amplitude=0.3)
+    model.report_positivity_limiter = False
+    model.use_ptc = True
+    model.ptc_settings = {"cfl0": 10.0}
+    model.ptc_warm_start = warm_start
+    model.set_up_solver()
+    model.time_integrator.verbose = False
+    return model
+
+
+def test_ptc_warm_start_continues_at_the_final_cfl():
+    """After a converged steady solve, a solve from that end state at a slightly
+    different angle of attack continues at the final CFL instead of ramping up
+    from cfl0 again: fewer steps, same converged state."""
+    steps, states = {}, {}
+    for warm in (False, True):
+        model = _ptc_channel(warm)
+        integrator = model.time_integrator
+        assert integrator._warm_start_cfl() is None          # nothing to continue from yet
+        model.solve_system()
+        assert model.solver_converged
+        cold_steps = integrator.last_steady_steps
+        assert cold_steps > 3
+        alpha = model.boundary_conditions['inlet']['alpha']
+        model.set_angle_of_attack(alpha + np.radians(0.05))
+        model.solve_system()
+        assert model.solver_converged
+        steps[warm] = integrator.last_steady_steps
+        states[warm] = model.u_vec.x.array.copy()
+    assert steps[True] < steps[False], steps
+    np.testing.assert_allclose(states[True], states[False], rtol=0, atol=1e-7)
+
+
+def test_ptc_warm_start_needs_the_end_state_of_the_last_solve():
+    model = _ptc_channel(True)
+    integrator = model.time_integrator
+    model.solve_system()
+    assert integrator._warm_start_cfl() is not None
+    model.u_vec.x.array[:] *= 1.0 + 1e-9
+    model.u_vec.x.scatter_forward()
+    assert integrator._warm_start_cfl() is None
