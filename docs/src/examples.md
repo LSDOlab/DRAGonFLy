@@ -49,7 +49,7 @@ $C_p$/$c_f$ files, optional VTX fields, and a checkpoint for `--restart`. See `-
 ## `benchmark_pod.py`: full-order against reduced-order solutions
 The [POD reduced-order model](reduced_order_modeling.md) of the Euler and the RANS model at the same design
 points. Each model trains its own `pod_global` and `pod_local` (local_weighted) ROMs on the full-order solutions
-at a Latin-Hypercube sample of (FFD control-point motions, $\alpha$, $M_\infty$), then compares them with the
+at a Latin-Hypercube sample of (shape, $\alpha$, $M_\infty$), then compares them with the
 full-order solve at a separate random test set: state L2 errors, lift, drag and moment errors, the ROM residual
 and the wall times, with a per-phase breakdown of every test solve (see Profiling in the [user guide](user_guide.md)). It
 writes one `DataStore` per (model, variant), box plots with Euler and RANS side by side, and stacked bars of where
@@ -58,8 +58,14 @@ the full-order and reduced-order solves spend their time.
 | | |
 |---|---|
 | Meshes | 2D (`--dimension 2D`): `naca0012_euler_mesh_quad_v2` (Euler), `naca0012_cgrid_rans_coarse` (RANS); 3D (default): `wing_vol_L3.cgns` for both |
-| Design space | vertical FFD control-point motions (10 x 3 in 2D, $\pm 0.01$; 4 x 5 x 3 in 3D, spanwise-tapered), $\alpha \in [1.75^\circ, 2.25^\circ]$, $M_\infty \in [0.7, 0.9]$ |
-| Defaults | 50 training and 25 test points, `rb_size` 10, Mach continuation for the full-order solves, ROMs started from the free stream |
+| Design space | 2D: vertical motions of 10 x 3 FFD control points ($\pm 0.01$). 3D: the `WingShape` of `wing_opt_rans.py` on a 5 x 3 x 2 block (25 variables: sweep, aspect ratio, span, taper ratio, 3 x 4 thickness and 3 x 3 camber modes). $\alpha \in [1.75^\circ, 2.25^\circ]$, $M_\infty \in [0.7, 0.9]$ |
+| Defaults | 50 training and 25 test points, `rb_size` 10, Mach continuation for the full-order solves, ROMs started from the free stream, `pod_local` weighting by the parameter distance normalized by each parameter's sampled range (`--parameter-distance raw` for the parameters as they are) |
+
+The wall times compare flow solves. The full-order time is the windtunnel's own timer (initial state, solver
+set-up, nonlinear solve, solver release), and the ROM's covers the same steps (initial state, solver set-up,
+basis, reduced solve, solver release). The shape-to-mesh motion (FFD and mesh warp), the mesh deformation, the
+file output and the coefficient evaluation are in neither; the whole full-order evaluation time is reported
+separately. On the 3D wing the mesh motion alone is about twice the flow solve of an Euler evaluation.
 
 Every setting is a command-line option (`--help`), e.g. a quick 2D run:
 ```sh

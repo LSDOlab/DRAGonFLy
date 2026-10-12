@@ -2,7 +2,7 @@
 POD reduced-order model benchmark: full-order (FOM) against reduced-order
 (ROM) solutions of the Euler and the RANS model at the same design points.
 
-Each design point is a shape (FFD control-point motions), an angle of attack
+Each design point is a shape (see problem_definition), an angle of attack
 and a Mach number. For each flow model in --models the script builds its own
 DG_windtunnel_model (with no reduced-order model of its own, so every solve
 through it is a FOM solve) and one core.reduced_order_model.ReducedOrderModel
@@ -22,6 +22,13 @@ Workflow (per flow model, on the same samples):
      FOM (the reference), then each variant's LSPG ROM on the same deformed
      mesh, and record the state L2 errors (domain and wall), the lift, drag
      and moment errors, the ROM residual and both wall times.
+
+     The wall times compare FLOW SOLVES: the FOM's is the windtunnel's own
+     timer (initial state, solver set-up, nonlinear solve, solver release), the
+     ROM's covers the same steps (initial state, solver set-up, basis, reduced
+     solve, solver release). The shape -> mesh motion (FFD and mesh warp), the
+     mesh deformation, the file output and the coefficient evaluation are in
+     neither; the FOM's whole evaluation time is reported separately.
   4. Write one DataStore per (model, variant) to <output-dir>/Result_dicts,
      print a summary and save comparison plots (Euler and RANS side by side).
 
@@ -56,8 +63,7 @@ from matplotlib import pyplot as plt
 from dragonfly_sim.core.windtunnel_model import DG_windtunnel_model
 from dragonfly_sim.core.RANS_model import CompressibleRANSModel
 from dragonfly_sim.core.reduced_order_model import ReducedOrderModel
-from dragonfly_sim.core.shape_design import FFDShapeParameterization, ControlPointMotions
-from dragonfly_sim.utils.ffd_dv_utils import spanwise_linear_bounds
+from dragonfly_sim.core.shape_design import FFDShapeParameterization, ControlPointMotions, WingShape
 from dragonfly_sim.utils.mesh_io_utils import load_dolfinx_mesh
 from dragonfly_sim.utils.mesh_manager_utils import airfoil_inner_bdry_function, wing_inner_bdry_function
 from dragonfly_sim.utils.data_handler import DataStore
@@ -88,8 +94,9 @@ def parse_args(argv=None):
     g.add_argument("--alpha-lower", type=float, default=1.75, help="degrees")
     g.add_argument("--alpha-upper", type=float, default=2.25,
                    help="degrees; the inlet/outlet split is tagged at 2 deg and allows +/-1 deg")
-    g.add_argument("--cp-motion-sample-scale", type=float, default=1.0,
-                   help="scale of the sampled shape range relative to the design-variable bounds")
+    g.add_argument("--shape-sample-scale", "--cp-motion-sample-scale", type=float, default=1.0,
+                   help="scale of the sampled shape range relative to the design-variable bounds, "
+                        "about each variable's baseline value")
 
     g = p.add_argument_group("sampling")
     g.add_argument("--seed", type=int, default=0, help="training LHS seed; the test seed is seed + 1")
@@ -127,8 +134,11 @@ def parse_args(argv=None):
     g.add_argument("--cubic-cutoff", type=float, default=None,
                    help="Cubic: c in [0, 1) of the support radius c d_min + (1 - c) d_max "
                         "(never below the rb_size nearest snapshots); default: n_nonzero_weights")
-    g.add_argument("--parameter-distance", choices=("raw", "normalized"), default="raw",
-                   help="normalized: divide each parameter by its sampled range in the distance")
+    g.add_argument("--parameter-distance", choices=("raw", "normalized"), default="normalized",
+                   help="the distance between design points that weights the local_weighted snapshots; "
+                        "normalized: each parameter divided by its sampled range, so that shape "
+                        "variables, alpha and Mach count alike (raw: the parameters as they are, "
+                        "dominated by the variables of the largest numerical range)")
     g.add_argument("--inner-product", choices=("euclidean", "l2"), default="euclidean")
     g.add_argument("--state-scaling", choices=("freestream", "none"), default="freestream")
     g.add_argument("--rom-newton-max-it", type=int, default=15)
@@ -178,7 +188,7 @@ def parse_args(argv=None):
         args.dimension, args.rb_size, args.inner_product,
         "" if args.state_scaling == "freestream" else "_unscaled",
         "" if args.cubic_cutoff is None else "_c{:g}".format(args.cubic_cutoff),
-        "" if args.parameter_distance == "raw" else "_normdist")
+        "" if args.parameter_distance == "normalized" else "_rawdist")
     return args
 
 
@@ -186,27 +196,80 @@ def parse_args(argv=None):
 # Problem set-up
 # =============================================================================
 def problem_definition(dimension):
-    """The dimension-dependent part of the set-up (sandbox defaults)."""
+    """
+    The dimension-dependent part of the set-up (sandbox defaults). The shape
+    is `make_layers()`'s design-variable layers on an FFD block (`ffd_shape`,
+    `ffd_degree`, `ffd_block_corners`); a factory, because every flow model
+    needs its own, stateful, layers.
+
+    2D: vertical motions of 10 x 3 control points, +/-0.01 chords.
+    3D: the Simple Transonic Wing's planform and section variables on a
+    5 x 3 x 2 block, exactly as in wing_opt_rans.py (keep the two in step).
+    """
     if dimension == "2D":
         return dict(
             meshes={"euler": os.path.join(MESH_DIR, "naca0012_euler_mesh_quad_v2.xdmf"),
                     "rans": os.path.join(MESH_DIR, "naca0012_cgrid_rans_coarse.xdmf")},
             tdim=2, mach_0=0.8, reynolds=6e6,
             ffd_shape=[10, 3], ffd_degree=[2, 2], ffd_block_corners=None,
-            cp_dv_spec={1: 0.01},
+            make_layers=lambda: [ControlPointMotions({1: 0.01})],
             inner_bdry_function=airfoil_inner_bdry_function,
             aero_center=np.array([0.25, 0.]))
+
     c_root, taper = 5.0, 0.3
     mac = 2. / 3. * c_root * (1. + taper + taper ** 2) / (1. + taper)
+
+    # --- the geometry parameters below are those of wing_opt_rans.py -------------------
+    # FFD block: (chord, span, vertical). Three spanwise sections (root, mid-span, tip) are the
+    # stations of the section variables; the chordwise basis is a quartic Bezier (5 control points),
+    # which holds the thickness and camber modes below exactly.
+    ffd_bspline_deg = [4, 2, 1]
+    ffd_shape = [5, 3, 2]
+    ffd_block_corner_list = [[(-0.1, -1e-8, 0.32), (5.1, -1e-8, -0.3)], [(7.4, 14.1, 0.32), (9.1, 14.1, -0.3)]]
+
+    # The shape design variables and their bounds (see shape_design.WingShape).
+    # The baseline planform is measured from the mesh: quarter-chord sweep
+    # 25.3 deg, AR 8.615, span 28 (semi-span 14), root chord 5.0, taper ratio
+    # 0.3. Planform variables are absolute values starting at the baseline
+    # (their bounds must bracket it); leave one out to keep it fixed. AR, span
+    # and root chord are tied by s = AR * c_r * (1 + taper) / 4: with span, AR
+    # and taper as variables the root chord follows (the derived one; see
+    # WingShape's `derived`). A taper change is exact at the three FFD
+    # sections and blended between them (chord error < 1% for taper 0.2-0.5).
+    #
+    # Section variables are deltas from the baseline, with `modes` chordwise
+    # values at each of the ffd_shape[1] = 3 spanwise sections (root first,
+    # all modes of a section together: 3 x 4 thickness and 3 x 3 camber
+    # values). With xi the local chord fraction and B_m the Bernstein
+    # polynomials of degree modes - 1:
+    #   thickness: relative change of t/c, sum_m tau_m B_m(xi) (0.1 in every
+    #              mode: 10% thicker everywhere)
+    #   camber:    change of camber over local chord, sum_m kappa_m 4 xi (1 - xi)
+    #              B_m(xi) (leading and trailing edge fixed; kappa in every mode:
+    #              a parabolic camber line of maximum kappa)
+    # Bounds may also be per-section arrays, e.g. to pin the root:
+    # {'bounds': (np.array([0., -0.1, -0.1]), np.array([0., 0.1, 0.1])), 'modes': 4}.
+    def make_layers():
+        wing = WingShape(
+            planform={'sweep': np.radians((20., 30.)),     # quarter-chord sweep [rad]
+                      'aspect_ratio': (7.5, 10.),
+                      'span': (26., 30.),                  # full span; the model is the half wing
+                      'taper_ratio': (0.2, 0.4)},
+            sections={'thickness': {'bounds': 0.1, 'modes': 4},
+                      'camber': {'bounds': 0.01, 'modes': 3}},
+            sweep_chord_fraction=0.25,
+            # the STW's trapezoid ends at y = 14; the wall's largest y (the default)
+            # would include the rounded tip cap and shift AR and taper slightly
+            semi_span=14.0)
+        return [wing]
+    # --- end of the wing_opt_rans.py geometry parameters ---------------------------------
+
     return dict(
         meshes={"euler": os.path.join(MESH_DIR, "wing_vol_L3.cgns"),
                 "rans": os.path.join(MESH_DIR, "wing_vol_L3.cgns")},
         tdim=3, mach_0=0.85, reynolds=5e6 / mac,
-        ffd_shape=[4, 5, 3], ffd_degree=[3, 3, 2],
-        ffd_block_corners=[[(-0.1, -1e-8, 0.32), (5.1, -1e-8, -0.3)],
-                           [(7.4, 14.1, 0.32), (9.1, 14.1, -0.3)]],
-        cp_dv_spec={2: spanwise_linear_bounds(base_bound=0.05, scale_at_root=1.0,
-                                              scale_at_ref=0.5, y_ref=14.1)},
+        ffd_shape=ffd_shape, ffd_degree=ffd_bspline_deg, ffd_block_corners=ffd_block_corner_list,
+        make_layers=make_layers,
         inner_bdry_function=wing_inner_bdry_function,
         aero_center=np.array([0.25, 0., 0.]))
 
@@ -253,7 +316,7 @@ class Problem:
                          'outlet': {'p': 1.0}}
         self.shape = FFDShapeParameterization(definition["ffd_shape"], definition["ffd_degree"],
                                               definition["ffd_block_corners"],
-                                              layers=[ControlPointMotions(definition["cp_dv_spec"])])
+                                              layers=definition["make_layers"]())
         kwargs = dict(asm_overlap=1, ilu_levels=1)
         if kind == "rans":
             self.reynolds = args.reynolds if args.reynolds is not None else definition["reynolds"]
@@ -296,9 +359,15 @@ class Problem:
 
     # -- shape parameters ------------------------------------------------------
     def shape_bounds(self):
-        lower = np.concatenate([np.asarray(dv.lower, dtype=float).ravel() for dv in self.dvs.dvs])
-        upper = np.concatenate([np.asarray(dv.upper, dtype=float).ravel() for dv in self.dvs.dvs])
-        return lower, upper
+        """(lower, upper, baseline) of the flat shape vector: the design-variable
+        bounds and initial values."""
+        flat = lambda attr: np.concatenate([np.asarray(getattr(dv, attr), dtype=float).ravel()
+                                            for dv in self.dvs.dvs])
+        return flat("lower"), flat("upper"), flat("value")
+
+    def shape_layout(self):
+        """[[name, shape], ...] of the shape variables, in flat-vector order."""
+        return [[name, [int(n) for n in dv.shape]] for name, dv in zip(self.dvs.names, self.dvs.dvs)]
 
     def set_shape(self, flat):
         offset = 0
@@ -334,10 +403,18 @@ class Problem:
         self.wt.postprocessor.set_angle_of_attack(alpha)     # also sets the model's alpha
 
     def run_fom(self, sample, n_shape, args, label, initial_condition=None):
-        """One FOM solve through the windtunnel's CSDL graph. Returns
-        (solution_local, mesh_motions, walltime), or (None, None, walltime)
-        for an invalid mesh or (without --keep-nonconverged) a failed solve.
-        The mesh is at its baseline on return."""
+        """One FOM evaluation through the windtunnel's CSDL graph (shape -> mesh
+        motion -> flow solve -> output). Returns (solution_local, mesh_motions,
+        solve_walltime, evaluation_walltime), or (None, None, ...) for an
+        invalid mesh or (without --keep-nonconverged) a failed solve.
+        The mesh is at its baseline on return.
+
+        solve_walltime is the FLOW SOLVE alone, as the windtunnel times it:
+        the initial state, the solver set-up, the Newton / pseudo-time solve
+        and releasing the solver -- the scope the ROM's wall time covers (see
+        test()), so the two compare like with like. evaluation_walltime is the
+        whole evaluation, which adds the FFD and mesh warp, the mesh deformation,
+        the solution output and the coefficient evaluation."""
         alpha, mach = float(sample[n_shape]), float(sample[n_shape + 1])
         if initial_condition is not None:
             self.wt.previous_solution = initial_condition
@@ -346,14 +423,18 @@ class Problem:
         self.set_flow_condition(alpha, mach)
         self.set_shape(sample[:n_shape])
         self.sim[self.alpha_var] = np.array([alpha])
+        comm = self.model.mesh_obj.mesh.comm
+        n_before = len(self.wt.data_store.FOM_walltime)      # filled on rank 0 only
         t0 = perf_counter()
         self.sim.run()
-        walltime = perf_counter() - t0
-        comm = self.model.mesh_obj.mesh.comm
+        evaluation_walltime = perf_counter() - t0
+        solve_walltime = comm.bcast(
+            sum(t for _, t in self.wt.data_store.FOM_walltime[n_before:]) if comm.rank == 0 else None,
+            root=0)
         if not self.wt.mesh.is_valid:
             PETSc.Sys.Print("WARNING: [{} {}] inverted cells in the deformed mesh; sample "
                             "ignored".format(self.kind, label))
-            return None, None, walltime
+            return None, None, solve_walltime, evaluation_walltime
         solution = self.model.u_vec.x.petsc_vec.getArray().copy()
         converged = bool(self.model.last_solve_converged)
         finite = comm.allreduce(bool(np.all(np.isfinite(solution))), op=MPI.LAND)
@@ -362,10 +443,10 @@ class Problem:
                 self.kind, label, "did not converge" if finite else "is not finite",
                 "kept (--keep-nonconverged)" if args.keep_nonconverged else "sample ignored"))
             if not args.keep_nonconverged or not finite:
-                return None, None, walltime
+                return None, None, solve_walltime, evaluation_walltime
         if not args.warm_start:
             self.wt.previous_solution = None
-        return solution, np.array(self.sim[self.mesh_motion_var]), walltime
+        return solution, np.array(self.sim[self.mesh_motion_var]), solve_walltime, evaluation_walltime
 
     def coefficients(self, solution_local):
         pp = self.wt.postprocessor
@@ -484,6 +565,7 @@ def write_training_data(args, problem, parameters, snapshots, lower, upper):
             json.dump({"mesh": os.path.abspath(problem.mesh_path), "model": problem.kind,
                        "n_cells": int(np.array(snapshots).shape[1]) if snapshots else 0,
                        "n_state": int(problem.model.n_state),
+                       "shape_layout": problem.shape_layout(),
                        "parameters": np.asarray(parameters).tolist(),
                        "bounds_lower": np.asarray(lower).tolist(),
                        "bounds_upper": np.asarray(upper).tolist(),
@@ -503,6 +585,15 @@ def read_training_data(args, problem):
             or (meta["parameters"] and meta["n_cells"] != n_cells):
         raise ValueError("{} was written for another mesh or model ({}, {} cells, {} state "
                          "components)".format(meta_path, meta["mesh"], meta["n_cells"], meta["n_state"]))
+    # files from before the layout was recorded hold the 2D control-point shape
+    n_parameters = problem.dvs.size + 2
+    if "shape_layout" in meta:
+        same_shape = meta["shape_layout"] == problem.shape_layout()
+    else:
+        same_shape = not meta["parameters"] or len(meta["parameters"][0]) == n_parameters
+    if not same_shape:
+        raise ValueError("{} was sampled with another shape parameterization ({}; this run: {})".format(
+            meta_path, meta.get("shape_layout", "layout not recorded"), problem.shape_layout()))
     if problem.kind == "rans" and meta["reynolds"] != problem.reynolds:
         raise ValueError("{} was solved at Re {} (this run: {})".format(
             meta_path, meta["reynolds"], problem.reynolds))
@@ -542,7 +633,7 @@ def train(args, problems, lower, upper, n_shape):
             if pb.continuation is not None:
                 ic, why = pb.continuation.select(samples[i], samples[i][-1])
                 PETSc.Sys.Print("[{} {}] initial condition: {}".format(kind, label, why))
-            solution, motions, walltime = pb.run_fom(samples[i], n_shape, args, label, ic)
+            solution, motions, walltime, _ = pb.run_fom(samples[i], n_shape, args, label, ic)
             if solution is None:
                 continue
             if pb.continuation is not None:
@@ -562,6 +653,11 @@ def train(args, problems, lower, upper, n_shape):
                 stored[kind][1].append(cells)
     for kind, pb in problems.items():
         write_training_data(args, pb, stored[kind][0], stored[kind][1], lower, upper)
+
+
+# Phase groups that are not part of the flow solve (the shape -> mesh pipeline, file output and the
+# coefficient evaluation): left out of the full-order breakdown, which covers the flow solve alone
+NOT_FLOW_SOLVE = ("mesh", "output", "post")
 
 
 def capture_phase_breakdown():
@@ -587,7 +683,8 @@ def test(args, problems, lower, upper, n_shape):
     # every solve
     first = next(iter(problems.values()))
     first.model.enable_profiling(enabled=args.profiling, barriers=args.profile_barriers, reset=True)
-    breakdowns = {kind: {name: {} for name in ["FOM"] + list(args.variants)} for kind in problems}
+    breakdowns = {kind: {name: {} for name in ["FOM", "FOM evaluation"] + list(args.variants)}
+                  for kind in problems}
     for i in order:
         sample = samples[i]
         label = "test {}/{}".format(i + 1, args.n_test)
@@ -598,20 +695,27 @@ def test(args, problems, lower, upper, n_shape):
             if pb.continuation is not None:
                 ic, why = pb.continuation.select(sample, sample[-1])
                 PETSc.Sys.Print("[{} {}] initial condition: {}".format(kind, label, why))
-            capture_phase_breakdown()                    # start the solve from an empty profile
-            fom, motions, fom_walltime = pb.run_fom(sample, n_shape, args, label, ic)
+            capture_phase_breakdown()                    # start the evaluation from an empty profile
+            fom, motions, fom_walltime, fom_evaluation_walltime = pb.run_fom(
+                sample, n_shape, args, label, ic)
             fom_breakdown = capture_phase_breakdown()
             if fom is None:
                 continue
+            # the breakdown is that of the flow solve, like fom_walltime: without the phases
+            # of the shape -> mesh pipeline, the file output and the coefficient evaluation
+            fom_breakdown = {name: t for name, t in fom_breakdown.items()
+                             if default_group(name) not in NOT_FLOW_SOLVE}
             if comm.rank == 0:
                 breakdowns[kind]["FOM"][i] = (fom_breakdown, fom_walltime)
+                breakdowns[kind]["FOM evaluation"][i] = ({}, fom_evaluation_walltime)
             if pb.continuation is not None:
                 pb.continuation.add(sample, fom)
             pb.wt.mesh.apply_node_motions(motions)
             c_fom = pb.coefficients(fom)
             pb.wt.mesh.reset_nodes()
-            PETSc.Sys.Print("[{} {}] FOM: c_l {:.6f}, c_d {:.6f}, c_m {:.6f} ({:.2f} s)".format(
-                kind, label, c_fom["cl"], c_fom["cd"], c_fom["cm"], fom_walltime))
+            PETSc.Sys.Print("[{} {}] FOM: c_l {:.6f}, c_d {:.6f}, c_m {:.6f} (flow solve {:.2f} s, whole "
+                            "evaluation {:.2f} s)".format(kind, label, c_fom["cl"], c_fom["cd"], c_fom["cm"],
+                                                         fom_walltime, fom_evaluation_walltime))
             for variant, rom in pb.roms.items():
                 ds = pb.results[variant]
                 if comm.rank == 0:
@@ -619,17 +723,20 @@ def test(args, problems, lower, upper, n_shape):
                     ds.FOM_forces.append((i, c_fom["D"], c_fom["L"], c_fom["M"], np.nan))
                     ds.FOM_walltime.append((i, fom_walltime))
                     ds.parameter_vectors_per_iteration.append((i, sample))
-                # Timed (and profiled): the ROM's own share of an evaluation --
-                # deforming the mesh to this design (the warp is reused from
-                # the FOM evaluation), the initial state and the reduced solve
+                # The ROM solve is timed (and profiled) over the scope of the FOM's flow
+                # solve: the initial state, the solver set-up, the (reduced) solve and
+                # releasing the solver. The mesh is deformed to this design first, outside
+                # the timed region, as the shape -> mesh motion is for the FOM.
+                pb.wt.mesh.apply_node_motions(motions)
                 capture_phase_breakdown()
                 t0 = perf_counter()
-                pb.wt.mesh.apply_node_motions(motions)
                 if args.rom_ic == "continuation" and ic is not None:
                     pb.model.set_u_vec(ic)
                 else:
                     pb.model.interpolate_solution_vector(None)
                 result = rom.solve(pb.model, sample)
+                if args.release:
+                    pb.model.release_solver()
                 rom_walltime = perf_counter() - t0
                 rom_breakdown = capture_phase_breakdown()
                 if result is None or not np.all(np.isfinite(result.solution)):
@@ -659,8 +766,6 @@ def test(args, problems, lower, upper, n_shape):
                     ds.absolute_l2_bdry_errors_per_iteration.append((i, errors[2]))
                     ds.relative_l2_bdry_errors_per_iteration.append((i, errors[3]))
                 pb.wt.mesh.reset_nodes()
-                if args.release:
-                    pb.model.release_solver()
     first.model.enable_profiling(enabled=False)
     return breakdowns
 
@@ -708,7 +813,7 @@ def print_summary(args, problems):
                 PETSc.Sys.Print("    {:13s} mean {:.3e}  p50 {:.3e}  p95 {:.3e}  max {:.3e}".format(
                     name, np.mean(v), np.percentile(v, 50), np.percentile(v, 95), np.max(v)))
             if vals["rom_walltime"].size and vals["fom_walltime"].size:
-                PETSc.Sys.Print("    speed-up (mean FOM / mean ROM wall time): {:.2f}".format(
+                PETSc.Sys.Print("    speed-up (mean FOM flow solve / mean ROM solve wall time): {:.2f}".format(
                     np.mean(vals["fom_walltime"]) / np.mean(vals["rom_walltime"])))
     PETSc.Sys.Print("=" * 78)
 
@@ -745,7 +850,7 @@ def plot_metric(args, problems, metric, ylabel, path, fom_reference=False):
             fom = metric_values(problems[kind].results[args.variants[0]])["fom_walltime"]
             if fom.size:
                 ax.axhline(np.mean(fom), color=INK_2, linestyle="--", linewidth=1.2)
-                ax.text(positions[-1] + 0.45, np.mean(fom), "FOM mean", color=INK_2, fontsize=8,
+                ax.text(positions[-1] + 0.45, np.mean(fom), "FOM flow solve, mean", color=INK_2, fontsize=8,
                         ha="right", va="bottom")
         ax.set_yscale("log")
         ax.set_xticks(positions, labels=args.variants)
@@ -806,8 +911,12 @@ def ordered_groups(present):
 
 
 def print_phase_summary(args, breakdowns):
-    PETSc.Sys.Print("\nMean wall time per solve by phase group [s] (share)")
+    PETSc.Sys.Print("\nMean wall time per flow solve by phase group [s] (share)")
     for kind, by_model in breakdowns.items():
+        evaluation = [t for _, t in by_model["FOM evaluation"].values()]
+        if evaluation:
+            PETSc.Sys.Print("  {} FOM, whole evaluation (adds the shape -> mesh motion, mesh deformation, "
+                            "output and coefficients): {:.3g} s".format(kind, np.mean(evaluation)))
         for name in ["FOM"] + list(args.variants):
             means, total = mean_group_breakdown(by_model[name])
             if total == 0.0:
@@ -832,8 +941,8 @@ def plot_phase_breakdown(args, problems, breakdowns, plot_dir):
     if not groups:
         PETSc.Sys.Print("No phase breakdown recorded; skipping the wall-time breakdown plots.")
         return
-    for percent, ylabel, name in ((False, "Mean wall time per solve [s]", "walltime_breakdown_seconds"),
-                                  (True, "Share of the solve wall time [%]", "walltime_breakdown_percent")):
+    for percent, ylabel, name in ((False, "Mean wall time per flow solve [s]", "walltime_breakdown_seconds"),
+                                  (True, "Share of the flow solve wall time [%]", "walltime_breakdown_percent")):
         fig, axes = plt.subplots(1, len(kinds), figsize=(1.2 + 2.8 * len(kinds), 3.8), squeeze=False,
                                  sharey=percent, facecolor=SURFACE)
         for ax, kind in zip(axes[0], kinds):
@@ -893,7 +1002,7 @@ def write_results(args, problems, test_results=True, breakdowns=None):
             ("abs_dcl", r"Absolute $c_l$ error", "cl_absolute_error", False),
             ("abs_dcd", r"Absolute $c_d$ error", "cd_absolute_error", False),
             ("eta", r"ROM residual $\|R\|/\|u\|$", "rom_eta", False),
-            ("rom_walltime", "ROM wall time [s]", "walltime", True)):
+            ("rom_walltime", "ROM solve wall time [s]", "walltime", True)):
         plot_metric(args, problems, metric, ylabel, os.path.join(plot_dir, name + ".png"),
                     fom_reference=ref)
     if breakdowns:
@@ -911,21 +1020,32 @@ def main(argv=None):
     problems = {kind: Problem(kind, args, definition) for kind in args.models}
 
     # The same design points for every model: the shape parameterizations
-    # must agree in size and bounds
+    # must agree in layout, bounds and baseline (both models measure the same
+    # wing from the same mesh in 3D)
     first = next(iter(problems.values()))
-    shape_lower, shape_upper = first.shape_bounds()
+    shape_lower, shape_upper, shape_baseline = first.shape_bounds()
     for pb in problems.values():
-        lo, up = pb.shape_bounds()
-        if lo.shape != shape_lower.shape or not (np.allclose(lo, shape_lower) and np.allclose(up, shape_upper)):
+        lo, up, base = pb.shape_bounds()
+        if pb.shape_layout() != first.shape_layout() or not (
+                np.allclose(lo, shape_lower) and np.allclose(up, shape_upper)
+                and np.allclose(base, shape_baseline)):
             raise ValueError("the {} and {} shape parameterizations differ".format(first.kind, pb.kind))
     n_shape = shape_lower.size
-    lower = np.concatenate([args.cp_motion_sample_scale * shape_lower,
+    # the sampled range: the bounds, scaled about the baseline (zero for the
+    # control-point motions and section deltas, the measured value for the
+    # absolute planform variables)
+    scale = args.shape_sample_scale
+    lower = np.concatenate([shape_baseline + scale * (shape_lower - shape_baseline),
                             [np.radians(args.alpha_lower), args.mach_lower]])
-    upper = np.concatenate([args.cp_motion_sample_scale * shape_upper,
+    upper = np.concatenate([shape_baseline + scale * (shape_upper - shape_baseline),
                             [np.radians(args.alpha_upper), args.mach_upper]])
+    first.shape.print_design_variables(PETSc.Sys.Print)
     span = upper - lower
+    # normalized: every sampled parameter has unit range in the distance (a pinned one, which does
+    # not vary, none)
     parameter_scales = (np.where(span > 0, 1.0 / np.where(span > 0, span, 1.0), 0.0)
                         if args.parameter_distance == "normalized" else None)
+    PETSc.Sys.Print("local_weighted parameter distance: {}".format(args.parameter_distance))
     for pb in problems.values():
         pb.build_roms(args, parameter_scales)
         if args.mach_continuation:
