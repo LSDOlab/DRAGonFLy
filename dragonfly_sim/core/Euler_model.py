@@ -112,6 +112,8 @@ class CompressibleEulerModel():
         self.krylov_type = "gmres"
         self.krylov_diagonal_scale = True
         self.direct_linear_solver = False
+        # relative tolerance of that Krylov solve, set before set_up_solver
+        self.krylov_rtol = 1e-3
 
         # Instantiate the FormManager
         self.forms = FormManager(mesh, model=self,
@@ -654,7 +656,8 @@ class CompressibleEulerModel():
             self.solver.set_step_limiter(limiter)
 
             ksp = self.solver.krylov_solver
-            self.apply_krylov_solver_settings(ksp, monitor_convergence=False, max_it=300)
+            self.apply_krylov_solver_settings(ksp, monitor_convergence=False, max_it=300,
+                                              rtol=self.krylov_rtol)
             self.solver_is_set_up = True
 
             # Print Jacobian matrix block size

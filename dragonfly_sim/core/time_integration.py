@@ -80,7 +80,9 @@ class CFLController:
       no Krylov    an inexact direction never grows CFL
       progress     r < (1 - 1e-3) r_prev: grow by max(r_prev/r, min_growth),
                    capped at max_growth
-      rise         r > 1.05 r_prev: shrink by at least 1/max_growth
+      rise         r > 1.05 r_prev: CFL *= r_prev/r, clipped to
+                   [rise_factor_min, rise_factor_max]; the defaults, 0.1 and
+                   1/max_growth = 0.5, cut it by at least half
       band         otherwise (|R| flat within -0.1%..+5%): grow by
                    band_growth on a clean step (theta = 1), else hold. Holding
                    kept the STW L3 wing at CFL 3.15 for 118 of 152 steps.
@@ -105,6 +107,8 @@ class CFLController:
     theta_cut: float = 0.1
     cfl_min_limited: float = 1e-3
     band_growth: float = 1.2
+    rise_factor_min: float = 0.1
+    rise_factor_max: float = 0.5
     max_frozen_steps: int = 5
     cfl: float = field(init=False)
     frozen_steps: int = field(init=False, default=0)
@@ -131,7 +135,7 @@ class CFLController:
         elif r < (1.0 - 1e-3) * r_prev:
             growth = max(growth, self.min_growth)
         elif r > 1.05 * r_prev:
-            growth = min(growth, 1.0 / self.max_growth)
+            growth = min(max(r_prev / r, self.rise_factor_min), self.rise_factor_max)
         elif theta >= 1.0:
             growth = self.band_growth
         else:

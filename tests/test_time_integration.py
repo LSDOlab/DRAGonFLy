@@ -54,6 +54,25 @@ def test_cfl_controller_decisions():
     assert c.cfl == 10.0
 
 
+def test_cfl_controller_milder_cut_on_a_rise():
+    # default: any rise above 5% at least halves the CFL
+    c = CFLController(cfl0=10.0)
+    c.update(1.0, 1.1)
+    assert c.cfl == pytest.approx(5.0)
+    # milder: the cut is the residual ratio, clipped to [rise_factor_min, rise_factor_max]
+    c = CFLController(cfl0=10.0, rise_factor_min=0.7, rise_factor_max=0.9)
+    c.update(1.0, 1.1)                                                 # 1/1.1 = 0.909 -> clipped to 0.9
+    assert c.cfl == pytest.approx(9.0)
+    c.cfl = 10.0
+    c.update(1.0, 1.25)                                                # 1/1.25 = 0.8: proportional
+    assert c.cfl == pytest.approx(8.0)
+    c.cfl = 10.0
+    c.update(1.0, 3.0)                                                 # large rise: no cut below 0.7
+    assert c.cfl == pytest.approx(7.0)
+    c.cfl = 10.0
+    assert c.update(1.0, 20.0) == (False, False) and c.cfl == pytest.approx(1.0)   # rejection is unchanged
+
+
 def test_cfl_controller_stops_when_frozen():
     # theta = 0 leaves the state unchanged: max_frozen_steps of them in a row exhaust the controller
     c = CFLController(cfl0=5.0, max_frozen_steps=3)
