@@ -25,6 +25,7 @@ import numpy as np
 import ufl
 import dolfinx
 import dolfinx.fem.petsc
+from mpi4py import MPI
 from petsc4py import PETSc
 
 
@@ -188,6 +189,25 @@ class DerivedFieldChainRule:
             # PETSc.garbage_cleanup (several GB for a 3D Green-Gauss gradient)
             B.destroy()
         return g
+
+    def functional_alpha(self, J, key):
+        """dJ/dalpha (total) as a number. Collective."""
+        dJ = self._compiled((key, "alpha"), lambda: None if self.alpha_var is None
+                            else _nonempty(ufl.diff(J, self.alpha_var)))
+        total = 0.0
+        if dJ is not None:
+            total = self.mesh_obj.mesh.comm.allreduce(dolfinx.fem.assemble_scalar(dJ), op=MPI.SUM)
+        for field in self.fields:
+            a = field.alpha_vector()
+            if a is None:
+                continue
+            dJdf = self._partial_field(J, key, field)
+            if dJdf is not None:
+                v = _assemble_vec(dJdf)
+                total += v.dot(a)
+                v.destroy()
+            a.destroy()
+        return total
 
     def functional_mesh(self, J, key):
         """dJ/dx (total) as a Vec on the mesh's coordinate_space."""

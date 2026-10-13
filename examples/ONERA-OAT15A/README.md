@@ -14,4 +14,5 @@ OMP_NUM_THREADS=1 mpirun -n 8 python oat15a_analysis.py --out-dir <output folder
 python oat15a_analysis.py --plot <run folder>/results.csv --figure-dir figures
 ```
 
-`figures/` holds the figures shown on the documentation page.
+`figures/rizzi/` holds the figures of the Rizzi-grid sweep shown on the documentation page, and
+`data/rizzi_results.csv` its results (grids 1-7, all five angles of attack).

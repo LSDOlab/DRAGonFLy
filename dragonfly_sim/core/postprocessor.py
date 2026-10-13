@@ -195,6 +195,15 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
         d_dmesh_shape_1_dim = self.mesh_obj.dof_to_node_map.T@d_dmesh.reshape(-1, self.mesh_obj.mesh.geometry.dim)
         return d_dmesh_shape_1_dim.flatten()
 
+    def _assemble_alpha_derivative(self, form):
+        """d(form)/dalpha at fixed U through the derived fields, e.g. a
+        reconstructed gradient whose boundary facets carry the alpha-dependent
+        far-field state; zero without derived fields. The force directions are
+        Constants (set_angle_of_attack), so their rotation is not part of it."""
+        if not self.sim_model.derived_fields:
+            return 0.0
+        return self.sim_model.alpha_derivative(form)
+
     def compute_force_in_direction(self, u_dof_vec, direction_vec):
         force_density = self._pressure_force_vector(u_dof_vec)
         return ufl.dot(direction_vec, force_density)*self.mesh_obj.form_manager.ds(self.wall_meshtag_val)
@@ -262,7 +271,9 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
             ksp.destroy()
             dcm_du = self.compute_cm_deriv(u_dof_vec)
             local_contribution = float(np.dot(dcm_du, sol.getArray()[:local_size]))
-            return self.mesh_obj.mesh.comm.allreduce(local_contribution, op=MPI.SUM)
+            moment_coeff = (1.0/self.C_infty_moment)*self.compute_moment_form(u_dof_vec)
+            return (self.mesh_obj.mesh.comm.allreduce(local_contribution, op=MPI.SUM)
+                    + self._assemble_alpha_derivative(moment_coeff))
 
         drdu_mat = self.sim_model.assemble_dRdu_mat(u_dof_vec)
         dr_dalpha = self.sim_model.assemble_dRdalpha_vec(u_dof_vec)
@@ -383,13 +394,14 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
         u_vec = input_vals['u_vec']
         alpha = input_vals['alpha'][0]
         deform_array = input_vals['mesh_deformation'] if 'mesh_deformation' in input_vals else None
+        shape_parameters = input_vals['shape_param_inputs'] if 'shape_param_inputs' in input_vals else None
 
         # Update the angle of attack and downstream quantities
         self.set_angle_of_attack(alpha)
 
         # Apply the mesh deformations to the mesh (none in a forward analysis)
         if deform_array is not None:
-            self.mesh_obj.apply_node_motions(deform_array)
+            self.mesh_obj.apply_node_motions(deform_array, design=shape_parameters)
 
         # check whether the mesh and solution on it are valid
         if (self.mesh_obj.is_valid and self.sim_model.last_solve_converged and not np.isnan(np.linalg.norm(u_vec))) or self.testing_mode:
@@ -423,9 +435,6 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
             output_vals['M'], output_vals['c_m'] = 0.0, 0.0
             output_vals['c_m_alpha'] = 0.0
 
-        # reset the mesh to its undeformed state
-        self.mesh_obj.reset_nodes()
-
     def compute_derivatives(self, input_vals, outputs_vals, derivatives):
         # Compute the derivatives of the output quantities w.r.t. the inputs
         PETSc.Sys.Print("starting compute_derivatives in DG_postprocessor...")
@@ -433,13 +442,14 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
         u_vec = input_vals['u_vec']
         alpha = input_vals['alpha'][0]
         deform_array = input_vals['mesh_deformation'] if 'mesh_deformation' in input_vals else None
+        shape_parameters = input_vals['shape_param_inputs'] if 'shape_param_inputs' in input_vals else None
 
         # Update the angle of attack and downstream quantities
         self.set_angle_of_attack(alpha)
 
         # Apply the mesh deformations to the mesh and update geometry-dependent quantities
         if deform_array is not None:
-            self.mesh_obj.apply_node_motions(deform_array)
+            self.mesh_obj.apply_node_motions(deform_array, design=shape_parameters)
         self.refresh_geometry_dependent_reference_quantities()
 
         # Compute all force and moment derivatives w.r.t. the nondimensional state and mesh vertex movement
@@ -452,11 +462,14 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
             derivatives['D', 'mesh_deformation'] = self.compute_D_meshderiv(u_vec)[None, :]
             derivatives['M', 'mesh_deformation'] = self.compute_M_meshderiv(u_vec)[None, :]
 
-        # Compute the force derivatives w.r.t. angle of attack changes; the arithmetic for this looks odd but the math checks out
+        # Compute the force derivatives w.r.t. angle of attack changes at fixed u_vec: the
+        # rotation of the lift and drag directions (dL = -D dalpha, dD = L dalpha), plus
+        # the forces' dependence on alpha through the derived fields
         L_val, _ = self.compute_cl(u_vec)
         D_val, _ = self.compute_cd(u_vec)
-        derivatives['L', 'alpha'] = np.array([[-D_val]], dtype=np.float64)
-        derivatives['D', 'alpha'] = np.array([[ L_val]], dtype=np.float64)
-        derivatives['M', 'alpha'] = np.array([[0.0]], dtype=np.float64)
-
-        self.mesh_obj.reset_nodes()
+        dL = self._assemble_alpha_derivative(self.compute_force_in_direction(u_vec, self.psi_lift))
+        dD = self._assemble_alpha_derivative(self.compute_force_in_direction(u_vec, self.psi_drag))
+        dM = self._assemble_alpha_derivative(self.compute_moment_form(u_vec))
+        derivatives['L', 'alpha'] = np.array([[-D_val + dL]], dtype=np.float64)
+        derivatives['D', 'alpha'] = np.array([[ L_val + dD]], dtype=np.float64)
+        derivatives['M', 'alpha'] = np.array([[dM]], dtype=np.float64)

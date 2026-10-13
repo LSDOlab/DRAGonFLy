@@ -1,3 +1,4 @@
+import os
 import numpy as np
 from matplotlib import pyplot as plt
 
@@ -63,6 +64,11 @@ class DataStore():
         self.absolute_l2_bdry_errors_per_iteration = []
         self.relative_l2_bdry_errors_per_iteration = []
 
+        # Per adjoint solve (one per output row of a derivative evaluation):
+        # (eval_idx, 'rom' or 'fom', wall time). 'rom' is the reduced adjoint
+        # of an accepted ROM solution, 'fom' the full-order adjoint.
+        self.adjoint_solves = []
+
         # Number of DoFs in simulation
         self.fe_dofs = 0
         # Number of design parameters in optimization
@@ -78,6 +84,7 @@ class DataStore():
 
     def write_store_to_numpy_file(self, save_folder="Result_dicts", save_filename="POD_deployment.npy"):
         save_location = save_folder + "/" + save_filename
+        os.makedirs(save_folder, exist_ok=True)
         # create dictionary with all data
         data_dict = self.compile_store_in_dict()
         # save data_dict to location

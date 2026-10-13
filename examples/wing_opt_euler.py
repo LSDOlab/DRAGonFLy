@@ -2,7 +2,7 @@
 Drag minimization of the Simple Transonic Wing with the Euler model: planform
 (sweep, aspect ratio, span, taper) and section (thickness and camber modes at
 three spanwise stations) design variables plus the angle of attack, at
-M 0.8. The RANS counterpart is wing_opt_rans.py.
+M 0.75. The RANS counterpart is wing_opt_rans.py.
 
     OMP_NUM_THREADS=1 mpirun -n 8 python wing_opt_euler.py
 """
@@ -21,6 +21,7 @@ from dragonfly_sim.utils.mesh_manager_utils import wing_inner_bdry_function
 from dragonfly_sim.utils.mesh_io_utils import load_dolfinx_mesh
 from dragonfly_sim.core.windtunnel_model import DG_windtunnel_model
 from dragonfly_sim.core.Euler_model import CompressibleEulerModel
+from dragonfly_sim.core.MUSCL_Euler_model import MUSCLEulerModel
 from dragonfly_sim.core.postprocessor import DG_postprocessor
 
 from dragonfly_sim.utils.ffd_dv_utils import spanwise_linear_bounds
@@ -54,7 +55,14 @@ if __name__ == '__main__':
 
     # Inlet flow conditions
     rho_0 = 1.0
-    M_0 = 0.8
+    M_0 = 0.75
+
+    # Inviscid flux discretization. False: the first-order p = 0 scheme (HLL on
+    # the cell averages), whose numerical dissipation dominates the drag and
+    # scales with the wetted area. True: MUSCL (Green-Gauss reconstruction,
+    # core/MUSCL_Euler_model.py), second order, with pseudo-transient
+    # continuation and the condensed Jacobian, as in the RANS model.
+    muscl = True
     p_0 = 1.0
     attack = np.radians(2)
 
@@ -126,12 +134,27 @@ if __name__ == '__main__':
                                            np.array([0.25, 0., 0.], dtype=np.double),
                                            mesh_inner_bdry_function=wing_inner_bdry_function,
                                            poly_order=poly_o, gamma=1.4,
-                                           filename_suffix="wing_opt_euler_L3mesh_p=0_M=0_8",
-                                           asm_overlap=1, ilu_levels=1,
-                                           model_class=CompressibleEulerModel)
+                                           filename_suffix="wing_opt_euler{}_L3mesh_p=0_M=0_75".format(
+                                               "_muscl" if muscl else ""),
+                                           asm_overlap=1, ilu_levels=2 if muscl else 1,
+                                           model_class=MUSCLEulerModel if muscl else CompressibleEulerModel)
+    if muscl:
+        # pseudo-transient continuation from the free stream needs more steps
+        # than a plain Newton solve
+        csdl_euler_model.max_newton_iterations = 400
+    # The c_m_alpha log is monitoring only; it costs a linear solve per evaluation
+    csdl_euler_model.log_cm_alpha = False
+    # No per-evaluation mesh_deformation file; the solution files are still written
+    csdl_euler_model.write_mesh_deformation = False
+    # One solution frame per design (CSDL evaluates each design twice)
+    csdl_euler_model.write_once_per_design = True
+    # Free the solver's matrices after each forward solve (rebuilt when next
+    # needed), as in wing_opt_rans.py
+    csdl_euler_model.release_solver_memory = True
     csdl_euler_model.set_up_sim()
 
     csdl_coeff_model = DG_postprocessor(csdl_euler_model.mesh, csdl_euler_model.sim_model, csdl_euler_model.WALL_TAG, np.array([0.25, 0., 0.], dtype=np.double), p_inf_dim=101325.)
+    csdl_coeff_model.log_cm_alpha = False
 
     # Shape design variables first (all of them as one flat vector), then alpha
     shape_param_vector = shape.declare_design_variables()
@@ -173,9 +196,16 @@ if __name__ == '__main__':
         # (the optimizer never sees a dimensional value, regardless of 
         # p_inf_dim/L_ref_dim -- those only scale the console printout in 
         # compute())
+        # Lower bound: the lift of the undeformed wing at these conditions
+        # (M 0.75, alpha 2 deg), from a converged forward solve
+        # first order (2026-10-08: 8 Newton steps to |R| 3.0e-10; c_l 0.34803, c_d 0.047778)
+        L_baseline = 6.240966914666039
+        if muscl:
+            # MUSCL (2026-10-08: 80 PTC steps to |R| 7.4e-10; c_l 0.53780, c_d 0.012229)
+            L_baseline = 9.64391809932878
         L_constraint = L
         L_constraint.add_name('L_limit')
-        L_constraint.set_as_constraint(lower=10.)
+        L_constraint.set_as_constraint(lower=L_baseline)
 
     # Geometric constraints. The wing's planform quantities follow directly from
     # its variables (shape.outputs()['wing']: area, span, semi_span, root_chord,
@@ -206,23 +236,25 @@ if __name__ == '__main__':
     # PETSc.Sys.Print("finished sim run")
     
     # test accuracy of simulation object
-    print("Starting check_totals...")
-    sim.check_totals(step_size=1e-6)
+    # print("Starting check_totals...")
+    # sim.check_totals(step_size=1e-6)
 
-    # PETSc.Sys.Print("Defining optimization problem...")
+    PETSc.Sys.Print("Defining optimization problem...")
 
-    # prob = CSDLAlphaProblem(problem_name='shape_opt',simulator=sim)
-    # # # optimizer = COBYLA(prob, solver_options={'maxiter':400, 'catol':1e-6, 'rhobeg': 0.025}, turn_off_outputs=True)
+    prob = CSDLAlphaProblem(problem_name='shape_opt',simulator=sim)
+    # optimizer = COBYLA(prob, solver_options={'maxiter':400, 'catol':1e-6, 'rhobeg': 0.025}, turn_off_outputs=True)
 
-    # optimizer = SLSQP(prob, solver_options={'ftol':1e-8, 'maxiter':150})
-    # # # optimizer = PySLSQP(prob, solver_options={'acc':1e-8, 'maxiter':100})
+    # modopt writes its outputs into a timestamped folder that every rank would
+    # create at once (a FileExistsError race): only rank 0 writes them
+    optimizer = SLSQP(prob, solver_options={'ftol':1e-8, 'maxiter':150},
+                      turn_off_outputs=mesh_from_file.comm.Get_rank() != 0)
+    # optimizer = PySLSQP(prob, solver_options={'acc':1e-8, 'maxiter':100})
 
-    # PETSc.Sys.Print("Solving optimization problem...")
+    PETSc.Sys.Print("Solving optimization problem...")
 
-    # optimizer.solve()
+    optimizer.solve()
 
-    # # save data store file
-    # if mesh_from_file.comm.Get_rank() == 0:
-    #     csdl_euler_model.data_store.write_store_to_numpy_file(save_filename="SLSQP_{}.npy".format(csdl_euler_model.filename_suffix))
-    # csdl_euler_model.data_store.write_store_to_numpy_file(save_filename="SLSQP_L3mesh_cpgrid=10x5x2_p=0_test_M=0_85.npy")
-    # optimizer.print_results()
+    # save data store file
+    if mesh_from_file.comm.Get_rank() == 0:
+        csdl_euler_model.data_store.write_store_to_numpy_file(save_filename="SLSQP_{}.npy".format(csdl_euler_model.filename_suffix))
+    optimizer.print_results()

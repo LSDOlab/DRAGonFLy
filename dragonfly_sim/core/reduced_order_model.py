@@ -42,18 +42,57 @@ outer loop): passes of at most newton_max_it iterations, each stopping on
 ||g|| = ||(S A V)^T S r|| < max(atol, rtol ||g_0||), on a negligible step, or on
 a stall of ||g||; up to max_outer_iterations passes, converged when a pass
 ends with ||g|| < g_conv_limit.
+
+Derivatives. The ROM solves the LSPG stationarity condition, the projected
+residual equations
+
+    Phi^T R(V a; x) = 0,    Phi = S^T S A V,
+
+so when its solution is accepted the adjoint is that of these k equations
+(ReducedOrderModel.adjoint, an LSPGAdjoint). With V, S and Phi frozen at the
+solution (the basis is not differentiated, and the Gauss-Newton terms, which
+are proportional to S R, are dropped), for an output f with g = (df/du)^T:
+
+    (S A V)^T (S A V) lam = V^T g,    psi = Phi lam = S^T S A V lam,
+
+and df/dx = df/dx|_u - psi^T dR/dx with the full-order dR/dx: psi takes the
+place of the full-order adjoint A^-T g. It is the Petrov-Galerkin solution of
+A^T psi = g in the span of Phi, tested with V: V^T (A^T psi - g) = 0. psi is
+computed as S Q y with S A V = Q R (a distributed thin QR) and R^T y = V^T g,
+without forming the normal matrix, whose condition number is squared.
 """
 from dataclasses import dataclass
 from time import perf_counter
 
 import numpy as np
+import scipy.linalg as sp_la
 from mpi4py import MPI
 from petsc4py import PETSc
 
 from dragonfly_sim.core.pod import PODBasis
-from dragonfly_sim.utils.pod_utils import DiagonalWeight
+from dragonfly_sim.utils.pod_utils import DiagonalWeight, tsqr
 from dragonfly_sim.utils.derived_fields import diagonal_mass_inverse
 from dragonfly_sim.utils.solver_profiling import PROFILER as _PROF
+
+
+def scaled_jacobian_basis(model, V, S, AV=None):
+    """
+    S A V at the model's current u_vec, A the exact Jacobian assembled by its
+    Newton problem (problem.J). Returns (this rank's rows of S A V, the PETSc
+    product A V); `AV`, if given, is a product of the same shape to reuse.
+    Without S the rows are a view of AV's array.
+    """
+    problem = model.problem
+    problem.J(model.u_vec.x.petsc_vec, problem._A)
+    A = problem._A
+    if AV is None:
+        AV = A.matMult(V)
+    else:
+        A.matMult(V, result=AV)
+    SAV = AV.getDenseArray()
+    if S is not None:
+        SAV = S.getArray(readonly=True)[:, None] * SAV
+    return SAV, AV
 
 
 class LSPGSolver:
@@ -143,23 +182,14 @@ class LSPGSolver:
     def _reduced_system(self, model):
         """(H, g, ||S r||) with H = (S A V)^T (S A V), g = (S A V)^T S r at the
         current u_vec."""
-        problem = model.problem
         r, r_norm = self._weighted_residual(model)
-        problem.J(model.u_vec.x.petsc_vec, problem._A)
-        A = problem._A
+        if self._AV is not None and self._AV.getSize()[1] != self.V.getSize()[1]:
+            self._AV.destroy()
+            self._AV = None
         with _PROF.phase("rom:project"):
-            if self._AV is not None and self._AV.getSize()[1] != self.V.getSize()[1]:
-                self._AV.destroy()
-                self._AV = None
-            if self._AV is None:
-                self._AV = A.matMult(self.V)
-            else:
-                A.matMult(self.V, result=self._AV)
-            AV = self._AV.getDenseArray()
-            if self.S is not None:
-                AV = self.S.getArray(readonly=True)[:, None] * AV
-            H = self.comm.allreduce(AV.T @ AV, op=MPI.SUM)
-            g = self.comm.allreduce(AV.T @ r, op=MPI.SUM)
+            SAV, self._AV = scaled_jacobian_basis(model, self.V, self.S, self._AV)
+            H = self.comm.allreduce(SAV.T @ SAV, op=MPI.SUM)
+            g = self.comm.allreduce(SAV.T @ r, op=MPI.SUM)
         return H, g, r_norm
 
     def solve(self, model):
@@ -259,6 +289,107 @@ class LSPGSolver:
         return theta
 
 
+class LSPGAdjoint:
+    """
+    The adjoint of an accepted LSPG solution (Derivatives in the module
+    docstring): psi = S Q y, with S A V = Q R and R^T y = V^T g, for the basis
+    V and residual weight S of that solve. The factorization is formed by the
+    first solve() and reused for every later right-hand side (CSDL passes one
+    per output row). It belongs to one design and state; matches() checks
+    both.
+
+    Parameters
+    ----------
+    V : PETSc.Mat
+        The basis of the solve (owned by the POD, not by this object).
+    S : PETSc.Vec or None
+        The diagonal residual weight of the solve; destroyed with this object.
+    parameter_vector, solution
+        The design and this rank's owned entries of the accepted solution.
+    """
+
+    def __init__(self, V, S, comm, parameter_vector, solution):
+        self.V = V
+        self.S = S
+        self.comm = comm
+        self.parameter_vector = np.array(parameter_vector, dtype=float).ravel()
+        self.solution = np.array(solution, dtype=float)
+        self._Q = None
+        self._R = None
+
+    @property
+    def rb_size(self):
+        return self.V.getSize()[1]
+
+    def matches(self, parameter_vector, u_local):
+        """Whether this is the adjoint at design `parameter_vector` and state
+        `u_local` (owned entries): both equal to the accepted solve's on every
+        rank. Collective."""
+        pv = np.asarray(parameter_vector, dtype=float).ravel()
+        local = bool(np.array_equal(pv, self.parameter_vector)
+                     and np.array_equal(np.asarray(u_local, dtype=float), self.solution))
+        return self.comm.allreduce(local, op=MPI.LAND)
+
+    def _factor(self, model):
+        """Q, R of S A V, A the steady Jacobian at the model's current u_vec."""
+        model.set_up_solver()
+        with model.steady_residual():
+            SAV, AV = scaled_jacobian_basis(model, self.V, self.S)
+            self._Q, self._R = tsqr(self.comm, SAV)
+        AV.destroy()
+        diag = np.abs(np.diag(self._R))
+        if not np.all(np.isfinite(self._R)) or diag.min() <= np.finfo(float).eps * diag.max():
+            raise ValueError("reduced adjoint: S A V is singular to working precision "
+                             "(|R_ii| from {:.3e} to {:.3e})".format(diag.min(), diag.max()))
+
+    def solve(self, model, rhs_local):
+        """
+        psi (this rank's owned entries) for the right-hand side g, rhs_local
+        being its owned entries. The model's u_vec, mesh and angle of attack
+        must be those of the accepted solution (the first call assembles the
+        Jacobian there). Collective.
+        """
+        first = self._Q is None
+        if first:
+            self._factor(model)
+        rhs = np.asarray(rhs_local, dtype=float)
+        b = self.comm.allreduce(self.V.getDenseArray().T @ rhs, op=MPI.SUM)
+        y = sp_la.solve_triangular(self._R, b, trans='T', lower=False)
+        psi = self._Q @ y
+        if self.S is not None:
+            psi = self.S.getArray(readonly=True) * psi
+        psi_norm = np.sqrt(self.comm.allreduce(float(psi @ psi), op=MPI.SUM))
+        if not np.isfinite(psi_norm):
+            raise ValueError("reduced adjoint: non-finite solution")
+        if first:
+            diag = np.abs(np.diag(self._R))
+            PETSc.Sys.Print("reduced (LSPG) adjoint: basis width {}, |R_ii| from {:.3e} to {:.3e}, "
+                            "Petrov-Galerkin residual |V^T (A^T psi - g)| / |V^T g| = {:.3e}".format(
+                                self.rb_size, diag.min(), diag.max(),
+                                self._galerkin_residual(model, psi, rhs, b)))
+        else:
+            PETSc.Sys.Print("reduced (LSPG) adjoint: reused the factorization, |psi| = {:.6e}".format(psi_norm))
+        return psi
+
+    def _galerkin_residual(self, model, psi, rhs, b):
+        """|V^T (A^T psi - g)| / |V^T g|, with the Jacobian _factor assembled
+        (zero up to round-off)."""
+        A = model.problem._A
+        x, Atx = A.createVecLeft(), A.createVecRight()
+        x.array[:] = psi
+        A.multTranspose(x, Atx)
+        res = self.comm.allreduce(self.V.getDenseArray().T @ (Atx.array - rhs), op=MPI.SUM)
+        x.destroy()
+        Atx.destroy()
+        return float(np.linalg.norm(res) / max(np.linalg.norm(b), 1e-300))
+
+    def destroy(self):
+        if self.S is not None:
+            self.S.destroy()
+            self.S = None
+        self._Q = self._R = None
+
+
 @dataclass
 class ROMResult:
     solution: np.ndarray       # this rank's owned entries of the ROM state
@@ -310,6 +441,9 @@ class ReducedOrderModel:
       run_fom_every_evaluation
                          also run the FOM when the ROM is accepted (benchmarking;
                          the accepted output stays the ROM's)
+
+    After an accepted solve, `adjoint` is its LSPGAdjoint (None otherwise),
+    valid until the next solve.
     """
 
     def __init__(self, rb_size=20, basis_mode='global', max_rank=None, qr_rank_tol=1e-10,
@@ -351,6 +485,7 @@ class ReducedOrderModel:
         self.W = None
         self.scales = None
         self.last_solver = None
+        self.adjoint = None
 
     # ------------------------------------------------------------------
     # Set-up and weights
@@ -425,13 +560,21 @@ class ReducedOrderModel:
         self.pod.snapshot_matrix.print_info()
         return added
 
+    def discard_adjoint(self):
+        """Drop the adjoint of the last accepted solve. Collective."""
+        if self.adjoint is not None:
+            self.adjoint.destroy()
+            self.adjoint = None
+
     def solve(self, model, parameter_vector):
         """
         The ROM solution at parameter_vector, starting from the model's
         current u_vec (projected onto the basis); u_vec holds it afterwards.
         Returns a ROMResult, or None when there are fewer than min_snapshots
-        snapshots. Collective.
+        snapshots. When the solution is accepted, `adjoint` is its adjoint;
+        any earlier one is discarded first. Collective.
         """
+        self.discard_adjoint()
         if self.n_snapshots < self.min_snapshots:
             PETSc.Sys.Print("ROM: {} snapshot(s) stored, {} needed; skipping the ROM solve".format(
                 self.n_snapshots, self.min_snapshots))
@@ -480,10 +623,12 @@ class ReducedOrderModel:
             else:
                 PETSc.Sys.Print("ROM: {} LSPG passes without |g| < {:.1e} (last |g| {:.6e})".format(
                     self.max_outer_iterations, self.g_conv_limit, solver.last_g_norm))
-        finally:
-            solver.destroy()
+        except BaseException:
             if S is not None:
                 S.destroy()
+            raise
+        finally:
+            solver.destroy()
         self.last_solver = solver
         solver.n_iterations = iterations
 
@@ -496,9 +641,16 @@ class ReducedOrderModel:
                            walltime=perf_counter() - t0)
         PETSc.Sys.Print("ROM relative residual norm eta: {} (||r||: {}); {} iterations, wall time {}".format(
             eta, residual_norm, iterations, result.walltime))
+        if result.accepted:
+            # the basis stays valid until the next solve rebuilds it, which
+            # discards this adjoint first
+            self.adjoint = LSPGAdjoint(self.pod.basis, S, comm, parameter_vector, result.solution)
+        elif S is not None:
+            S.destroy()
         return result
 
     def destroy(self):
+        self.discard_adjoint()
         if self.pod is not None:
             self.pod.destroy()
             self.pod = None

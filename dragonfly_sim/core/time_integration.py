@@ -32,6 +32,7 @@ builds them at all (the plain Newton solve is unchanged).
 from dataclasses import dataclass, field
 
 import numpy as np
+from mpi4py import MPI
 from petsc4py import PETSc
 import ufl
 import dolfinx
@@ -90,6 +91,12 @@ class CFLController:
     CFL stays within [floor, cfl_max]; the floor is cfl_min_limited after a
     limited step and min(cfl_min, CFL) otherwise, so a CFL below cfl_min
     regrows by the usual rule instead of jumping back to cfl_min.
+
+    exhausted: CFL fell below 1e-6 cfl0 after rejections, or the last
+    max_frozen_steps steps all had theta = 0. A step with theta = 0 leaves the
+    state unchanged, so once a cell sits at the positivity floor every later
+    step repeats it; without this stop PTC spent its whole step budget frozen
+    (OAT15A, Cadence grid level 1: ~950 identical steps at CFL cfl_min_limited).
     """
     cfl0: float = 5.0
     cfl_max: float = 1e12
@@ -101,16 +108,20 @@ class CFLController:
     theta_cut: float = 0.1
     cfl_min_limited: float = 1e-3
     band_growth: float = 1.2
+    max_frozen_steps: int = 5
     cfl: float = field(init=False)
+    frozen_steps: int = field(init=False, default=0)
 
     def __post_init__(self):
         self.reset()
 
     def reset(self):
         self.cfl = float(self.cfl0)
+        self.frozen_steps = 0
 
     def update(self, r_prev, r, ksp_ok=True, theta=1.0):
         """Returns (accept, limited). Updates self.cfl."""
+        self.frozen_steps = self.frozen_steps + 1 if theta <= 0.0 else 0
         limited = theta < self.theta_cut
         if not np.isfinite(r) or r > self.reject_factor * r_prev:
             self.cfl *= self.cut
@@ -134,7 +145,7 @@ class CFLController:
 
     @property
     def exhausted(self):
-        return self.cfl < 1e-6 * self.cfl0
+        return self.cfl < 1e-6 * self.cfl0 or self.frozen_steps >= self.max_frozen_steps
 
 
 @dataclass
@@ -242,6 +253,8 @@ class TimeIntegrator:
         self.step_index = 0
         self.dt_prev = None
         self.verbose = True
+        # (state, CFL) at the end of the last converged steady solve
+        self._steady_end = None
 
     # -- helpers ---------------------------------------------------------
     def _print(self, *args):
@@ -253,10 +266,28 @@ class TimeIntegrator:
         dst.x.scatter_forward()
 
     # -- steady PTC ------------------------------------------------------
+    def _warm_start_cfl(self):
+        """The final CFL of the last converged steady solve if the state now in
+        u_vec is that solve's end state (the warm start of an optimization
+        step), else None. Collective."""
+        end = self._steady_end
+        if end is None:
+            return None
+        u = self.model.u_vec.x.array
+        same = end[0].shape == u.shape and bool(np.array_equal(end[0], u))
+        return end[1] if self.model.mesh_obj.mesh.comm.allreduce(same, op=MPI.MIN) else None
+
     def solve_steady(self, controller=None, max_steps=None, tol=None):
         """
         Pseudo-transient continuation to the steady state from the current
         u_vec. Returns the model's physical residual Vec.
+
+        With model.ptc_warm_start (default) and no explicit controller, a
+        start from the end state of the previous converged steady solve
+        continues at that solve's final CFL: the design (or alpha) has moved
+        a little, so the flow is near its new steady state, and ramping the
+        CFL up from cfl0 again would only repeat the early steps. A step
+        that is too bold is rejected and the CFL cut, as always.
         """
         m = self.model
         if self.term.physical:
@@ -267,6 +298,11 @@ class TimeIntegrator:
         if self.boundary_updaters:
             raise RuntimeError("time-dependent boundary conditions (riemann2) have no steady state")
         ctrl = controller if controller is not None else CFLController(**m.ptc_settings)
+        if controller is None and getattr(m, "ptc_warm_start", False):
+            warm_cfl = self._warm_start_cfl()
+            if warm_cfl is not None:
+                ctrl.cfl = float(min(max(warm_cfl, ctrl.cfl), ctrl.cfl_max))
+                self._print("[ptc] warm start: continuing at CFL {:.3e}".format(ctrl.cfl))
         tol = m.residual_conv_limit if tol is None else tol
         max_steps = int(m.max_newton_iterations if max_steps is None else max_steps)
         m._ensure_residual_vector()
@@ -300,10 +336,15 @@ class TimeIntegrator:
                 continue
             m.solver_converged = r < tol
             r_prev = r
+            if ctrl.exhausted:
+                self._print("[ptc]   no update for {} steps (positivity limiter theta = 0); "
+                            "stopping".format(ctrl.frozen_steps))
+                break
         m.solver.max_it = max_it_saved
         if not m.solver_converged:
             self._print("WARNING: PTC stopped after {} steps at |R| = {:.6e}".format(it, r_prev))
         self.last_steady_steps = it
+        self._steady_end = ((m.u_vec.x.array.copy(), ctrl.cfl) if m.solver_converged else None)
         m._assemble_physical_residual()
         m.u_vec.x.scatter_forward()
         return m.residual_vec_physical

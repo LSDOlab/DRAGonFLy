@@ -74,7 +74,8 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
 
         reduced_order_model: a core.reduced_order_model.ReducedOrderModel to
         try before every flow solve (see _solve), or None for full-order
-        solves only.
+        solves only. Where its solution is accepted, the derivatives use the
+        adjoint of its projected equations (see apply_inverse_jacobian).
         """
         super().__init__()
 
@@ -153,6 +154,10 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
 
         # POD reduced-order model (None: full-order solves only)
         self.reduced_order_model = reduced_order_model
+        # (parameter vector, converged) of the last evaluation if the FOM
+        # solved it, else None: a re-evaluation of that design skips the ROM
+        # (see _solve)
+        self._fom_design = None
 
         # Naming suffix for exported files
         self.filename_suffix = filename_suffix
@@ -440,13 +445,15 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
             PETSc.Sys.Print("mesh_node_motions 2-norm: {}".format(np.linalg.norm(mesh_node_motions)))
 
             # Apply the mesh node motions to the mesh
-            self.mesh.apply_node_motions(mesh_node_motions)
+            self.mesh.apply_node_motions(mesh_node_motions, design=shape_parameters)
 
         # If the mesh is not valid (e.g. has inverted cells), set the output to zero and don't run any simulations
         if not self.mesh.is_valid:
             PETSc.Sys.Print("Mesh is not valid, skipping simulations.")
             output_vals['u_vec'] = np.zeros((self.sim_model.u_vec.x.petsc_vec.local_size,))
-            self.mesh.reset_nodes()
+            self._fom_design = None
+            if self.reduced_order_model is not None:
+                self.reduced_order_model.discard_adjoint()
             return
 
         # re-define the current weak form if necessary
@@ -486,8 +493,6 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
                                                      solution_array=solution_output)
             self._last_written_design = design
 
-        self.mesh.reset_nodes()
-
         # Explicitly collect garbage and cleanup PETSc objects
         gc.collect()
         PETSc.garbage_cleanup(self.mesh.mesh.comm)
@@ -511,23 +516,37 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         Without a reduced-order model this is the full-order (FOM) solve from
         the warm start. With one, the ROM is tried first (once it holds enough
         snapshots), from the warm start projected onto the basis, and its
-        solution is accepted when eta = ||R||/||u|| < eta_threshold. Otherwise
-        the FOM solves from the warm start exactly as without a ROM, and its
-        solution, if converged and finite, becomes a snapshot at
-        `parameter_vector`.
+        solution is accepted when eta = ||R||/||u|| < eta_threshold; the ROM
+        then holds the adjoint of that solution (rom.adjoint), which
+        apply_inverse_jacobian uses. Otherwise the FOM solves from the warm
+        start exactly as without a ROM, and its solution, if converged and
+        finite, becomes a snapshot at `parameter_vector`.
+
+        A re-evaluation of the design the FOM solved last skips the ROM: the
+        FOM restarts from its own solution (no Newton steps if that
+        converged), so the design keeps the FOM solution and the full-order
+        adjoint. CSDL re-runs the model before every derivative evaluation,
+        and by then the ROM would reproduce that solution, now a snapshot, and
+        accept it.
         """
         rom = self.reduced_order_model
         if rom is None:
             return self._run_fom_solve()
+        rom.discard_adjoint()
 
-        self.sim_model.interpolate_solution_vector(self.previous_solution)
-        rom_result = rom.solve(self.sim_model, parameter_vector)
-        rom_forces = None
-        if rom_result is not None:
-            rom_forces = self._log_rom_solve(rom_result)
+        repeat = self._fom_design is not None and np.array_equal(parameter_vector, self._fom_design[0])
+        rom_result = rom_forces = None
+        if repeat:
+            PETSc.Sys.Print("Re-evaluating the design the FOM solved last: skipping the ROM")
+        else:
+            self.sim_model.interpolate_solution_vector(self.previous_solution)
+            rom_result = rom.solve(self.sim_model, parameter_vector)
+            if rom_result is not None:
+                rom_forces = self._log_rom_solve(rom_result)
         accept_rom = rom_result is not None and rom_result.accepted
         if accept_rom and not rom.run_fom_every_evaluation:
             PETSc.Sys.Print("Accepting ROM solution")
+            self._fom_design = None
             return rom_result.solution, True
 
         solution_fom, fom_converged = self._run_fom_solve()
@@ -535,11 +554,15 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
             self._log_rom_error(rom_forces)
         if accept_rom:
             PETSc.Sys.Print("Accepting ROM solution (FOM run for comparison)")
+            self._fom_design = None
             return rom_result.solution, True
 
         PETSc.Sys.Print("Accepting FOM solution")
         finite = self.mesh.mesh.comm.allreduce(bool(np.all(np.isfinite(solution_fom))), op=MPI.LAND)
-        if fom_converged and finite:
+        converged = fom_converged and finite
+        if converged and repeat and self._fom_design[1]:
+            PETSc.Sys.Print("The snapshot of this design is already stored")
+        elif converged:
             self.sim_model.set_u_vec(solution_fom)
             rom.add_snapshot(self.sim_model, parameter_vector)
             sigma = rom.snapshot_singular_values()
@@ -547,6 +570,7 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
                 self.data_store.global_snapshot_sing_vals_per_iteration += [(self.eval_idx, sigma)]
         else:
             PETSc.Sys.Print("Not adding a ROM snapshot: the FOM solve did not converge")
+        self._fom_design = (np.array(parameter_vector, dtype=float), converged)
         return solution_fom, fom_converged
 
     def _log_rom_solve(self, result):
@@ -594,8 +618,13 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         self.sim_model.interpolate_solution_vector(initial_condition)
 
         # solve the FOM
-        self.sim_model.set_up_solver()
-        residual_norm = self.sim_model.solve_system().norm()
+        # an incoming state that already meets the convergence criterion
+        # needs no solver (SNES, KSP/PC, matrices): skip building it
+        if self.sim_model.incoming_state_converged():
+            residual_norm = self.sim_model.residual_vec_physical.norm()
+        else:
+            self.sim_model.set_up_solver()
+            residual_norm = self.sim_model.solve_system().norm()
         fom_converged = self.sim_model.solver_converged
         eta = self.sim_model.relative_residual_norm(residual_norm)
         solution_fom = self.sim_model.u_vec.x.petsc_vec.getArray().copy()
@@ -631,6 +660,7 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         print("starting apply_inverse_jacobian in DG_windtunnel_model...")
 
         mesh_node_motions = input_vals['mesh_node_motions'] if 'mesh_node_motions' in input_vals else None
+        shape_parameters = input_vals['shape_parameters'] if 'shape_parameters' in input_vals else None
         alpha = input_vals['alpha'][0]
         u_vec = outputs['u_vec'] # numpy array
 
@@ -642,19 +672,27 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
             # and the corresponding solution that we are linearizing around
             if mesh_node_motions is not None:
                 PETSc.Sys.Print("apply_inverse_jacobian, stepping into mesh.apply_node_motions")
-                self.mesh.apply_node_motions(mesh_node_motions)
+                self.mesh.apply_node_motions(mesh_node_motions, design=shape_parameters)
             self.sim_model.set_angle_of_attack(alpha)
             self.sim_model.compute_weakform()
             self.sim_model.set_u_vec(u_vec)
+
+            rom = self.reduced_order_model
+            if (rom is not None and rom.adjoint is not None
+                    and rom.adjoint.matches(self._parameter_vector(shape_parameters, alpha), u_vec)):
+                # The accepted solution is the ROM's: the adjoint of its
+                # projected (LSPG) equations, lifted to the full state, which
+                # compute_jacvec_product then uses like the full-order one
+                d_residuals['u_vec'] = rom.adjoint.solve(self.sim_model, d_outputs['u_vec'])
+                self._log_adjoint("rom", pre_apply_inverse_jacobian_time)
+                return
 
             if self.sim_model.has_condensed_jacobian:
                 self._condensed_adjoint(d_outputs, d_residuals)
                 if self.release_solver_memory:
                     self.sim_model.release_solver()
-                self.mesh.reset_nodes()
                 PETSc.garbage_cleanup()
-                PETSc.Sys.Print("apply_inverse_jacobian total time: {}".format(
-                    perf_counter() - pre_apply_inverse_jacobian_time))
+                self._log_adjoint("fom", pre_apply_inverse_jacobian_time)
                 return
 
             self._drdu_mat = self.sim_model.assemble_dRdu_mat()
@@ -717,14 +755,17 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
 
             PETSc.garbage_cleanup()
 
-            self.mesh.reset_nodes()
-
-            post_apply_inverse_jacobian_time = perf_counter()
-            total_apply_inverse_jacobian_time = post_apply_inverse_jacobian_time - pre_apply_inverse_jacobian_time
-
-            PETSc.Sys.Print("apply_inverse_jacobian total time: {}".format(total_apply_inverse_jacobian_time))
+            self._log_adjoint("fom", pre_apply_inverse_jacobian_time)
         else:
             raise ValueError("Reverse mode required")
+
+    def _log_adjoint(self, kind, start_time):
+        # which adjoint ('rom' or 'fom') the derivative of the last evaluation
+        # used, and its wall time
+        walltime = perf_counter() - start_time
+        if self.mesh.mesh.comm.Get_rank() == 0:
+            self.data_store.adjoint_solves += [(self.eval_idx - 1, kind, walltime)]
+        PETSc.Sys.Print("apply_inverse_jacobian total time ({} adjoint): {}".format(kind, walltime))
 
     def _condensed_adjoint(self, d_outputs, d_residuals):
         """The adjoint solve for a model whose dR/dU is a condensed product
@@ -757,6 +798,7 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         print("starting compute_jacvec_product in DG_windtunnel_model...")
 
         mesh_node_motions = input_vals['mesh_node_motions'] if 'mesh_node_motions' in input_vals else None
+        shape_parameters = input_vals['shape_parameters'] if 'shape_parameters' in input_vals else None
         alpha = input_vals['alpha'][0]
         u_vec = outputs['u_vec'] # numpy array
 
@@ -767,7 +809,7 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
             # apply the angle of attack and compute the weak form
             if mesh_node_motions is not None:
                 PETSc.Sys.Print("compute_jacvec_product, stepping into mesh.apply_node_motions")
-                self.mesh.apply_node_motions(mesh_node_motions)
+                self.mesh.apply_node_motions(mesh_node_motions, design=shape_parameters)
             self.sim_model.set_angle_of_attack(alpha)
             self.sim_model.compute_weakform()
 
@@ -809,8 +851,6 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
                     # a fresh chained operator per call (not cached): free it now
                     destroy_chained_operator(dr_dxmesh)
 
-                self.mesh.reset_nodes()
-
                 PETSc.Sys.Print("d_input norm: {}".format(d_input.norm()))
 
                 d_input_cg1 = d_input.getArray().reshape(-1, self.mesh.mesh.geometry.dim)   # (N_CG1_dofs, gdim)
@@ -818,10 +858,6 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
                 d_inputs['mesh_node_motions'] = d_input_geom
 
                 PETSc.garbage_cleanup()
-            else:
-                # The mesh branch above owns the reset; without it, an
-                # alpha-only reverse pass would leave the mesh deformed.
-                self.mesh.reset_nodes()
         else:
             raise ValueError("Reverse mode required")
         
