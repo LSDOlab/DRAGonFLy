@@ -308,6 +308,58 @@ def test_windtunnel_accepts_the_rom_between_snapshots(in_tmp_dir, kind, eta_thre
         assert m.relative_residual_norm(m._assemble_physical_residual()) < eta_threshold
 
 
+@pytest.mark.parametrize("kind, eta_threshold", [("euler", 1e-9), ("rans", 1e-7)])
+def test_windtunnel_rom_adjoint(in_tmp_dir, kind, eta_threshold):
+    """
+    dD/dalpha through CSDL with a ROM. At 2.3 degrees the ROM (two snapshots)
+    is rejected and the FOM solves; compute_totals re-runs that design, which
+    then skips the ROM and takes the full-order adjoint. At 2.45 degrees (three
+    snapshots) the ROM is accepted, the derivative takes the reduced adjoint,
+    and it matches central differences of the ROM's own solves (accepted at
+    both points; the global basis is fixed).
+    """
+    import csdl_alpha as csdl
+    recorder = csdl.Recorder(inline=False)
+    recorder.start()
+    rom = ReducedOrderModel(rb_size=5, eta_threshold=eta_threshold)
+    wt = make_windtunnel(kind, rom=rom, suffix="adjoint")
+    wt.postprocessor.log_cm_alpha = False
+    alpha = csdl.Variable(name='alpha', value=np.array([np.radians(ALPHAS[0])]))
+    alpha.set_as_design_variable()
+    u_vec = wt.evaluate(alpha=alpha)
+    out = wt.postprocessor.evaluate(u_vec, alpha=alpha)
+    out.D.set_as_objective()
+    recorder.stop()
+    sim = csdl.experimental.JaxSimulator(recorder, gpu=False)
+    root = MPI.COMM_WORLD.rank == 0
+    ds = wt.data_store
+
+    for a in ALPHAS[:3]:
+        sim[alpha] = np.array([np.radians(a)])
+        sim.run()
+    assert rom.n_snapshots == 3 and rom.adjoint is None
+    sim.compute_totals()
+    assert rom.n_snapshots == 3 and rom.adjoint is None
+    if root:
+        assert [acc for _, acc in ds.ROM_meets_threshold] == [False]
+        fom_kinds = [k for _, k, _ in ds.adjoint_solves]
+        assert fom_kinds and set(fom_kinds) == {"fom"}
+
+    a = np.radians(ALPHAS[4])
+    sim[alpha] = np.array([a])
+    sim.run()
+    dD = float(np.asarray(sim.compute_totals()[out.D, alpha]).ravel()[0])
+    assert rom.adjoint is not None
+    h = 1e-5
+    fd = (wt.solve_forward(a + h)[2]["D"] - wt.solve_forward(a - h)[2]["D"]) / (2 * h)
+    PETSc.Sys.Print("ROM-ADJOINT-CHECK {}: dD/dalpha {:.12f}, FD of the ROM solves {:.12f}".format(
+        kind, dD, fd))
+    if root:
+        assert [acc for _, acc in ds.ROM_meets_threshold] == [False] + [True] * 4
+        assert set(k for _, k, _ in ds.adjoint_solves[len(fom_kinds):]) == {"rom"}
+    assert abs(fd - dD) < 1e-6 * abs(fd), (fd, dD)
+
+
 def test_windtunnel_falls_back_to_the_fom(in_tmp_dir):
     """eta_threshold 0 never accepts the ROM: every evaluation is the FOM
     from the same warm start, identical to a windtunnel without a ROM (to the
@@ -353,7 +405,9 @@ class _LinearModel:
         from types import SimpleNamespace
         rng = np.random.default_rng(seed)
         self.n_state = n_state
-        x = PETSc.Vec().createMPI((PETSc.DECIDE, n), comm=comm)
+        # blocks of n_state per "cell", like a flow state (the state scaling
+        # repeats per block)
+        x = PETSc.Vec().createMPI((PETSc.DECIDE, n), bsize=n_state, comm=comm)
         rs, re = x.getOwnershipRange()
         K = PETSc.Mat().createAIJ(size=((re - rs, n), (re - rs, n)), nnz=(3, 3), comm=comm)
         K.setUp()
@@ -367,6 +421,7 @@ class _LinearModel:
         self.u_vec = SimpleNamespace(x=SimpleNamespace(petsc_vec=x, scatter_forward=lambda: None))
         self.problem = _LinearProblem(K, f, self.u_vec)
         self.mesh_obj = SimpleNamespace(mesh=SimpleNamespace(comm=comm))
+        self.functionspaces = {"V": None}          # read, but unused, by the Euclidean weights
         self.steady_residual = contextlib.nullcontext
         self.rng, self.n, self.rs, self.re = rng, n, rs, re
 
@@ -388,8 +443,8 @@ class _LinearModel:
         return full_norm / self.u_vec.x.petsc_vec.norm()
 
 
-def _linear_rom(model, k=4, **kw):
-    rom = ReducedOrderModel(rb_size=k, inner_product="euclidean", state_scaling=None, **kw)
+def _linear_rom(model, k=4, state_scaling=None, **kw):
+    rom = ReducedOrderModel(rb_size=k, inner_product="euclidean", state_scaling=state_scaling, **kw)
     rom.set_up(model)
     x = model.u_vec.x.petsc_vec
     for j in range(k):
@@ -436,3 +491,64 @@ def test_outer_passes_and_absolute_g_limit():
     result = rom.solve(model, np.array([0.5]))
     assert result.iterations == 3
     assert not result.converged
+
+
+# ----------------------------------------------------------------------
+# The reduced (LSPG) adjoint
+# ----------------------------------------------------------------------
+def test_tsqr_matches_numpy_qr():
+    """Thin QR of a 7 x 4 matrix split by rows: on 3 ranks every block has
+    fewer rows than columns."""
+    from dragonfly_sim.utils.pod_utils import tsqr
+    comm = MPI.COMM_WORLD
+    X = np.random.default_rng(3).standard_normal((7, 4))
+    Q_local, R = tsqr(comm, X[np.array_split(np.arange(7), comm.size)[comm.rank]])
+    Q = np.vstack(comm.allgather(Q_local))
+    np.testing.assert_allclose(Q @ R, X, atol=1e-13)
+    np.testing.assert_allclose(Q.T @ Q, np.eye(4), atol=1e-13)
+    np.testing.assert_array_equal(np.triu(R), R)
+    np.testing.assert_allclose(np.abs(R), np.abs(np.linalg.qr(X)[1]), rtol=1e-12, atol=1e-13)
+
+
+def test_reduced_adjoint_is_the_lspg_adjoint():
+    """
+    The adjoint of an accepted LSPG solution of R(u) = K u - f, with a state
+    scaling (S != I). R is linear, so the reduced adjoint psi is the exact
+    derivative of the ROM output: with dR/df = -I, the change of g^T u_rom
+    under f -> f + df is psi^T df. psi solves the Petrov-Galerkin projection
+    V^T (K^T psi - g) = 0, differs from the full-order adjoint K^-T g, and a
+    second right-hand side reuses the factorization.
+    """
+    comm = MPI.COMM_WORLD
+    model = _LinearModel(comm)
+    n_J = []
+    J = model.problem.J
+    model.problem.J = lambda x, A: (n_J.append(1), J(x, A))
+    rom = _linear_rom(model, state_scaling=[1.0, 10.0, 0.1], eta_threshold=np.inf)
+    result = rom.solve(model, np.array([0.5]))
+    assert result.accepted and rom.adjoint is not None
+    u0 = global_array(comm, result.solution)
+    s = global_array(comm, rom.adjoint.S.getArray())
+    assert s.max() / s.min() == pytest.approx(100.0)
+
+    g = np.random.default_rng(21).standard_normal(model.n)[model.rs:model.re]
+    calls = len(n_J)
+    psi = rom.adjoint.solve(model, g)
+    assert len(n_J) == calls + 1
+    np.testing.assert_allclose(rom.adjoint.solve(model, -2.0 * g), -2.0 * psi, rtol=1e-14, atol=1e-14)
+    assert len(n_J) == calls + 1
+
+    K = model.problem.K
+    Kd = np.column_stack([global_array(comm, _matvec(K, np.eye(model.n)[:, j], model))
+                          for j in range(model.n)])
+    V = np.vstack(comm.allgather(rom.pod.basis.getDenseArray().copy()))
+    psi, g = global_array(comm, psi), global_array(comm, g)
+    assert np.linalg.norm(V.T @ (Kd.T @ psi - g)) <= 1e-12 * np.linalg.norm(V.T @ g)
+    psi_fom = np.linalg.solve(Kd.T, g)
+    assert np.linalg.norm(psi - psi_fom) > 0.1 * np.linalg.norm(psi_fom)
+
+    # the derivative of the ROM output itself: re-solve with a perturbed f
+    df = np.random.default_rng(22).standard_normal(model.n)
+    model.problem.f.array[:] += df[model.rs:model.re]
+    u1 = global_array(comm, rom.solve(model, np.array([0.5])).solution)
+    assert g @ (u1 - u0) == pytest.approx(psi @ df, rel=1e-9)

@@ -1207,6 +1207,14 @@ class CompressibleEulerModel():
         self.update_derived_fields()
         return self._chain.functional_state(form, self._form_key(form))
 
+    def alpha_derivative(self, form):
+        """dJ/dalpha of a scalar functional J at fixed U: its explicit alpha
+        dependence plus that of the derived fields (e.g. a reconstructed
+        gradient reading the alpha-dependent far-field states). A number.
+        Collective."""
+        self.update_derived_fields()
+        return self._chain.functional_alpha(form, self._form_key(form))
+
     def mesh_derivative(self, form):
         """dJ/dx of a scalar functional J through the derived fields: a Vec on
         the mesh's coordinate_space."""

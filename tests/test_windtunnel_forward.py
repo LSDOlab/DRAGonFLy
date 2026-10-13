@@ -127,7 +127,10 @@ def rans_alpha_derivative(release, alphas):
 def test_release_solver_memory_gives_the_same_rans_derivatives(in_tmp_dir):
     """release_solver_memory frees the flow solver after every forward solve and
     the condensed dR/dU after every adjoint; both are rebuilt when next needed,
-    so values and adjoint derivatives are unchanged."""
+    so values and adjoint derivatives are unchanged. And the derivatives match
+    central differences of forward solves: the wall's end cells touch the far
+    field, so the drag also depends on alpha through the reconstructed
+    gradient (the postprocessor's alpha partial)."""
     alphas = [np.radians(2.0), np.radians(2.5)]
     _, kept = rans_alpha_derivative(False, alphas)
     wt, released = rans_alpha_derivative(True, alphas)
@@ -136,6 +139,9 @@ def test_release_solver_memory_gives_the_same_rans_derivatives(in_tmp_dir):
     for (D, dD), (D_r, dD_r) in zip(kept, released):
         assert abs(D_r - D) <= 1e-10 * abs(D), (D, D_r)
         assert abs(dD_r - dD) <= 1e-8 * abs(dD), (dD, dD_r)
+    a, h = alphas[-1], 1e-6
+    fd = (wt.solve_forward(a + h)[2]["D"] - wt.solve_forward(a - h)[2]["D"]) / (2 * h)
+    assert abs(fd - released[-1][1]) < 1e-5 * abs(fd), (fd, released[-1][1])
 
 
 @pytest.mark.parametrize("once", [False, True])

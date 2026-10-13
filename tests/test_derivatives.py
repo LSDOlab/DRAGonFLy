@@ -128,6 +128,23 @@ def test_functional_state_and_mesh_derivatives(case):
     assert abs((Jp - Jm) / (2 * eps) - an) < 1e-7 * abs(an)
 
 
+def test_functional_alpha_derivative(case):
+    """dJ/dalpha at fixed U: the drag reads the reconstructed gradient, whose
+    boundary facets in the wall's end cells carry the alpha-dependent
+    far-field state."""
+    model, u0, _ = case
+    eps = 1e-6
+    vals = []
+    for a in (ALPHA + eps, ALPHA - eps):
+        model.set_angle_of_attack(a)
+        vals.append(_J(model))
+    model.set_angle_of_attack(ALPHA)
+    fd = (vals[0] - vals[1]) / (2 * eps)
+    an = model.alpha_derivative(_drag(model))
+    assert abs(an) > 1e-6
+    assert abs(fd - an) < 1e-7 * abs(an), (fd, an)
+
+
 def test_wall_distance_and_its_mesh_derivative(case):
     model, _, dX = case
     wd = model.wall_distance

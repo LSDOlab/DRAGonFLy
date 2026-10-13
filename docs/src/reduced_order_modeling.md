@@ -20,8 +20,8 @@ for alpha in alphas:
 ```
 
 The same applies inside a CSDL graph (`evaluate`), where the snapshot parameters are the shape parameters and
-the angle of attack. Only the forward solve is reduced. The adjoint is the full-order adjoint at the accepted
-state.
+the angle of attack. Where the ROM solution is accepted, the derivatives use the adjoint of the reduced
+equations (see Derivatives below). Elsewhere they use the full-order adjoint.
 
 ## One evaluation
 
@@ -111,6 +111,51 @@ The stopping rules are those of the original POD benchmark (`newton_*`, `stall_*
 
 $\|g\|$ is the LSPG stationarity residual. The projected residual $V^T r$ does not vanish at the LSPG
 solution, so it is not tested. Acceptance is decided separately, by $\eta$ against `eta_threshold`.
+
+## Derivatives
+
+The LSPG solution solves the $k$ projected residual equations
+
+$$
+\Phi^T R(V a; x) = 0, \qquad \Phi = S^T S A V,
+$$
+
+the stationarity condition of $\min_a \|S R(Va; x)\|$, with $x$ the shape parameters and the angle of attack.
+When this solution is accepted, the adjoint of an output $f$ is the adjoint of these equations, with $V$, $S$
+and $\Phi$ frozen at the solution:
+
+$$
+(S A V)^T (S A V)\, \lambda = V^T g, \qquad \psi = \Phi \lambda = S^T S A V \lambda, \qquad
+\frac{df}{dx} = \frac{\partial f}{\partial x} - \psi^T \frac{\partial R}{\partial x},
+$$
+
+with $g = (\partial f/\partial u)^T$. The reduced matrix is the Gauss-Newton matrix of the forward solve. The
+lifted adjoint $\psi$ takes the place of the full-order adjoint $A^{-T} g$, and the rest of the derivative
+($\partial R/\partial \alpha$ and $\partial R/\partial x_\text{mesh}$, then the mesh warping) is unchanged.
+$\psi$ is the Petrov-Galerkin solution of $A^T \psi = g$ in the span of $\Phi$, tested with $V$:
+$V^T (A^T \psi - g) = 0$. A Galerkin ROM ($\Phi = V$) would give $V^T A^T V \lambda = V^T g$ and $\psi = V \lambda$
+instead. `DG_windtunnel_model.apply_inverse_jacobian` computes $\psi = S Q y$ from a distributed thin QR
+$S A V = Q R$ and $R^T y = V^T g$, so it never forms the normal matrix, whose condition number is squared.
+This costs one Jacobian assembly and $k$ products with it, and no Krylov solve. CSDL passes one right-hand
+side per output, and every output after the first reuses the factorization. `DataStore.adjoint_solves`
+records which adjoint each derivative used.
+
+This is the derivative of the reduced equations with the basis held fixed. Two kinds of terms are left out:
+
+- The exact linearization of the stationarity condition also has second-derivative terms of $R$ contracted
+  with $z = S^T S R(u_r)$, the weighted residual at the ROM solution:
+  $V^T \big(\sum_i z_i \nabla^2_{uu} R_i\big) V$ in the reduced matrix, and
+  $\partial_x \big(z^T A(u; x) V\lambda\big)$ in the derivative. With `inner_product="l2"`, $S$ also depends
+  on the mesh. These terms are linear in the residual of the accepted solution, so they are of relative size
+  $O(\eta)$.
+- For `basis_mode="local_weighted"` the basis depends on $x$ through the snapshot weights, and that dependence
+  is not differentiated. For `"global"` the basis is fixed.
+
+CSDL re-runs the model before every derivative evaluation, so each design is evaluated at least twice. A
+re-evaluation of the design that the full-order model solved last skips the ROM. The full-order solve restarts
+from its own converged solution, so it takes no Newton steps, and the derivative is the full-order adjoint. By
+then that solution is a snapshot, and the ROM would reproduce it and be accepted. A design the ROM solved keeps
+the ROM and its reduced adjoint.
 
 ## What to expect
 
