@@ -52,6 +52,11 @@ class DataStore():
         self.rom_coefficient_errors = []
         self.global_snapshot_sing_vals_per_iteration = []
 
+        # Per adjoint solve (one per output row of a derivative evaluation):
+        # (eval_idx, 'rom' or 'fom', wall time). 'rom' is the reduced adjoint
+        # of an accepted ROM solution, 'fom' the full-order adjoint.
+        self.adjoint_solves = []
+
         # Number of DoFs in simulation
         self.fe_dofs = 0
         # Number of design parameters in optimization

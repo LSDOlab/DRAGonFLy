@@ -1,7 +1,8 @@
 """
 Helpers for core/pod.py: PETSc dense-matrix plumbing for the distributed
 snapshot SVD, and the compact-support cubic weight function of the
-local_weighted basis.
+local_weighted basis. Also the distributed thin QR (tsqr) of the reduced
+adjoint in core/reduced_order_model.py.
 
 Storage convention (see core/pod.py:SnapshotMatrix):
 
@@ -85,6 +86,30 @@ def replicated_transpose_product(comm, V, x_local):
     """V^T x as a numpy array on every rank, for a distributed MATDENSE V
     and this rank's owned entries x_local of a vector in V's row layout."""
     return comm.allreduce(V.getDenseArray().T @ x_local, op=MPI.SUM)
+
+
+def tsqr(comm, X_local):
+    """
+    Thin QR, X = Q R, of a tall matrix X (N x k) distributed by rows,
+    X_local being this rank's rows (TSQR): each rank factors its block, the
+    k x k factors are gathered in rank order and factored once more.
+
+    Returns (Q_local, R): this rank's rows of Q (Q^T Q = I) and the k x k
+    upper-triangular R, identical on every rank (every rank factors the same
+    gathered stack). A rank with fewer than k rows (or none) pads its factor
+    with zero rows.
+    """
+    n_local, k = X_local.shape
+    Q1 = np.zeros((n_local, k))
+    R1 = np.zeros((k, k))
+    if n_local > 0:
+        q, r = np.linalg.qr(X_local, mode='reduced')
+        m = r.shape[0]
+        Q1[:, :m] = q
+        R1[:m, :] = r
+    Q2, R = np.linalg.qr(np.vstack(comm.allgather(R1)), mode='reduced')
+    rank = comm.Get_rank()
+    return Q1 @ Q2[rank * k:(rank + 1) * k, :], R
 
 
 class DiagonalWeight:

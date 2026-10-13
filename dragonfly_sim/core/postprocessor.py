@@ -195,6 +195,15 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
         d_dmesh_shape_1_dim = self.mesh_obj.dof_to_node_map.T@d_dmesh.reshape(-1, self.mesh_obj.mesh.geometry.dim)
         return d_dmesh_shape_1_dim.flatten()
 
+    def _assemble_alpha_derivative(self, form):
+        """d(form)/dalpha at fixed U through the derived fields, e.g. a
+        reconstructed gradient whose boundary facets carry the alpha-dependent
+        far-field state; zero without derived fields. The force directions are
+        Constants (set_angle_of_attack), so their rotation is not part of it."""
+        if not self.sim_model.derived_fields:
+            return 0.0
+        return self.sim_model.alpha_derivative(form)
+
     def compute_force_in_direction(self, u_dof_vec, direction_vec):
         force_density = self._pressure_force_vector(u_dof_vec)
         return ufl.dot(direction_vec, force_density)*self.mesh_obj.form_manager.ds(self.wall_meshtag_val)
@@ -262,7 +271,9 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
             ksp.destroy()
             dcm_du = self.compute_cm_deriv(u_dof_vec)
             local_contribution = float(np.dot(dcm_du, sol.getArray()[:local_size]))
-            return self.mesh_obj.mesh.comm.allreduce(local_contribution, op=MPI.SUM)
+            moment_coeff = (1.0/self.C_infty_moment)*self.compute_moment_form(u_dof_vec)
+            return (self.mesh_obj.mesh.comm.allreduce(local_contribution, op=MPI.SUM)
+                    + self._assemble_alpha_derivative(moment_coeff))
 
         drdu_mat = self.sim_model.assemble_dRdu_mat(u_dof_vec)
         dr_dalpha = self.sim_model.assemble_dRdalpha_vec(u_dof_vec)
@@ -451,9 +462,14 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
             derivatives['D', 'mesh_deformation'] = self.compute_D_meshderiv(u_vec)[None, :]
             derivatives['M', 'mesh_deformation'] = self.compute_M_meshderiv(u_vec)[None, :]
 
-        # Compute the force derivatives w.r.t. angle of attack changes; the arithmetic for this looks odd but the math checks out
+        # Compute the force derivatives w.r.t. angle of attack changes at fixed u_vec: the
+        # rotation of the lift and drag directions (dL = -D dalpha, dD = L dalpha), plus
+        # the forces' dependence on alpha through the derived fields
         L_val, _ = self.compute_cl(u_vec)
         D_val, _ = self.compute_cd(u_vec)
-        derivatives['L', 'alpha'] = np.array([[-D_val]], dtype=np.float64)
-        derivatives['D', 'alpha'] = np.array([[ L_val]], dtype=np.float64)
-        derivatives['M', 'alpha'] = np.array([[0.0]], dtype=np.float64)
+        dL = self._assemble_alpha_derivative(self.compute_force_in_direction(u_vec, self.psi_lift))
+        dD = self._assemble_alpha_derivative(self.compute_force_in_direction(u_vec, self.psi_drag))
+        dM = self._assemble_alpha_derivative(self.compute_moment_form(u_vec))
+        derivatives['L', 'alpha'] = np.array([[-D_val + dL]], dtype=np.float64)
+        derivatives['D', 'alpha'] = np.array([[ L_val + dD]], dtype=np.float64)
+        derivatives['M', 'alpha'] = np.array([[dM]], dtype=np.float64)
