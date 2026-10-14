@@ -39,12 +39,11 @@ def in_tmp_dir(tmp_path):
 
 
 def make_windtunnel():
-    wt = DG_windtunnel_model(jittered_square(8), BC, mesh_inner_bdry_function=bottom_wall,
+    wt = DG_windtunnel_model(jittered_square(8), BC, moments=[("pitch", (0.25, 0.), "pitch")],
+                             mesh_inner_bdry_function=bottom_wall,
                              poly_order=0, filename_suffix="test_forward")
     wt.euler_residual_conv_limit = 1e-12
-    wt.log_cm_alpha = False
     wt.set_up_sim()
-    wt.postprocessor.log_cm_alpha = False
     return wt
 
 
@@ -53,7 +52,8 @@ def test_forward_analysis_without_csdl(in_tmp_dir):
     assert wt.ffd is None and wt.mesh_warper is None
     u, converged, forces = wt.solve_forward()
     assert converged
-    assert set(forces) >= {"L", "D", "M", "c_l", "c_d", "c_m"}
+    assert set(forces) >= {"L", "D", "c_l", "c_d", "moments"}
+    assert set(forces["moments"]["pitch"]) == {"M", "c_m"}
     # forces_and_coefficients agrees with the postprocessor's own assemblies
     L, c_l = wt.postprocessor.compute_cl(u)
     assert forces["L"] == L and forces["c_l"] == c_l
@@ -98,10 +98,8 @@ def rans_alpha_derivative(release, alphas):
                              model_class=CompressibleRANSModel, model_kwargs={'Re': 1e3})
     wt.euler_residual_conv_limit = 1e-12
     wt.max_newton_iterations = 400
-    wt.log_cm_alpha = False
     wt.release_solver_memory = release
     wt.set_up_sim()
-    wt.postprocessor.log_cm_alpha = False
     alpha = csdl.Variable(name='alpha', value=np.array([BC['inlet']['alpha']]))
     alpha.set_as_design_variable()
     u_vec = wt.evaluate(alpha=alpha)
@@ -156,10 +154,8 @@ def test_solution_file_fields_and_write_once_per_design(once, in_tmp_dir, monkey
                              poly_order=0, filename_suffix="test_fields",
                              model_class=CompressibleRANSModel, model_kwargs={'Re': 1e3})
     wt.max_newton_iterations = 400
-    wt.log_cm_alpha = False
     wt.write_once_per_design = once
     wt.set_up_sim()
-    wt.postprocessor.log_cm_alpha = False
     flow = wt.sim_model.flow
     writer = flow.fom_solution_writer
     assert writer.field_names == ["density", "momentum", "energy", "rho_nu_tilde",
@@ -207,10 +203,8 @@ def test_muscl_euler_alpha_derivative(in_tmp_dir):
                              poly_order=0, filename_suffix="test_muscl", model_class=MUSCLEulerModel)
     wt.euler_residual_conv_limit = 1e-12
     wt.max_newton_iterations = 400
-    wt.log_cm_alpha = False
     wt.release_solver_memory = True
     wt.set_up_sim()
-    wt.postprocessor.log_cm_alpha = False
     assert wt.sim_model.has_condensed_jacobian and wt.sim_model.face_traces is not None
     alpha = csdl.Variable(name='alpha', value=np.array([BC['inlet']['alpha']]))
     alpha.set_as_design_variable()

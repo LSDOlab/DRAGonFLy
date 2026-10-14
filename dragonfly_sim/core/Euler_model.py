@@ -882,10 +882,11 @@ class CompressibleEulerModel():
             return np.nan
         return full_norm / u_norm
 
-    def solve_linearized(self, rhs, out, transpose=False, prefix="lin_", rtol=1e-10,
-                         atol=1e-11, max_it=1000, gmres_restart=200, release_operands=False):
+    def linearized_solver(self, transpose=False, prefix="lin_", rtol=1e-10,
+                          atol=1e-11, max_it=1000, gmres_restart=200, release_operands=False,
+                          matrix_free=False, ksp_options=None):
         """
-        Solve dR/dU x = rhs (or its transpose, for the adjoint) at the
+        The KSP of dR/dU x = rhs (or its transpose, for the adjoint) at the
         current state, for models whose dR/dU is a condensed product
         (has_condensed_jacobian). FGMRES on the exact operator, right
         preconditioned with ASM/ILU of the compact A_UU part -- the forward
@@ -893,9 +894,18 @@ class CompressibleEulerModel():
         The transposes are formed explicitly. With release_operands and
         transpose, the condensed dR/dU (and its blocks) is freed once the
         transposes exist, before the preconditioner is set up: only the
-        transposes are used from then on (release_solver). Returns the KSP
-        (iterations, residual norm and reason are read off it).
+        transposes are used from then on (release_solver). The KSP holds its
+        operators and, after its first solve, the preconditioner's factors, so
+        it solves any number of right-hand sides at this state; the caller
+        destroys it. Collective.
+
+        matrix_free (with transpose): the operator is the python Mat of
+        TransposedCondensedOperator, A_UU^T x + B^T (A_UG^T x), which never
+        forms A or the product A_UG B; its context owns the matrices and is
+        destroyed with destroy_adjoint_operator(ksp).
         """
+        if transpose and matrix_free:
+            return self._matrix_free_adjoint_solver(prefix, rtol, atol, max_it, gmres_restart, ksp_options)
         A = self.assemble_dRdu_mat()
         P = self._dRdu_condensed.A_UU
         if transpose:
@@ -915,6 +925,72 @@ class CompressibleEulerModel():
                                               monitor_convergence=False, rtol=rtol, atol=atol)
         finally:
             self.krylov_type, self.krylov_diagonal_scale = saved
+        self._apply_ksp_options(ksp, ksp_options)
+        return ksp
+
+    @staticmethod
+    def _apply_ksp_options(ksp, ksp_options):
+        """Override KSP settings through the PETSc options DB, after the model's own:
+        a dict of option names without the prefix, e.g. {"ksp_type": "dgmres",
+        "ksp_gmres_restart": 400}. An option the PETSc build does not know (a KSP type
+        it was not built with) raises a PETSc error."""
+        if not ksp_options:
+            return
+        opts, prefix = PETSc.Options(), ksp.getOptionsPrefix()
+        for key, value in ksp_options.items():
+            opts[prefix + key] = value
+        ksp.setFromOptions()
+
+    def _matrix_free_adjoint_solver(self, prefix, rtol, atol, max_it, gmres_restart, ksp_options=None):
+        from dragonfly_sim.utils.gradient_condensation import TransposedCondensedOperator
+        self.update_derived_fields()
+        rec = self.reconstruction
+        forms = rec.compact_forms(self.F)
+        A_UU = dolfinx.fem.petsc.create_matrix(forms[0])
+        A_UG = dolfinx.fem.petsc.create_matrix(forms[1])
+        for M, a in ((A_UU, forms[0]), (A_UG, forms[1])):
+            M.zeroEntries()
+            dolfinx.fem.petsc.assemble_matrix(M, a)
+            M.assemble()
+        P = A_UU.transpose(PETSc.Mat())
+        A_UU.destroy()
+        gradient = rec.gradient
+        B = gradient.state_jacobian()
+        ctx = TransposedCondensedOperator(P, A_UG, B, gradient.discard)
+        A = ctx.create_mat(self.mesh_obj.mesh.comm)
+        self._return_freed_memory()
+        ksp = PETSc.KSP().create(self.mesh_obj.mesh.comm)
+        ksp.setOptionsPrefix(prefix)
+        ksp.setOperators(A, A if self.direct_linear_solver else P)
+        saved = (self.krylov_type, self.krylov_diagonal_scale)
+        self.krylov_type, self.krylov_diagonal_scale = "fgmres", False
+        try:
+            self.apply_krylov_solver_settings(ksp, max_it=max_it, gmres_restart=gmres_restart,
+                                              monitor_convergence=False, rtol=rtol, atol=atol)
+        finally:
+            self.krylov_type, self.krylov_diagonal_scale = saved
+        self._apply_ksp_options(ksp, ksp_options)
+        return ksp
+
+    @staticmethod
+    def destroy_adjoint_operator(ksp):
+        """Destroy a KSP of linearized_solver and, for a matrix-free one, what
+        its operator's context owns."""
+        A = ksp.getOperators()[0]
+        ksp.destroy()
+        if A.getType() == PETSc.Mat.Type.PYTHON:
+            A.destroy()                  # PETSc calls the context's destroy(mat)
+
+    def release_derived_caches(self):
+        """Free what the derived fields cache between calls (Jacobians kept
+        while the state, alpha and mesh are unchanged). Collective."""
+        for f in self.derived_fields:
+            f.release_cache()
+
+    def solve_linearized(self, rhs, out, **kwargs):
+        """Solve dR/dU x = rhs once (see linearized_solver for the arguments):
+        returns the KSP (iterations, residual norm and reason are read off it)."""
+        ksp = self.linearized_solver(**kwargs)
         ksp.solve(rhs, out)
         return ksp
 

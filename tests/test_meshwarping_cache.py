@@ -22,10 +22,9 @@ def warper(in_tmp_dir):  # noqa: F811
     recorder = csdl.Recorder(inline=False)
     recorder.start()
     shape = FFDShapeParameterization([5, 3], [2, 2], layers=[ControlPointMotions({1: 0.01})])
-    wt = DG_windtunnel_model(jittered_square(8), BC, shape, np.array([0.25, 0.]),
+    wt = DG_windtunnel_model(jittered_square(8), BC, shape,
                              mesh_inner_bdry_function=bottom_wall,
                              poly_order=0, filename_suffix="test_warp_cache")
-    wt.log_cm_alpha = False
     wt.write_mesh_deformation = False
     wt.set_up_sim()
     mw = wt.mesh_warper

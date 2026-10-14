@@ -22,6 +22,11 @@
   mesh, with `solve_forward()` outside CSDL or `evaluate(alpha=...)` in a graph; `DG_postprocessor` computes
   forces and coefficients without FFD definitions (`forces_and_coefficients`, `evaluate` without a mesh
   deformation).
+- Moments about any number of points and directions: `DG_windtunnel_model(moments=[(name, point, direction), ...])`
+  and `DG_postprocessor(moments=...)` give CSDL outputs `M_<name>` (differentiated) and `c_m_<name>`, e.g. a
+  wing's root bending moment and pitching moment in one simulation. **Breaking:** `aero_center` and the outputs
+  `M`, `c_m` and `c_m_alpha` (with `log_cm_alpha`) are removed; the old pitching moment is
+  `("pitch", aero_center, "pitch")`. The FOM/ROM coefficient histories hold one $c_m$ per moment.
 - Partition-independent checkpoints; `examples/flow_analysis.py`, `examples/airfoil_analysis.py` and
   `examples/rans_airfoil_opt.py`.
 - Mesh input from structured multi-block CGNS grids one cell thick (`utils/mesh_io_utils.py`:

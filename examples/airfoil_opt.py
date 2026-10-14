@@ -69,8 +69,11 @@ if __name__ == '__main__':
     recorder = csdl.Recorder(inline=False)
     recorder.start()
 
+    # Moments of the wall force (see DG_postprocessor): the pitching moment about the quarter chord
+    moments = [("pitch", (0.25, 0.), "pitch")]
+
     csdl_euler_model = DG_windtunnel_model(mesh_from_file, boundary_dict, shape,
-                                           np.array([0.25, 0.], dtype=np.double),
+                                           moments=moments,
                                            mesh_inner_bdry_function=airfoil_inner_bdry_function,
                                            poly_order=poly_o, gamma=1.4,
                                            filename_suffix="derivatives_meshwarping_2D_SLSQP_quadgrid_M=0_8_p=1",
@@ -78,7 +81,7 @@ if __name__ == '__main__':
 
     csdl_euler_model.set_up_sim()
 
-    csdl_coeff_model = DG_postprocessor(csdl_euler_model.mesh, csdl_euler_model.sim_model, csdl_euler_model.WALL_TAG, np.array([0.25, 0.], dtype=np.double), p_inf_dim=101325.)
+    csdl_coeff_model = DG_postprocessor(csdl_euler_model.mesh, csdl_euler_model.sim_model, csdl_euler_model.WALL_TAG, moments=moments, p_inf_dim=101325.)
 
     # Shape design variables first (all of them as one flat vector), then alpha
     shape_param_vector = shape.declare_design_variables()
@@ -95,16 +98,14 @@ if __name__ == '__main__':
 
     u_vec = csdl_euler_model.evaluate(mesh_nodes_deformation, shape_param_vector, alpha)
     outputs = csdl_coeff_model.evaluate(u_vec, mesh_nodes_deformation, alpha, shape_param_vector)
-    # c_l/c_d/c_m are MONITORED ONLY -- no gradient is supplied for them (see
+    # c_l/c_d/c_m_<name> are MONITORED ONLY -- no gradient is supplied for them (see
     # DG_postprocessor.evaluate), so they must not become a constraint or
-    # objective. L/D/M are the differentiated, nondimensional quantities used
+    # objective. L/D/M_<name> are the differentiated, nondimensional quantities used
     # below -- dimensional values are only ever printed to the console inside
     # DG_postprocessor.compute(), for monitoring.
-    c_l, c_d, c_m = outputs.c_l, outputs.c_d, outputs.c_m
-    L, D, M = outputs.L, outputs.D, outputs.M
-    # Exact dc_m/d(alpha) from a tangent solve. MONITORED ONLY -- no gradient is
-    # supplied, so it must not become a constraint or objective.
-    c_m_alpha = outputs.c_m_alpha
+    c_l, c_d = outputs.c_l, outputs.c_d
+    L, D = outputs.L, outputs.D
+    M_pitch = outputs.M_pitch
 
     # Named so the total-derivative probe below can identify it: D comes out of
     # CustomOperation.create_output, which does not set Variable.name, and an

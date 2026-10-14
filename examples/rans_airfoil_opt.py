@@ -51,7 +51,7 @@ if __name__ == '__main__':
     recorder.start()
 
     windtunnel = DG_windtunnel_model(mesh_from_file, boundary_dict, shape,
-                                     np.array([0.25, 0.], dtype=np.double),
+                                     moments=[("pitch", (0.25, 0.), "pitch")],
                                      mesh_inner_bdry_function=airfoil_inner_bdry_function,
                                      poly_order=0, gamma=1.4,
                                      filename_suffix="rans_airfoil_check_totals",
@@ -66,7 +66,7 @@ if __name__ == '__main__':
     windtunnel.set_up_sim()
 
     coefficients = DG_postprocessor(windtunnel.mesh, windtunnel.sim_model, windtunnel.WALL_TAG,
-                                    np.array([0.25, 0.], dtype=np.double))
+                                    moments=windtunnel.moments)
     shape_param_vector = shape.declare_design_variables()
 
     alpha = csdl.Variable(name='alpha', value=np.array([attack]))

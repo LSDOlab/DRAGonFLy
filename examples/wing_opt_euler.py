@@ -130,8 +130,14 @@ if __name__ == '__main__':
     recorder = csdl.Recorder(inline=False)
     recorder.start()
 
+    # Moments of the wall force (see DG_postprocessor): the pitching moment about the
+    # quarter chord and the root bending moment about the chordwise axis through the
+    # root section (y = 0 symmetry plane)
+    moments = [("pitch", (0.25, 0., 0.), "pitch"),
+               ("root_bending", (0.25, 0., 0.), (1., 0., 0.))]
+
     csdl_euler_model = DG_windtunnel_model(mesh_from_file, boundary_dict, shape,
-                                           np.array([0.25, 0., 0.], dtype=np.double),
+                                           moments=moments,
                                            mesh_inner_bdry_function=wing_inner_bdry_function,
                                            poly_order=poly_o, gamma=1.4,
                                            filename_suffix="wing_opt_euler{}_L3mesh_p=0_M=0_75".format(
@@ -142,8 +148,6 @@ if __name__ == '__main__':
         # pseudo-transient continuation from the free stream needs more steps
         # than a plain Newton solve
         csdl_euler_model.max_newton_iterations = 400
-    # The c_m_alpha log is monitoring only; it costs a linear solve per evaluation
-    csdl_euler_model.log_cm_alpha = False
     # No per-evaluation mesh_deformation file; the solution files are still written
     csdl_euler_model.write_mesh_deformation = False
     # One solution frame per design (CSDL evaluates each design twice)
@@ -153,8 +157,7 @@ if __name__ == '__main__':
     csdl_euler_model.release_solver_memory = True
     csdl_euler_model.set_up_sim()
 
-    csdl_coeff_model = DG_postprocessor(csdl_euler_model.mesh, csdl_euler_model.sim_model, csdl_euler_model.WALL_TAG, np.array([0.25, 0., 0.], dtype=np.double), p_inf_dim=101325.)
-    csdl_coeff_model.log_cm_alpha = False
+    csdl_coeff_model = DG_postprocessor(csdl_euler_model.mesh, csdl_euler_model.sim_model, csdl_euler_model.WALL_TAG, moments=moments, p_inf_dim=101325.)
 
     # Shape design variables first (all of them as one flat vector), then alpha
     shape_param_vector = shape.declare_design_variables()
@@ -175,17 +178,14 @@ if __name__ == '__main__':
 
     outputs = csdl_coeff_model.evaluate(u_vec, mesh_nodes_deformation, alpha, shape_param_vector)
 
-    # c_l/c_d/c_m are MONITORED ONLY -- no gradient is supplied for them (see
+    # c_l/c_d/c_m_<name> are MONITORED ONLY -- no gradient is supplied for them (see
     # DG_postprocessor.evaluate), so they must not become a constraint or
-    # objective. L/D/M are the differentiated, nondimensional quantities used
+    # objective. L/D/M_<name> are the differentiated, nondimensional quantities used
     # below -- dimensional values are only ever printed to the console inside
     # DG_postprocessor.compute(), for monitoring.
-    c_l, c_d, c_m = outputs.c_l, outputs.c_d, outputs.c_m
-    L, D, M = outputs.L, outputs.D, outputs.M
-    # Exact (tangent-solve) pitching-moment slope. MONITORED ONLY -- no gradient
-    # is supplied for it, so it must not be made a constraint or objective.
-    # See DG_postprocessor.evaluate for what constraining it would require.
-    c_m_alpha = outputs.c_m_alpha
+    c_l, c_d = outputs.c_l, outputs.c_d
+    L, D = outputs.L, outputs.D
+    M_pitch, M_root_bending = outputs.M_pitch, outputs.M_root_bending
 
     D.add_name('drag')
     D.set_as_objective()

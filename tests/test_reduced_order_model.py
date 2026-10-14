@@ -61,11 +61,11 @@ def make_windtunnel(kind, rom=None, Re=200.0, suffix="rom"):
     kw = {}
     if kind == "rans":
         kw = dict(model_class=CompressibleRANSModel, model_kwargs={"Re": Re})
-    wt = DG_windtunnel_model(jittered_square(8), BC, mesh_inner_bdry_function=lambda x: x[1] < 1e-8,
+    wt = DG_windtunnel_model(jittered_square(8), BC, moments=[("pitch", (0.25, 0.), "pitch")],
+                             mesh_inner_bdry_function=lambda x: x[1] < 1e-8,
                              poly_order=0, filename_suffix="{}_{}".format(suffix, kind),
                              reduced_order_model=rom, **kw)
     wt.euler_residual_conv_limit = 1e-11
-    wt.log_cm_alpha = False
     wt.set_up_sim()
     _WINDTUNNELS.append(wt)
     return wt
@@ -323,7 +323,6 @@ def test_windtunnel_rom_adjoint(in_tmp_dir, kind, eta_threshold):
     recorder.start()
     rom = ReducedOrderModel(rb_size=5, eta_threshold=eta_threshold)
     wt = make_windtunnel(kind, rom=rom, suffix="adjoint")
-    wt.postprocessor.log_cm_alpha = False
     alpha = csdl.Variable(name='alpha', value=np.array([np.radians(ALPHAS[0])]))
     alpha.set_as_design_variable()
     u_vec = wt.evaluate(alpha=alpha)
@@ -373,6 +372,9 @@ def test_windtunnel_falls_back_to_the_fom(in_tmp_dir):
         u_fom, c_fom, f_fom = wt_fom.solve_forward(np.radians(a))
         assert c_rom and c_fom
         assert u_rom == pytest.approx(u_fom, rel=1e-12, abs=1e-12)
+        for name, moment in f_rom.pop("moments").items():
+            assert moment == pytest.approx(f_fom["moments"][name], rel=1e-12, abs=1e-12)
+        f_fom.pop("moments")
         assert f_rom == pytest.approx(f_fom, rel=1e-12, abs=1e-12)
     assert rom.n_snapshots == 4
     if MPI.COMM_WORLD.rank == 0:

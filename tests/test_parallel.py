@@ -17,7 +17,7 @@ MODULES = ["test_euler_regression.py", "test_turbulence_models.py", "test_recons
            "test_derivatives.py", "test_time_integration.py", "test_windtunnel_forward.py",
            "test_pod.py", "test_reduced_order_model.py",
            "test_mesh_deformation_cache.py", "test_incoming_state_converged.py",
-           "test_meshwarping_cache.py"]
+           "test_meshwarping_cache.py", "test_moments.py", "test_adjoint_reuse.py", "test_adjoint_speedups.py"]
 
 
 @pytest.mark.skipif(shutil.which("mpirun") is None, reason="mpirun is not available")

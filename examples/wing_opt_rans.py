@@ -7,8 +7,9 @@ stations) design variables plus the angle of attack, at M 0.75.
 The flow model is CompressibleRANSModel (p = 0, Green-Gauss gradients
 condensed out of Newton, MUSCL, pseudo-transient continuation from the free
 stream), passed to DG_windtunnel_model as model_class; the drag includes the
-wall friction. The wing wall is adiabatic no-slip, the y = 0 symmetry plane
-slip. The L3 grid is wall-resolved (first cell ~9e-6, root chord 5); the
+wall friction. The lift and the pitching moment may not fall below, and the
+root bending moment may not exceed, their values on the undeformed wing. The wing wall is
+adiabatic no-slip, the y = 0 symmetry plane slip. The L3 grid is wall-resolved (first cell ~9e-6, root chord 5); the
 wall-merged XDMF variant coarsens exactly those layers, so it is not meant
 for RANS.
 
@@ -143,7 +144,6 @@ if __name__ == '__main__':
     recorder.start()
 
     csdl_flow_model = DG_windtunnel_model(mesh_from_file, boundary_dict, shape,
-                                          np.array([0.25, 0., 0.], dtype=np.double),
                                           mesh_inner_bdry_function=wing_inner_bdry_function,
                                           poly_order=poly_o, gamma=1.4,
                                           filename_suffix="wing_opt_rans_L3mesh_p=0_M=0_75",
@@ -161,14 +161,20 @@ if __name__ == '__main__':
     # Check where the RANS residual levels off before tightening it.
     # Memory (L3, p = 0, 4 ranks, measured 2026-10-07): the PTC solve peaks at
     # ~22 GB in total, but one assembly of the exact condensed Jacobian dR/dU
-    # -- what the adjoint (check_totals, optimization) and the c_m_alpha log
-    # solve on -- went past 33 GB, more than a 46 GB workstation had left.
-    # Plan the derivative runs for a larger machine. The c_m_alpha log is
-    # monitoring only, so it is switched off below (it would assemble that
-    # Jacobian after every flow solve).
-    csdl_flow_model.log_cm_alpha = False
+    # -- what the adjoint (check_totals, optimization) solves on -- went past
+    # 33 GB, more than a 46 GB workstation had left. Plan the derivative runs
+    # for a larger machine.
+    # Adjoint linear solves: absolute residual tolerance 1e-9 (the default is 1e-11). The
+    # check that rejects a degraded solve (linear_residual_accept_limit) keeps its ten-fold
+    # margin above the tolerance. The transposed Jacobian and preconditioner built for a design
+    # are reused by the adjoint solves of all its outputs (see DG_windtunnel_model).
+    csdl_flow_model.linear_solver_atol = 1e-9
+    csdl_flow_model.linear_residual_accept_limit = 1e-8
+    # Each adjoint solve starts from the first-order adjoint solution (the compact part of the
+    # Jacobian alone, solved to a relative tolerance of 1e-2).
+    csdl_flow_model.adjoint_first_order_guess = True
     # Free the solver's matrices after each forward solve and the adjoint's
-    # after each adjoint, so the two never coexist (rebuilt when next needed).
+    # after each design's adjoints, so the two never coexist (rebuilt when next needed).
     csdl_flow_model.release_solver_memory = True
     # No per-evaluation mesh_deformation file; the solution files are still written
     csdl_flow_model.write_mesh_deformation = False
@@ -176,9 +182,32 @@ if __name__ == '__main__':
     csdl_flow_model.write_once_per_design = True
     csdl_flow_model.set_up_sim()
 
+    # Moments of the wall force (see DG_postprocessor), both constrained below:
+    #   root_bending: about the x direction (chordwise axis) through the origin, on the
+    #                 y = 0 symmetry plane at the root;
+    #   pitch:        about the y direction (spanwise axis) through the quarter chord of the
+    #                 root section, from the fitted baseline planform (x of the root
+    #                 quarter chord, z of the chord plane at the root).
+    # The points are fixed in space, also when a design variable moves the root.
+    root_quarter_chord = (wing.baseline['x_ref_root'], 0., wing.baseline['z_chord_plane'][1])
+    moments = [("root_bending", (0., 0., 0.), (1., 0., 0.)),
+               ("pitch", root_quarter_chord, (0., 1., 0.))]
+    PETSc.Sys.Print("Moment points: root bending about (0, 0, 0), pitch about the root quarter chord {}"
+                    .format(np.round(root_quarter_chord, 6)))
+
     # D includes the wall friction (D_friction is its viscous part)
-    csdl_coeff_model = DG_postprocessor(csdl_flow_model.mesh, csdl_flow_model.sim_model, csdl_flow_model.WALL_TAG, np.array([0.25, 0., 0.], dtype=np.double), p_inf_dim=101325.)
-    csdl_coeff_model.log_cm_alpha = False
+    csdl_coeff_model = DG_postprocessor(csdl_flow_model.mesh, csdl_flow_model.sim_model, csdl_flow_model.WALL_TAG, moments=moments, p_inf_dim=101325.)
+
+    # The moments of the undeformed wing at the initial flow conditions, from a forward solve on
+    # the undeformed mesh: the limits of the moment constraints below (upper for root bending,
+    # lower for pitching). The first
+    # optimization evaluation is this same design, and starts from this converged state.
+    u_baseline, baseline_converged, _ = csdl_flow_model.solve_forward(attack)
+    if not baseline_converged:
+        raise RuntimeError("the baseline flow solve did not converge: no baseline moments for the constraints")
+    baseline_moments = csdl_coeff_model.forces_and_coefficients(u_baseline)["moments"]
+    PETSc.Sys.Print("Baseline moments (nondimensional): " + ", ".join(
+        "{} {:.8f}".format(name, m["M"]) for name, m in baseline_moments.items()))
 
     # Shape design variables first (all of them as one flat vector), then alpha
     shape_param_vector = shape.declare_design_variables()
@@ -199,17 +228,14 @@ if __name__ == '__main__':
 
     outputs = csdl_coeff_model.evaluate(u_vec, mesh_nodes_deformation, alpha, shape_param_vector)
 
-    # c_l/c_d/c_m are MONITORED ONLY -- no gradient is supplied for them (see
+    # c_l/c_d/c_m_<name> are MONITORED ONLY -- no gradient is supplied for them (see
     # DG_postprocessor.evaluate), so they must not become a constraint or
-    # objective. L/D/M are the differentiated, nondimensional quantities used
+    # objective. L/D/M_<name> are the differentiated, nondimensional quantities used
     # below -- dimensional values are only ever printed to the console inside
     # DG_postprocessor.compute(), for monitoring.
-    c_l, c_d, c_m = outputs.c_l, outputs.c_d, outputs.c_m
-    L, D, M = outputs.L, outputs.D, outputs.M
-    # Exact (tangent-solve) pitching-moment slope. MONITORED ONLY -- no gradient
-    # is supplied for it, so it must not be made a constraint or objective.
-    # See DG_postprocessor.evaluate for what constraining it would require.
-    c_m_alpha = outputs.c_m_alpha
+    c_l, c_d = outputs.c_l, outputs.c_d
+    L, D = outputs.L, outputs.D
+    M_root_bending, M_pitch = outputs.M_root_bending, outputs.M_pitch
 
     D.add_name('drag')
     D.set_as_objective()
@@ -227,6 +253,15 @@ if __name__ == '__main__':
         L_constraint = L
         L_constraint.add_name('L_limit')
         L_constraint.set_as_constraint(lower=L_baseline)
+
+    # Moment constraints: the root bending moment may not exceed, and the pitching moment may not
+    # fall below, its value on the undeformed wing. M_<name> are the raw nondimensional moment integrals (like
+    # L), the quantities to constrain; their coefficients are monitoring only.
+    with csdl.namespace('Constraint 3'):
+        M_root_bending.add_name('root_bending_limit')
+        M_root_bending.set_as_constraint(upper=baseline_moments["root_bending"]["M"])
+        M_pitch.add_name('pitch_limit')
+        M_pitch.set_as_constraint(lower=baseline_moments["pitch"]["M"])
 
     # Geometric constraints. The wing's planform quantities follow directly from
     # its variables (shape.outputs()['wing']: area, span, semi_span, root_chord,
