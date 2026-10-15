@@ -9,7 +9,7 @@ nodes to the parameterization, and `model.deform_mesh()` turns the resulting wal
 motions:
 ```python
 shape = FFDShapeParameterization(ffd_shape, ffd_degree, block_corner_list, layers=[...])
-model = DG_windtunnel_model(mesh, boundary_dict, shape, aero_center, ...)
+model = DG_windtunnel_model(mesh, boundary_dict, shape, moments=moments, ...)
 model.set_up_sim()
 shape_parameters = shape.declare_design_variables()   # all shape DVs, with bounds, as one vector
 alpha = ...                                           # declare alpha after the shape variables

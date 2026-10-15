@@ -45,6 +45,9 @@ WALL_TAG = 2
 QUADRATURE_DEGREE = 5
 
 
+pytestmark = [pytest.mark.unit_test]
+
+
 def build_model(poly_order=0, n=8, comm=None):
     """
     A small Euler model on a jittered unit square, with all four sides

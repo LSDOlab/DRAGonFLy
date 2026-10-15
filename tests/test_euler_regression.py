@@ -21,6 +21,9 @@ from euler_reference_quantities import euler_reference_quantities
 REFERENCE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "euler_reference.npz")
 
 
+pytestmark = [pytest.mark.verification]
+
+
 @pytest.fixture(scope="module")
 def quantities():
     return euler_reference_quantities(), np.load(REFERENCE)

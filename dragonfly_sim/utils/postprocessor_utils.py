@@ -30,3 +30,29 @@ def moment_integrand(force_vec, lever_vec, dimensions):
     else:
         raise ValueError(
             "moment_integrand supports 2 or 3 dimensions, got {}".format(dimensions))
+
+
+def moment_about(force_vec, lever_vec, direction, dimensions):
+    """
+    The component along `direction` of the moment (lever x force), the
+    integrand of the moment of a wall force density about a point:
+    M = d . (r x F), right-hand rule.
+
+      3D: the full cross product, projected on the (unit) direction vector.
+      2D: the only nonzero component of r x F is the out-of-plane one,
+          r_x F_y - r_y F_x, times the z entry of `direction`.
+
+    `direction` is a UFL-compatible vector of 3 entries in both cases (a
+    dolfinx Constant, say); in 2D only its z entry is read. The
+    nose-up-positive pitching moment of moment_integrand is direction
+    (0, 1, 0) in 3D and (0, 0, -1) in 2D.
+    """
+    if dimensions == 2:
+        return direction[2]*(lever_vec[0]*force_vec[1] - lever_vec[1]*force_vec[0])
+    elif dimensions == 3:
+        return (direction[0]*(lever_vec[1]*force_vec[2] - lever_vec[2]*force_vec[1])
+                + direction[1]*(lever_vec[2]*force_vec[0] - lever_vec[0]*force_vec[2])
+                + direction[2]*(lever_vec[0]*force_vec[1] - lever_vec[1]*force_vec[0]))
+    else:
+        raise ValueError(
+            "moment_about supports 2 or 3 dimensions, got {}".format(dimensions))

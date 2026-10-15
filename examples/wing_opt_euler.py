@@ -130,8 +130,14 @@ if __name__ == '__main__':
     recorder = csdl.Recorder(inline=False)
     recorder.start()
 
+    # Moments of the wall force (see DG_postprocessor): the pitching moment about the
+    # quarter chord and the root bending moment about the chordwise axis through the
+    # root section (y = 0 symmetry plane)
+    moments = [("pitch", (0.25, 0., 0.), "pitch"),
+               ("root_bending", (0.25, 0., 0.), (1., 0., 0.))]
+
     csdl_euler_model = DG_windtunnel_model(mesh_from_file, boundary_dict, shape,
-                                           np.array([0.25, 0., 0.], dtype=np.double),
+                                           moments=moments,
                                            mesh_inner_bdry_function=wing_inner_bdry_function,
                                            poly_order=poly_o, gamma=1.4,
                                            filename_suffix="wing_opt_euler{}_L3mesh_p=0_M=0_75".format(
@@ -142,8 +148,6 @@ if __name__ == '__main__':
         # pseudo-transient continuation from the free stream needs more steps
         # than a plain Newton solve
         csdl_euler_model.max_newton_iterations = 400
-    # The c_m_alpha log is monitoring only; it costs a linear solve per evaluation
-    csdl_euler_model.log_cm_alpha = False
     # No per-evaluation mesh_deformation file; the solution files are still written
     csdl_euler_model.write_mesh_deformation = False
     # One solution frame per design (CSDL evaluates each design twice)
@@ -153,8 +157,7 @@ if __name__ == '__main__':
     csdl_euler_model.release_solver_memory = True
     csdl_euler_model.set_up_sim()
 
-    csdl_coeff_model = DG_postprocessor(csdl_euler_model.mesh, csdl_euler_model.sim_model, csdl_euler_model.WALL_TAG, np.array([0.25, 0., 0.], dtype=np.double), p_inf_dim=101325.)
-    csdl_coeff_model.log_cm_alpha = False
+    csdl_coeff_model = DG_postprocessor(csdl_euler_model.mesh, csdl_euler_model.sim_model, csdl_euler_model.WALL_TAG, moments=moments, p_inf_dim=101325.)
 
     # Shape design variables first (all of them as one flat vector), then alpha
     shape_param_vector = shape.declare_design_variables()
@@ -175,20 +178,16 @@ if __name__ == '__main__':
 
     outputs = csdl_coeff_model.evaluate(u_vec, mesh_nodes_deformation, alpha, shape_param_vector)
 
-    # c_l/c_d/c_m are MONITORED ONLY -- no gradient is supplied for them (see
+    # c_l/c_d/c_m_<name> are MONITORED ONLY -- no gradient is supplied for them (see
     # DG_postprocessor.evaluate), so they must not become a constraint or
-    # objective. L/D/M are the differentiated, nondimensional quantities used
+    # objective. L/D/M_<name> are the differentiated, nondimensional quantities used
     # below -- dimensional values are only ever printed to the console inside
     # DG_postprocessor.compute(), for monitoring.
-    c_l, c_d, c_m = outputs.c_l, outputs.c_d, outputs.c_m
-    L, D, M = outputs.L, outputs.D, outputs.M
-    # Exact (tangent-solve) pitching-moment slope. MONITORED ONLY -- no gradient
-    # is supplied for it, so it must not be made a constraint or objective.
-    # See DG_postprocessor.evaluate for what constraining it would require.
-    c_m_alpha = outputs.c_m_alpha
+    c_l, c_d = outputs.c_l, outputs.c_d
+    L, D = outputs.L, outputs.D
+    M_pitch, M_root_bending = outputs.M_pitch, outputs.M_root_bending
 
     D.add_name('drag')
-    D.set_as_objective()
 
     # Define lower limit constraint on lift
     with csdl.namespace('Constraint 2'):
@@ -200,12 +199,19 @@ if __name__ == '__main__':
         # (M 0.75, alpha 2 deg), from a converged forward solve
         # first order (2026-10-08: 8 Newton steps to |R| 3.0e-10; c_l 0.34803, c_d 0.047778)
         L_baseline = 6.240966914666039
+        D_baseline = L_baseline * 0.047778 / 0.34803    # D = L c_d / c_l (same q S normalization)
         if muscl:
             # MUSCL (2026-10-08: 80 PTC steps to |R| 7.4e-10; c_l 0.53780, c_d 0.012229)
             L_baseline = 9.64391809932878
+            D_baseline = L_baseline * 0.012229 / 0.53780
         L_constraint = L
         L_constraint.add_name('L_limit')
-        L_constraint.set_as_constraint(lower=L_baseline)
+        L_constraint.set_as_constraint(lower=L_baseline, scaler=1./L_baseline)
+
+    # The objective and the constraint are scaled by their undeformed-wing values, so that SLSQP's
+    # absolute ftol acts as a relative tolerance (SLSQP has no rtol option): the convergence test
+    # is then on the relative drag change and the relative constraint violation.
+    D.set_as_objective(scaler=1./D_baseline)
 
     # Geometric constraints. The wing's planform quantities follow directly from
     # its variables (shape.outputs()['wing']: area, span, semi_span, root_chord,
@@ -246,7 +252,7 @@ if __name__ == '__main__':
 
     # modopt writes its outputs into a timestamped folder that every rank would
     # create at once (a FileExistsError race): only rank 0 writes them
-    optimizer = SLSQP(prob, solver_options={'ftol':1e-8, 'maxiter':150},
+    optimizer = SLSQP(prob, solver_options={'ftol':1e-6, 'maxiter':150},
                       turn_off_outputs=mesh_from_file.comm.Get_rank() != 0)
     # optimizer = PySLSQP(prob, solver_options={'acc':1e-8, 'maxiter':100})
 

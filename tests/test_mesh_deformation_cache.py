@@ -11,6 +11,9 @@ from dragonfly_sim.core.mesh_manager import Mesh
 from cases import jittered_square
 
 
+pytestmark = [pytest.mark.unit_test]
+
+
 @pytest.fixture
 def mesh_obj():
     mo = Mesh(jittered_square(6, MPI.COMM_WORLD), lambda pts: np.zeros(pts.shape[1], dtype=bool))
