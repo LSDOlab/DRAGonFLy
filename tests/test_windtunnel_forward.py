@@ -4,7 +4,7 @@ a forward flow analysis on a fixed mesh, with and without a CSDL graph, and
 the adjoint derivative with respect to alpha against finite differences.
 
 The domain is a jittered unit square whose bottom side is the "body" wall;
-the rest of the boundary is the far field, split into inflow and outflow.
+the rest of the boundary is the characteristic far field.
 """
 import os
 
@@ -18,7 +18,7 @@ from dragonfly_sim.core.windtunnel_model import DG_windtunnel_model
 
 from cases import jittered_square
 
-BC = {'inlet': {'rho': 1.0, 'p': 1.0, 'M': 0.5, 'alpha': np.radians(2.0)}, 'outlet': {'p': 1.0}}
+BC = {'rho': 1.0, 'p': 1.0, 'M': 0.5, 'alpha': np.radians(2.0)}
 
 
 def bottom_wall(x):
@@ -34,26 +34,33 @@ def in_tmp_dir(tmp_path):
     cwd = os.getcwd()
     os.chdir(path)
     yield
+    # collect what the test left unreferenced while the working directory still exists: an ADIOS2
+    # writer destroyed later, after the chdir, aborts the process
+    import gc
+    from petsc4py import PETSc
+    gc.collect()
+    PETSc.garbage_cleanup(comm)       # PETSc objects of parallel communicators are freed in a queue
     comm.Barrier()
     os.chdir(cwd)
 
 
 def make_windtunnel():
-    wt = DG_windtunnel_model(jittered_square(8), BC, mesh_inner_bdry_function=bottom_wall,
+    wt = DG_windtunnel_model(jittered_square(8), BC, moments=[("pitch", (0.25, 0.), "pitch")],
+                             mesh_inner_bdry_function=bottom_wall,
                              poly_order=0, filename_suffix="test_forward")
     wt.euler_residual_conv_limit = 1e-12
-    wt.log_cm_alpha = False
     wt.set_up_sim()
-    wt.postprocessor.log_cm_alpha = False
     return wt
 
 
+@pytest.mark.unit_test
 def test_forward_analysis_without_csdl(in_tmp_dir):
     wt = make_windtunnel()
     assert wt.ffd is None and wt.mesh_warper is None
     u, converged, forces = wt.solve_forward()
     assert converged
-    assert set(forces) >= {"L", "D", "M", "c_l", "c_d", "c_m"}
+    assert set(forces) >= {"L", "D", "c_l", "c_d", "moments"}
+    assert set(forces["moments"]["pitch"]) == {"M", "c_m"}
     # forces_and_coefficients agrees with the postprocessor's own assemblies
     L, c_l = wt.postprocessor.compute_cl(u)
     assert forces["L"] == L and forces["c_l"] == c_l
@@ -61,11 +68,12 @@ def test_forward_analysis_without_csdl(in_tmp_dir):
         wt.wall_geometry()
 
 
+@pytest.mark.verification
 def test_forward_csdl_graph_alpha_derivative(in_tmp_dir):
     recorder = csdl.Recorder(inline=False)
     recorder.start()
     wt = make_windtunnel()
-    alpha = csdl.Variable(name='alpha', value=np.array([BC['inlet']['alpha']]))
+    alpha = csdl.Variable(name='alpha', value=np.array([BC['alpha']]))
     alpha.set_as_design_variable()
     u_vec = wt.evaluate(alpha=alpha)
     out = wt.postprocessor.evaluate(u_vec, alpha=alpha)
@@ -79,7 +87,7 @@ def test_forward_csdl_graph_alpha_derivative(in_tmp_dir):
 
     # finite differences of plain forward solves
     h = 1e-6
-    a0 = BC['inlet']['alpha']
+    a0 = BC['alpha']
     Dp = wt.solve_forward(a0 + h)[2]["D"]
     Dm = wt.solve_forward(a0 - h)[2]["D"]
     fd = (Dp - Dm) / (2 * h)
@@ -98,11 +106,9 @@ def rans_alpha_derivative(release, alphas):
                              model_class=CompressibleRANSModel, model_kwargs={'Re': 1e3})
     wt.euler_residual_conv_limit = 1e-12
     wt.max_newton_iterations = 400
-    wt.log_cm_alpha = False
     wt.release_solver_memory = release
     wt.set_up_sim()
-    wt.postprocessor.log_cm_alpha = False
-    alpha = csdl.Variable(name='alpha', value=np.array([BC['inlet']['alpha']]))
+    alpha = csdl.Variable(name='alpha', value=np.array([BC['alpha']]))
     alpha.set_as_design_variable()
     u_vec = wt.evaluate(alpha=alpha)
     out = wt.postprocessor.evaluate(u_vec, alpha=alpha)
@@ -124,6 +130,7 @@ def rans_alpha_derivative(release, alphas):
     return wt, results
 
 
+@pytest.mark.verification
 def test_release_solver_memory_gives_the_same_rans_derivatives(in_tmp_dir):
     """release_solver_memory frees the flow solver after every forward solve and
     the condensed dR/dU after every adjoint; both are rebuilt when next needed,
@@ -145,6 +152,7 @@ def test_release_solver_memory_gives_the_same_rans_derivatives(in_tmp_dir):
 
 
 @pytest.mark.parametrize("once", [False, True])
+@pytest.mark.unit_test
 def test_solution_file_fields_and_write_once_per_design(once, in_tmp_dir, monkeypatch):
     """The solution file holds the state as separate fields plus velocity and
     pressure; with write_once_per_design, re-evaluating a design (CSDL re-runs
@@ -156,10 +164,8 @@ def test_solution_file_fields_and_write_once_per_design(once, in_tmp_dir, monkey
                              poly_order=0, filename_suffix="test_fields",
                              model_class=CompressibleRANSModel, model_kwargs={'Re': 1e3})
     wt.max_newton_iterations = 400
-    wt.log_cm_alpha = False
     wt.write_once_per_design = once
     wt.set_up_sim()
-    wt.postprocessor.log_cm_alpha = False
     flow = wt.sim_model.flow
     writer = flow.fom_solution_writer
     assert writer.field_names == ["density", "momentum", "energy", "rho_nu_tilde",
@@ -168,7 +174,7 @@ def test_solution_file_fields_and_write_once_per_design(once, in_tmp_dir, monkey
     monkeypatch.setattr(writer, "interpolate_and_write",
                         lambda values, write_counter=None, time=None: labels.append(
                             (write_counter, {k: v.x.array.copy() for k, v in values.items()})))
-    alpha = csdl.Variable(name='alpha', value=np.array([BC['inlet']['alpha']]))
+    alpha = csdl.Variable(name='alpha', value=np.array([BC['alpha']]))
     alpha.set_as_design_variable()
     u_vec = wt.evaluate(alpha=alpha)
     out = wt.postprocessor.evaluate(u_vec, alpha=alpha)
@@ -177,7 +183,7 @@ def test_solution_file_fields_and_write_once_per_design(once, in_tmp_dir, monkey
     sim = csdl.experimental.JaxSimulator(recorder, gpu=False)
     sim.run()
     sim.compute_totals()            # evaluates the same design again
-    sim[alpha] = np.array([BC['inlet']['alpha'] + 0.01])
+    sim[alpha] = np.array([BC['alpha'] + 0.01])
     sim.run()
     assert [k for k, _ in labels] == ([0, 2] if once else [0, 1, 2])
 
@@ -196,6 +202,7 @@ def test_solution_file_fields_and_write_once_per_design(once, in_tmp_dir, monkey
             w.writer.close()
 
 
+@pytest.mark.verification
 def test_muscl_euler_alpha_derivative(in_tmp_dir):
     """MUSCLEulerModel: the Euler model with the Green-Gauss MUSCL
     reconstruction converges by PTC, takes the condensed path, and its
@@ -207,12 +214,10 @@ def test_muscl_euler_alpha_derivative(in_tmp_dir):
                              poly_order=0, filename_suffix="test_muscl", model_class=MUSCLEulerModel)
     wt.euler_residual_conv_limit = 1e-12
     wt.max_newton_iterations = 400
-    wt.log_cm_alpha = False
     wt.release_solver_memory = True
     wt.set_up_sim()
-    wt.postprocessor.log_cm_alpha = False
     assert wt.sim_model.has_condensed_jacobian and wt.sim_model.face_traces is not None
-    alpha = csdl.Variable(name='alpha', value=np.array([BC['inlet']['alpha']]))
+    alpha = csdl.Variable(name='alpha', value=np.array([BC['alpha']]))
     alpha.set_as_design_variable()
     u_vec = wt.evaluate(alpha=alpha)
     out = wt.postprocessor.evaluate(u_vec, alpha=alpha)
@@ -224,7 +229,7 @@ def test_muscl_euler_alpha_derivative(in_tmp_dir):
     D0 = float(sim[out.D][0])
     dD = float(np.asarray(sim.compute_totals()[out.D, alpha]).ravel()[0])
     h = 1e-6
-    a0 = BC['inlet']['alpha']
+    a0 = BC['alpha']
     fd = (wt.solve_forward(a0 + h)[2]["D"] - wt.solve_forward(a0 - h)[2]["D"]) / (2 * h)
     assert abs(fd - dD) < 1e-5 * max(abs(fd), 1e-12), (fd, dD)
     assert abs(wt.solve_forward(a0)[2]["D"] - D0) < 1e-10

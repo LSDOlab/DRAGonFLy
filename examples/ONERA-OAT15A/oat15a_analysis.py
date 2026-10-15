@@ -11,8 +11,15 @@ meshes/ONERA-ONERA-OAT15A-Rizzi/).
 
 The grids are structured multi-block CGNS files one cell thick in span (chord
 230 mm); utils/mesh_io_utils reduces each to a 2D quad mesh with chord 1 in
-memory. The cases run one at a time, each from the same free stream. A case
-that does not converge is recorded as such and the sweep goes on.
+memory. The cases run one at a time. The default model is SA-neg RANS with MUSCL,
+and each case starts from the converged first-order RANS solution (the same model
+without MUSCL), which itself starts from the free stream (--init first-order).
+--init freestream starts from the free stream directly; --init euler from the
+first-order Euler solution. --model euler runs the Euler equations (slip wall):
+first-order (HLL flux) by default, from the free stream; --muscl adds MUSCL
+reconstruction, with the Van Albada limiter (epsilon 0.1) as its default (--limiter,
+--limiter-eps). A case that does not converge is recorded as such and the sweep
+goes on.
 
     OMP_NUM_THREADS=1 mpirun -n 8 python oat15a_analysis.py
     OMP_NUM_THREADS=1 mpirun -n 8 python oat15a_analysis.py --grids 1 2 --alphas 2.5
@@ -66,9 +73,9 @@ GRID_FILES = {
     "cadence_rev02": (os.path.join("ONERA-OAT15A_Cadence_Structured_REV02", "ONERA-OAT15A_Cadence_Structured_REV02",
                                    "CGNS", "ONERA-OAT15A_Cadence_Structured_REV02_Level-{0}.cgns"), [1, 2, 3, 4, 5, 6]),
 }
-COLUMNS = ("grid", "cells", "dofs", "alpha", "converged", "steps", "res", "wall_s", "case_s",
+COLUMNS = ("grid", "cells", "dofs", "alpha", "converged", "steps", "res", "wall_s", "case_s", "init_steps", "init_s",
            "c_l", "c_d", "c_d_pressure", "c_d_friction", "c_m")
-FORMATS = {"grid": "%d", "cells": "%d", "dofs": "%d", "alpha": "%.4f", "converged": "%d", "steps": "%d",
+FORMATS = {"grid": "%d", "cells": "%d", "dofs": "%d", "alpha": "%.4f", "converged": "%d", "steps": "%d", "init_steps": "%d", "init_s": "%.1f",
            "res": "%.6e", "wall_s": "%.1f", "case_s": "%.1f"}
 
 
@@ -85,17 +92,40 @@ def parse_args():
     p.add_argument("--Re", type=float, default=3e6, help="Reynolds number based on the chord")
     p.add_argument("--T-inf", type=float, default=271.0,
                    help="static free-stream temperature [K] (Sutherland); DPW8 test case 1a: 271 K")
-    p.add_argument("--farfield", choices=("split", "riemann"), default="split")
     p.add_argument("--mesh-dir", default=MESH_DIR)
     # steady solver
     p.add_argument("--cfl0", type=float, default=5.0)
+    p.add_argument("--cfl-rise-min", type=float, default=0.7,
+                   help="PTC: the largest CFL cut on a residual rise (CFL *= residual ratio, not below this); "
+                        "the controller's own default is 0.1")
+    p.add_argument("--cfl-rise-max", type=float, default=0.9,
+                   help="PTC: the mildest CFL cut once the residual rises by more than 5%% (the controller's "
+                        "own default is 0.5, i.e. at least halved)")
+    p.add_argument("--krylov-rtol", type=float, default=1e-3,
+                   help="relative tolerance of the Krylov solve of every Newton (pseudo-time) step, at most 300 "
+                        "iterations")
     p.add_argument("--cfl-max", type=float, default=None,
                    help="upper bound of the PTC CFL number (default: the controller's, 1e12)")
     p.add_argument("--steady-tol", type=float, default=1e-9)
     p.add_argument("--max-steps", type=int, default=1000, help="PTC step budget per case")
-    p.add_argument("--limiter", choices=("none", "vanalbada"), default="none",
-                   help="slope limiter of the MUSCL reconstruction")
-    p.add_argument("--limiter-eps", type=float, default=1e-2, help="Van Albada smoothness parameter")
+    p.add_argument("--model", choices=("sa", "euler"), default="sa",
+                   help="flow model: SA-neg RANS with MUSCL (default), or the Euler equations (slip wall), "
+                        "first-order unless --muscl is given")
+    p.add_argument("--muscl", action="store_true",
+                   help="--model euler: add MUSCL reconstruction (the RANS model always has it)")
+    p.add_argument("--init", choices=("first-order", "freestream", "euler", "rans1"), default="first-order",
+                   help="initial state of the MUSCL solve: the default is the converged first-order RANS solution "
+                        "for --model sa and the free stream for --model euler; explicitly: the free stream, the "
+                        "first-order Euler (HLL flux, no MUSCL, slip wall) or the first-order RANS solution. The "
+                        "first-order solve is on the same mesh and angle of attack")
+    p.add_argument("--init-tol", type=float, default=1e-8, help="residual of the first-order initialization")
+    p.add_argument("--init-max-steps", type=int, default=600, help="PTC step budget of the first-order initialization")
+    p.add_argument("--limiter", choices=("none", "vanalbada"), default=None,
+                   help="slope limiter of the MUSCL reconstruction (default: none for --model sa, vanalbada for "
+                        "--model euler --muscl, whose unlimited form froze at the trailing edge and the shock)")
+    p.add_argument("--limiter-eps", type=float, default=None,
+                   help="Van Albada smoothness parameter (default: 0.1 for --model euler --muscl, 0.01 for "
+                        "--model sa)")
     p.add_argument("--report-limiter", action="store_true",
                    help="print which cells block the Newton step whenever the positivity limiter cuts it")
     # output
@@ -247,26 +277,138 @@ def count_wall_facets(mesh_obj):
     return msh.comm.allreduce(int(n_owned), MPI.SUM)
 
 
+def _ptc_settings(args):
+    return {"cfl0": args.cfl0, "rise_factor_min": args.cfl_rise_min, "rise_factor_max": args.cfl_rise_max,
+            **({} if args.cfl_max is None else {"cfl_max": args.cfl_max})}
+
+
+def euler_muscl(args):
+    return getattr(args, "model", "sa") == "euler" and bool(getattr(args, "muscl", False))
+
+
+def resolve_limiter(args):
+    """(limiter or None, Van Albada eps) of the MUSCL solve: Van Albada with eps 0.1 for the Euler model with
+    MUSCL, no limiter for the RANS model (eps 0.01 if one is asked for)."""
+    euler = euler_muscl(args)
+    limiter = getattr(args, "limiter", None) or ("vanalbada" if euler else "none")
+    if getattr(args, "model", "sa") == "euler" and not euler and limiter != "none":
+        raise ValueError("--limiter needs MUSCL: add --muscl, or use --model sa")
+    eps = getattr(args, "limiter_eps", None)
+    return (None if limiter == "none" else limiter), (eps if eps is not None else (0.1 if euler else 1e-2))
+
+
+def resolve_init(args):
+    """The starting state --init names: "first-order" is the first-order RANS solution for the RANS model;
+    the Euler model (already first-order, or with MUSCL) starts from the free stream unless the first-order Euler
+    solution is asked for (--init euler)."""
+    model = getattr(args, "model", "sa")
+    init = getattr(args, "init", "first-order")
+    if init == "first-order":
+        init = "rans1" if model == "sa" else "freestream"
+    if init == "rans1" and model == "euler":
+        raise ValueError("--init rans1 needs --model sa: the Euler state has no turbulence variable")
+    return init
+
+
+def set_up_solver(model, args):
+    """model.set_up_solver(); an Euler model with MUSCL needs the RANS model's Newton Jacobian wiring (the exact
+    Jacobian for the Newton matrix, its compact part as the preconditioner) done by hand."""
+    model.set_up_solver()
+    if euler_muscl(args) and not model.direct_linear_solver:
+        model.problem.configure_snes(model.solver.snes, "compact_pc")
+        model.solver.krylov_solver.setFromOptions()
+
+
+def first_order_state(msh, args, alpha, kind):
+    """
+    Solve a first-order model on `msh` at the case's Mach number, angle of
+    attack and far field, to steady state by PTC: kind "euler" is the Euler
+    equations (HLL flux, no MUSCL, slip wall); "rans1" is the RANS model
+    without MUSCL (first-order HLL inviscid flux, no-slip wall, SA-neg).
+    Returns (state, cell-to-block map, info dict): the state as an
+    (n_blocks, n_state) array in that model's own block order, with the
+    dofmap that maps each cell to its block, so that a model on the same mesh
+    can be filled cell by cell. The model is freed before returning.
+    """
+    if kind == "euler":
+        mesh_obj, model, _ = build_model(msh, model="euler", mach=args.mach, alpha_deg=alpha)
+    else:
+        mesh_obj, model, _ = build_model(msh, model="sa", mach=args.mach, alpha_deg=alpha, Re=args.Re,
+                                         T_inf=args.T_inf, muscl=False)
+    model.report_positivity_limiter = args.report_limiter
+    model.krylov_rtol = args.krylov_rtol
+    model.use_ptc = True
+    model.ptc_settings = {**model.ptc_settings, **_ptc_settings(args)}
+    model.max_newton_iterations = args.init_max_steps
+    model.residual_conv_limit = args.init_tol
+    model.set_up_solver()
+    tic = time.perf_counter()
+    r = model.solve_system().norm()
+    info = dict(steps=model.time_integrator.last_steady_steps, res=r, wall_s=time.perf_counter() - tic,
+                converged=bool(model.solver_converged) and np.isfinite(r))
+    cl, cd, _, cm = ForceCoefficients(model, mesh_obj, alpha, aero_centre=(0.25, 0.0))()
+    info.update(c_l=cl, c_d=cd, c_m=cm)
+    bs = model.n_state
+    state = model.u_vec.x.array.reshape(-1, bs).copy()
+    cell_block = model.functionspaces["V"].dofmap.list[:, 0].copy()
+    model.solver.destroy()
+    del model, mesh_obj
+    gc.collect()
+    PETSc.garbage_cleanup(msh.comm)
+    return state, cell_block, info
+
+
+def apply_state(model, state, cell_block):
+    """Overwrite the first state.shape[1] components of `model`'s state with
+    `state` (see first_order_state), cell by cell: the mean flow of an Euler
+    solution (the transported scalars keep their free-stream values), or the
+    whole state of a first-order RANS solution."""
+    bs = model.n_state
+    u = model.u_vec.x.array.reshape(-1, bs)
+    u[model.functionspaces["V"].dofmap.list[:, 0], :state.shape[1]] = state[cell_block]
+    model.u_vec.x.scatter_forward()
+
+
 def solve_case(msh, args, alpha, n_wall_edges):
     """Build the model on `msh`, check that its wall is the grid's
-    `n_wall_edges` Wall edges, and solve to steady state from the free
-    stream. Returns (model, mesh_obj, record dict)."""
+    `n_wall_edges` Wall edges, and solve to steady state from the converged
+    first-order RANS solution (--init first-order, the default for --model sa;
+    --init euler / rans1 name the first-order model; --init freestream, the
+    default for --model euler: the free stream). Returns (model, mesh_obj,
+    record dict)."""
     tic_case = time.perf_counter()
-    mesh_obj, model, _ = build_model(msh, model="sa", mach=args.mach, alpha_deg=alpha, Re=args.Re,
-                                     T_inf=args.T_inf, farfield=args.farfield,
-                                     limiter=None if args.limiter == "none" else args.limiter,
-                                     limiter_eps=args.limiter_eps)
+    init = dict(steps=0, wall_s=0.0)
+    euler = None
+    init_kind = resolve_init(args)
+    if init_kind != "freestream":
+        euler = first_order_state(msh, args, alpha, init_kind)
+        init = euler[2]
+        PETSc.Sys.Print("first-order {} start: converged={} steps={} |R|={:.3e} c_l={:.4f} c_d={:.5f} "
+                        "c_m={:.4f} [{:.1f} s]".format(init_kind, init["converged"], init["steps"], init["res"],
+                                                        init["c_l"], init["c_d"], init["c_m"], init["wall_s"]))
+        if not init["converged"]:
+            PETSc.Sys.Print("WARNING: the first-order initialization did not converge; the MUSCL solve starts "
+                            "from its last state anyway")
+    limiter, limiter_eps = resolve_limiter(args)
+    mesh_obj, model, _ = build_model(msh, model=args.model, mach=args.mach, alpha_deg=alpha, Re=args.Re,
+                                     T_inf=args.T_inf, limiter=limiter,
+                                     limiter_eps=limiter_eps, euler_muscl=euler_muscl(args))
+    PETSc.Sys.Print("model {}{}: MUSCL limiter {} (eps {})".format(
+        args.model, " with MUSCL" if args.model == "euler" and euler_muscl(args) else "",
+        limiter or "none", limiter_eps if limiter else "-"))
     n_wall = count_wall_facets(mesh_obj)
     if n_wall != n_wall_edges:
         raise RuntimeError("the solver's wall has {} facets, the CGNS Wall family {} edges"
                            .format(n_wall, n_wall_edges))
     model.report_positivity_limiter = args.report_limiter
+    model.krylov_rtol = args.krylov_rtol
     model.use_ptc = True
-    model.ptc_settings = {**model.ptc_settings, "cfl0": args.cfl0,
-                          **({} if args.cfl_max is None else {"cfl_max": args.cfl_max})}
+    model.ptc_settings = {**model.ptc_settings, **_ptc_settings(args)}
     model.max_newton_iterations = args.max_steps
     model.residual_conv_limit = args.steady_tol
-    model.set_up_solver()
+    set_up_solver(model, args)
+    if euler is not None:
+        apply_state(model, euler[0], euler[1])
     tic = time.perf_counter()
     r = model.solve_system().norm()
     wall = time.perf_counter() - tic
@@ -275,6 +417,7 @@ def solve_case(msh, args, alpha, n_wall_edges):
     return model, mesh_obj, dict(alpha=alpha, dofs=model.u_vec.x.petsc_vec.getSize(),
                                  converged=int(converged), steps=model.time_integrator.last_steady_steps,
                                  res=r, wall_s=wall, case_s=time.perf_counter() - tic_case,
+                                 init_steps=init["steps"], init_s=init["wall_s"],
                                  c_l=cl, c_d=cd, c_d_pressure=cd - cdf, c_d_friction=cdf, c_m=cm)
 
 
@@ -301,7 +444,8 @@ def main():
     run_dir = None
     if comm.rank == 0:
         os.makedirs(args.out_dir, exist_ok=True)
-        stem = "oat15a_{}_sa_M{}_Re{:g}{}_".format(args.mesh_family, args.mach, args.Re,
+        stem = "oat15a_{}_{}_M{}_Re{:g}{}_".format(args.mesh_family, args.model + ("-muscl" if euler_muscl(args) else ""),
+                                                   args.mach, args.Re,
                                                    "_" + args.label if args.label else "")
         run_dir = tempfile.mkdtemp(prefix=stem + time.strftime("%Y%m%d-%H%M%S_"), dir=args.out_dir)
         with open(os.path.join(run_dir, "config.json"), "w") as f:
@@ -309,8 +453,8 @@ def main():
     run_dir = comm.bcast(run_dir, root=0)
     csv_path = os.path.join(run_dir, "results.csv")
     PETSc.Sys.Print("=" * 72)
-    PETSc.Sys.Print("OAT15A: {} grids {}, alpha {} deg, M={}, Re={:g}, T={} K, far field {}, {} ranks".format(
-        args.mesh_family, args.grids, args.alphas, args.mach, args.Re, args.T_inf, args.farfield, comm.size))
+    PETSc.Sys.Print("OAT15A: {} grids {}, alpha {} deg, M={}, Re={:g}, T={} K, {} ranks".format(
+        args.mesh_family, args.grids, args.alphas, args.mach, args.Re, args.T_inf, comm.size))
     PETSc.Sys.Print("Output: {}".format(run_dir))
     PETSc.Sys.Print("=" * 72)
 
@@ -335,7 +479,7 @@ def main():
             save_checkpoint(os.path.join(run_dir, "solution_grid{}_a{}.npz".format(g, alpha)), [model.u_vec],
                             {"mesh_family": args.mesh_family, "grid": g, "mesh": os.path.abspath(mesh_path),
                              "alpha": alpha, "mach": args.mach, "Re": args.Re, "T_inf": args.T_inf,
-                             "farfield": args.farfield, "chord_file_units": info["chord"],
+                             "chord_file_units": info["chord"],
                              "converged": bool(rec["converged"])})
             if args.write_fields:
                 field_writer(model, run_dir, prefix="grid{}_a{}_".format(g, alpha))()

@@ -9,8 +9,15 @@
   centres and the wall distance.
 - One time-integration module for steady pseudo-transient continuation, unsteady BDF1/BDF2 and dual time
   (`core/time_integration.py`); opt-in for the Euler model, PTC by default for RANS.
-- Characteristic far field (`define_farfield_bc`, `DG_windtunnel_model(farfield="riemann")`) and its unsteady
-  transverse refinement (`TransverseFarfield`, 2D).
+- Characteristic far field (`define_farfield_bc`) and its unsteady transverse refinement (`TransverseFarfield`, 2D).
+  It is the only far field of `DG_windtunnel_model` and the default of `examples/flow_analysis.py`. The inflow/outflow
+  split is removed, and with it the 1 degree limit on changes of the angle of attack. Breaking changes: the
+  boundary dictionary is the flat free-stream state `{'rho', 'p', 'M', 'alpha'}` (the `'inlet'`/`'outlet'` form
+  raises); `DG_windtunnel_model(farfield=...)`, `define_subsonic_inflow_bc`, `define_subsonic_outflow_bc`,
+  `subsonic_inflow_state`, `subsonic_outflow_state`, `INLET_TAG`/`OUTLET_TAG` and `alpha_tagging` are gone;
+  `define_inlet_outlet_conditions`, `boundary_conditions['inlet'|'outlet']` and
+  `compute_initial_conditions_from_inlet` became `define_farfield_conditions`, `farfield_conditions` (flat) and
+  `compute_initial_conditions_from_farfield`. The far field is subsonic: `M >= 1` raises.
 - Shape design variables as modular layers (`core/shape_design.py`): `DG_windtunnel_model` takes an
   `FFDShapeParameterization` (FFD block + layers) instead of `ffd_shape`, `ffd_degree`, `ffd_block_corner_list`
   and `cp_coord_opt_idxs`, and no longer depends on which variables exist; `model.deform_mesh()` gives the
@@ -22,8 +29,18 @@
   mesh, with `solve_forward()` outside CSDL or `evaluate(alpha=...)` in a graph; `DG_postprocessor` computes
   forces and coefficients without FFD definitions (`forces_and_coefficients`, `evaluate` without a mesh
   deformation).
+- Moments about any number of points and directions: `DG_windtunnel_model(moments=[(name, point, direction), ...])`
+  and `DG_postprocessor(moments=...)` give CSDL outputs `M_<name>` (differentiated) and `c_m_<name>`, e.g. a
+  wing's root bending moment and pitching moment in one simulation. **Breaking:** `aero_center` and the outputs
+  `M`, `c_m` and `c_m_alpha` (with `log_cm_alpha`) are removed; the old pitching moment is
+  `("pitch", aero_center, "pitch")`. The FOM/ROM coefficient histories hold one $c_m$ per moment.
 - Partition-independent checkpoints; `examples/flow_analysis.py`, `examples/airfoil_analysis.py` and
   `examples/rans_airfoil_opt.py`.
+- Boundary tags of the mesh can define the wall and symmetry planes: `load_dolfinx_mesh` reads and stores the facet
+  tags of XDMF ("Facet tags"), gmsh `.msh` (physical groups, now readable) and planar CGNS (Wall, Farfield) meshes, and
+  `DG_windtunnel_model(wall_tags=..., symmetry_tags=...)` uses them in place of `mesh_inner_bdry_function`; every other
+  boundary is far field. The function is used if given, with a warning that lists the mesh's tags. `examples/flow_analysis.py`
+  takes `--wall-tags` and `--symmetry-tags`.
 - Mesh input from structured multi-block CGNS grids one cell thick (`utils/mesh_io_utils.py`:
   `load_dolfinx_mesh`, `cgns_to_dolfinx_mesh`), reduced to a 2D quadrilateral mesh in memory;
   `examples/flow_analysis.py --mesh` accepts them. 3D structured grids are read as hexahedra (`tdim=3`);

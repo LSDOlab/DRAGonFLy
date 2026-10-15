@@ -35,7 +35,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", choices=("euler", "rans"), default="euler")
     parser.add_argument("--mesh", default=None)
-    parser.add_argument("--farfield", choices=("split", "riemann"), default="split")
     args = parser.parse_args()
 
     if args.model == "rans":
@@ -49,16 +48,16 @@ if __name__ == '__main__':
         mesh_from_file = xdmf.read_mesh()
 
     attack = np.radians(2.0)
-    boundary_dict = {'inlet': {'rho': 1.0, 'M': mach, 'p': 1.0, 'alpha': attack},
-                     'outlet': {'p': 1.0}}
+    boundary_dict = {'rho': 1.0, 'M': mach, 'p': 1.0, 'alpha': attack}
 
     # No shape parameterization: no FFD block, no mesh warper -- a forward analysis.
     recorder = csdl.Recorder(inline=False)
     recorder.start()
     windtunnel = DG_windtunnel_model(mesh_from_file, boundary_dict,
+                                     moments=[("pitch", (0.25, 0.), "pitch")],
                                      mesh_inner_bdry_function=airfoil_inner_bdry_function,
                                      poly_order=0, filename_suffix="airfoil_analysis_" + args.model,
-                                     farfield=args.farfield, **model_kwargs)
+                                     **model_kwargs)
     windtunnel.euler_residual_conv_limit = 1e-12
     windtunnel.max_newton_iterations = 400
     windtunnel.set_up_sim()
@@ -66,11 +65,13 @@ if __name__ == '__main__':
     # (1) A plain forward solve and its forces, no CSDL involved
     u, converged, forces = windtunnel.solve_forward(attack)
     PETSc.Sys.Print("solve_forward: converged {}; ".format(converged)
-                    + ", ".join("{} {:.6f}".format(k, v) for k, v in forces.items()))
+                    + ", ".join("{} {:.6f}".format(k, v) for k, v in forces.items() if k != "moments")
+                    + "; " + ", ".join("{} {:.6f}/{:.6f}".format(k, m["M"], m["c_m"])
+                                       for k, m in forces["moments"].items()))
 
     # (2) The CSDL graph with alpha as its only input
     coefficients = DG_postprocessor(windtunnel.mesh, windtunnel.sim_model, windtunnel.WALL_TAG,
-                                    windtunnel.aero_center)
+                                    moments=windtunnel.moments)
     alpha = csdl.Variable(name='alpha', value=np.array([attack]))
     alpha.set_as_design_variable(lower=np.radians(1.0), upper=np.radians(3.0))
     u_vec = windtunnel.evaluate(alpha=alpha)

@@ -10,11 +10,19 @@ a 3D grid (e.g. the Simple Transonic Wing's wing_vol_L*.cgns) into one
 hexahedral mesh the same way. cgns_to_dolfinx_mesh turns either into a
 distributed dolfinx mesh in memory: no intermediate file.
 
+Boundary tags: load_dolfinx_mesh also reads the boundary facet tags a mesh
+file carries (an XDMF "Facet tags" grid, the physical groups of a gmsh .msh,
+the Wall and Farfield families of a planar CGNS grid) and stores them on the
+returned mesh with attach_facet_tags, where core/mesh_manager.py:Mesh finds
+them. They can define the wall and symmetry boundaries in place of a function
+of the facet midpoints (DG_windtunnel_model's wall_tags and symmetry_tags).
+
 Block interface nodes are merged by EXACT coordinate match, which holds for
 grids whose 1-to-1 interfaces were written point-matched (Pointwise exports
 are); a grid that needs a tolerance merge fails the boundary check below.
 """
 import os
+import xml.etree.ElementTree as ET
 
 import numpy as np
 from mpi4py import MPI
@@ -285,6 +293,38 @@ def read_cgns_volume(cgns_path, interface_rel_tol=1e-10):
                 n_blocks=len(blocks))
 
 
+def attach_facet_tags(mesh, facet_tags, tag_names=None):
+    """
+    Store boundary facet tags on a dolfinx mesh, where core/mesh_manager.py:Mesh
+    looks for them: `mesh.facet_tags`, a dolfinx MeshTags of the facets (or
+    None), and `mesh.facet_tag_names`, a dict {name: tag value} of the tags that
+    have a name (gmsh physical groups, CGNS families). Returns the mesh.
+    """
+    if facet_tags is not None and facet_tags.dim != mesh.topology.dim - 1:
+        raise ValueError("facet tags are defined on entities of dimension {}, not on facets "
+                         "(dimension {})".format(facet_tags.dim, mesh.topology.dim - 1))
+    mesh.facet_tags = facet_tags
+    mesh.facet_tag_names = dict(tag_names or {})
+    return mesh
+
+
+def _cgns_facet_tags(mesh, edge_sets, comm):
+    """
+    MeshTags of the facets of a planar CGNS mesh from node index pairs, one
+    array per tag value ({value: (n, 2) array on rank 0, empty elsewhere}); the
+    pairs are in the input (merged-block) node numbering.
+    """
+    import dolfinx.io.gmsh
+    entities = np.concatenate([e for e in edge_sets.values()]).astype(np.int64)
+    values = np.concatenate([np.full(len(e), v, dtype=np.int32) for v, e in edge_sets.items()])
+    local_entities, local_values = dolfinx.io.gmsh.distribute_entity_data(mesh, 1, entities, values)
+    mesh.topology.create_connectivity(1, 2)
+    tags = dolfinx.mesh.meshtags_from_entities(
+        mesh, 1, dolfinx.graph.adjacencylist(local_entities), local_values.astype(np.int32, copy=False))
+    tags.name = "facet_tags"
+    return tags
+
+
 def cgns_to_dolfinx_mesh(cgns_path, comm=MPI.COMM_WORLD, tdim=2, **kwargs):
     """
     A distributed dolfinx mesh from a structured CGNS grid: rank 0 reads it
@@ -330,20 +370,66 @@ def cgns_to_dolfinx_mesh(cgns_path, comm=MPI.COMM_WORLD, tdim=2, **kwargs):
     element = basix.ufl.element("Lagrange", cell_name, 1, shape=(tdim,))
     partitioner = dolfinx.mesh.create_cell_partitioner(dolfinx.mesh.GhostMode.shared_facet, 2)
     mesh = dolfinx.mesh.create_mesh(comm, cells, element, x, partitioner=partitioner)
+    if tdim == 2:
+        # the families the planar reader found are the boundary tags: wall 1, far field 2
+        empty = np.empty((0, 2), dtype=np.int64)
+        edge_sets = {1: data["wall_edges"] if comm.rank == 0 else empty,
+                     2: data["farfield_edges"] if comm.rank == 0 else empty}
+        names = {kwargs.get("wall_family", "Wall"): 1, kwargs.get("farfield_family", "Farfield"): 2}
+        attach_facet_tags(mesh, _cgns_facet_tags(mesh, edge_sets, comm), names)
+    else:
+        attach_facet_tags(mesh, None)
     return mesh, info
 
 
-def load_dolfinx_mesh(path, comm=MPI.COMM_WORLD, mesh_name="mesh", tdim=2, **cgns_kwargs):
+def _xdmf_grid_names(path):
+    """The names of the Grid nodes of an XDMF file (read by every rank)."""
+    return [g.get("Name") for g in ET.parse(path).getroot().iter("Grid")]
+
+
+def _read_xdmf(path, comm, mesh_name, facet_tags_name):
+    with dolfinx.io.XDMFFile(comm, path, "r") as xdmf:
+        mesh = xdmf.read_mesh(name=mesh_name)
+        mesh.topology.create_entities(mesh.topology.dim - 1)
+        grids = _xdmf_grid_names(path)
+        if facet_tags_name is not None and facet_tags_name not in grids:
+            raise ValueError("{} has no grid '{}' of facet tags (grids: {})".format(
+                path, facet_tags_name, grids))
+        name = facet_tags_name if facet_tags_name is not None else (
+            "Facet tags" if "Facet tags" in grids else None)
+        tags = xdmf.read_meshtags(mesh, name) if name is not None else None
+    return attach_facet_tags(mesh, tags)
+
+
+def _read_msh(path, comm, tdim):
+    import dolfinx.io.gmsh
+    partitioner = dolfinx.mesh.create_cell_partitioner(dolfinx.mesh.GhostMode.shared_facet, 2)
+    data = dolfinx.io.gmsh.read_from_msh(path, comm, rank=0, gdim=tdim, partitioner=partitioner)
+    names = {name: group.tag for name, group in data.physical_groups.items()
+             if group.dim == data.mesh.topology.dim - 1}
+    return attach_facet_tags(data.mesh, data.facet_tags, names)
+
+
+def load_dolfinx_mesh(path, comm=MPI.COMM_WORLD, mesh_name="mesh", tdim=2, facet_tags_name=None,
+                      **cgns_kwargs):
     """
-    A dolfinx mesh from an XDMF file (grid `mesh_name`) or a structured CGNS
-    grid (cgns_to_dolfinx_mesh with `tdim`, cgns_kwargs passed on), by file
-    extension. Returns (mesh, info); info is cgns_to_dolfinx_mesh's dict, or {}
-    for XDMF. Collective.
+    A dolfinx mesh from an XDMF file (grid `mesh_name`), a gmsh .msh file or a
+    structured CGNS grid (cgns_to_dolfinx_mesh with `tdim`, cgns_kwargs passed
+    on), by file extension. Returns (mesh, info); info is
+    cgns_to_dolfinx_mesh's dict, or {} for the others. Collective.
+
+    The boundary facet tags the file carries are stored on the mesh
+    (attach_facet_tags): mesh.facet_tags is a MeshTags or None, mesh.facet_tag_names
+    maps tag names to values where the format has names. XDMF: the grid named
+    `facet_tags_name` (default: "Facet tags" if the file has it); .msh: the
+    physical groups of facets, `tdim` being the mesh dimension; CGNS: the Wall
+    (1) and Farfield (2) families of a planar grid, none for a volume grid.
     """
     ext = os.path.splitext(path)[1].lower()
     if ext == ".cgns":
         return cgns_to_dolfinx_mesh(path, comm, tdim=tdim, **cgns_kwargs)
     if ext == ".xdmf":
-        with dolfinx.io.XDMFFile(comm, path, "r") as xdmf:
-            return xdmf.read_mesh(name=mesh_name), {}
-    raise ValueError("unsupported mesh file '{}': expected .xdmf or .cgns".format(path))
+        return _read_xdmf(path, comm, mesh_name, facet_tags_name), {}
+    if ext == ".msh":
+        return _read_msh(path, comm, tdim), {}
+    raise ValueError("unsupported mesh file '{}': expected .xdmf, .msh or .cgns".format(path))

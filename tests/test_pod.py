@@ -185,28 +185,33 @@ class TestSnapshotMatrix:
 
     # -- accuracy of the incremental SVD ---------------------------------
     @weighted_or_not
+    @pytest.mark.verification
     def test_singular_values_match_known_svd(self, weighted):
         with self._case(weighted) as case:
             self.assert_close(case.sigma, case.sigma_true)
 
     @weighted_or_not
+    @pytest.mark.unit_test
     def test_reconstructs_snapshot_matrix(self, weighted):
         with self._case(weighted) as case:
             self.assert_close(case.U @ np.diag(case.sigma) @ case.VT, case.X)
 
     @weighted_or_not
+    @pytest.mark.unit_test
     def test_left_singular_vectors_are_W_orthonormal(self, weighted):
         with self._case(weighted) as case:
             U = case.U
             self.assert_close(U.T @ case.apply_W(U), np.eye(case.snapshot_matrix.rank))
 
     @weighted_or_not
+    @pytest.mark.verification
     def test_left_singular_vectors_match_known_svd(self, weighted):
         with self._case(weighted) as case:
             alignment = np.abs(case.U.T @ case.apply_W(case.U_true))
             self.assert_close(alignment, np.eye(self.N_SNAPSHOTS))
 
     @weighted_or_not
+    @pytest.mark.unit_test
     def test_right_singular_vectors_are_orthonormal(self, weighted):
         with self._case(weighted) as case:
             VT = case.VT
@@ -214,6 +219,7 @@ class TestSnapshotMatrix:
 
     # -- bookkeeping, rank deficiency, truncation -------------------------
     @weighted_or_not
+    @pytest.mark.unit_test
     def test_rank_and_snapshot_bookkeeping(self, weighted):
         with self._case(weighted) as case:
             sm = case.snapshot_matrix
@@ -223,12 +229,14 @@ class TestSnapshotMatrix:
             assert sm.R.getSize() == (self.N_SNAPSHOTS, self.N_SNAPSHOTS)
             assert sm.Sigma.getSize() == self.N_SNAPSHOTS
 
+    @pytest.mark.unit_test
     def test_full_svd_triplet_is_all_none_before_any_snapshot(self):
         with self._case(weighted=False, columns=np.zeros((self.N_DOFS, 0))) as case:
             assert case.snapshot_matrix.full_SVD_triplet == (None, None, None)
             assert case.snapshot_matrix.n_snapshots == 0
 
     @weighted_or_not
+    @pytest.mark.unit_test
     def test_rank_deficient_snapshot_is_rejected(self, weighted):
         with self._case(weighted) as case:
             sm = case.snapshot_matrix
@@ -243,6 +251,7 @@ class TestSnapshotMatrix:
 
     @weighted_or_not
     @pytest.mark.parametrize("scale", [1e-13, 1.0, 1e8])
+    @pytest.mark.unit_test
     def test_rank_test_is_relative_to_the_snapshot_norm(self, weighted, scale):
         """The same decision at every scale: a snapshot in the span adds no
         direction, a genuinely new one does -- also at 1e-13, where its
@@ -262,6 +271,7 @@ class TestSnapshotMatrix:
             self.assert_close(U.T @ case.apply_W(U), np.eye(sm.rank))
 
     @weighted_or_not
+    @pytest.mark.unit_test
     def test_large_near_span_snapshot_adds_no_round_off_direction(self, weighted):
         """In the span up to a relative 1e-13 at scale 1e6: rejected. An
         absolute test would accept it (residual ~1e-6) and add a direction of
@@ -276,6 +286,7 @@ class TestSnapshotMatrix:
             assert sm.rank == self.N_SNAPSHOTS
 
     @weighted_or_not
+    @pytest.mark.unit_test
     def test_duplicate_parameter_vector_is_skipped(self, weighted):
         with self._case(weighted) as case:
             sm = case.snapshot_matrix
@@ -286,6 +297,7 @@ class TestSnapshotMatrix:
             assert (sm.rank, sm.n_snapshots) == (rank_before, n_before)
 
     @weighted_or_not
+    @pytest.mark.unit_test
     def test_duplicate_parameter_vector_retains_reconstruction_weights(self, weighted):
         """Feeding back snapshot 0 itself reconstructs as d = e_0."""
         with self._case(weighted) as case:
@@ -299,6 +311,7 @@ class TestSnapshotMatrix:
             self.assert_close(sm.rejected_snapshot_reconstruction_weights[0], expected)
 
     @weighted_or_not
+    @pytest.mark.unit_test
     def test_duplicate_parameter_vector_weights_satisfy_R_old_d_eq_r(self, weighted):
         """With a wide (truncated) R, the stored d solves R_old d = Q^T W x."""
         k = self.TRUNCATED_RANK
@@ -323,6 +336,7 @@ class TestSnapshotMatrix:
             self.assert_close(R_old_np @ d, r_vec_np)
 
     @weighted_or_not
+    @pytest.mark.unit_test
     def test_rejected_reconstruction_weight_length_is_frozen_at_rejection_time(self, weighted):
         comm = MPI.COMM_WORLD
         X = self._build_reference(weighted)[0]
@@ -346,6 +360,7 @@ class TestSnapshotMatrix:
             template_vec.destroy()
 
     @weighted_or_not
+    @pytest.mark.unit_test
     def test_max_rank_truncation_is_lossless_for_rank_deficient_data(self, weighted):
         k = self.TRUNCATED_RANK
         with self._case(weighted, max_rank=k, rank_deficient_to=k) as case:
@@ -357,11 +372,13 @@ class TestSnapshotMatrix:
 
     # -- parallel behaviour ------------------------------------------------
     @weighted_or_not
+    @pytest.mark.unit_test
     def test_U_row_layout_matches_snapshot_vector_layout(self, weighted):
         with self._case(weighted) as case:
             assert case.snapshot_matrix.U.getLocalSize()[0] == case.template_vec.getLocalSize()
 
     @weighted_or_not
+    @pytest.mark.unit_test
     def test_svd_triplet_is_identical_on_all_ranks(self, weighted):
         with self._case(weighted) as case:
             all_sigma = case.comm.allgather(case.sigma)
@@ -371,6 +388,7 @@ class TestSnapshotMatrix:
 
 
 class TestDiagonalWeight:
+    @pytest.mark.unit_test
     def test_matches_a_diagonal_matrix(self):
         """DiagonalWeight (pointwise multiply) gives the same SVD as the same
         diagonal W as an AIJ Mat."""
@@ -406,6 +424,7 @@ class TestDiagonalWeight:
 
 
 class TestCubicDistHat:
+    @pytest.mark.unit_test
     def test_normal_case_dist_hat_is_the_kplus1th_smallest(self):
         dist = np.arange(8.0)
         k = 3
@@ -419,6 +438,7 @@ class TestCubicDistHat:
         assert w[0] == pytest.approx(1.0)
         assert np.all(np.diff(w[:k + 1]) <= 1e-12)
 
+    @pytest.mark.unit_test
     def test_edge_case_all_snapshots_requested(self):
         dist = np.array([0.0, 1.0, 2.0, 5.0])
         dist_hat = cubic_dist_hat(dist, dist.min(), dist.max(), n_nonzero_weights=4)
@@ -426,11 +446,13 @@ class TestCubicDistHat:
         w = cubic_weights(dist, dist.min(), dist_hat)
         assert np.all(w > 0.0) and np.all(np.isfinite(w))
 
+    @pytest.mark.unit_test
     def test_edge_case_oversubscribed_request_clamps(self):
         dist = np.array([0.0, 1.0, 2.0])
         w = cubic_weights(dist, dist.min(), cubic_dist_hat(dist, dist.min(), dist.max(), 1000))
         assert np.all(w > 0.0)
 
+    @pytest.mark.unit_test
     def test_tied_nearest_neighbours_are_all_included(self):
         dist = np.array([1.0, 1.0, 1.0, 3.0, 4.0, 5.0])
         dist_hat = cubic_dist_hat(dist, dist.min(), dist.max(), n_nonzero_weights=1)
@@ -440,12 +462,14 @@ class TestCubicDistHat:
         assert w[0] == w[1] == w[2] == pytest.approx(1.0)
         assert (w[3:] == 0.0).all()
 
+    @pytest.mark.unit_test
     def test_near_tie_is_finite_not_singular(self):
         dist = np.array([1.0, 1.0 + 1e-13, 1.0 + 1e-13, 3.0, 4.0])
         w = cubic_weights(dist, dist.min(), cubic_dist_hat(dist, dist.min(), dist.max(), 1))
         assert np.all(np.isfinite(w))
         assert np.count_nonzero(w) >= 1
 
+    @pytest.mark.unit_test
     def test_weights_are_well_defined_at_large_absolute_distances(self):
         dist = np.array([1000.0, 1000.5, 1001.0, 1005.0])
         w = cubic_weights(dist, dist.min(), cubic_dist_hat(dist, dist.min(), dist.max(), 2))
@@ -457,17 +481,20 @@ class TestCubicDistHat:
 class TestCubicDistHatFixed:
     """The user-set cutoff dist_hat = c min + (1 - c) max."""
 
+    @pytest.mark.unit_test
     def test_formula(self):
         assert cubic_dist_hat_fixed(1.0, 5.0, 0.0) == pytest.approx(5.0)
         assert cubic_dist_hat_fixed(1.0, 5.0, 0.8) == pytest.approx(1.8)
         assert cubic_dist_hat_fixed(1.0, 5.0, 0.5) == pytest.approx(3.0)
 
+    @pytest.mark.unit_test
     def test_c_zero_drops_only_the_farthest(self):
         dist = np.array([0.0, 1.0, 2.0, 5.0])
         w = cubic_weights(dist, dist.min(), cubic_dist_hat_fixed(dist.min(), dist.max(), 0.0))
         assert np.all(w[:3] > 0.0)
         assert w[3] == pytest.approx(0.0, abs=1e-14)
 
+    @pytest.mark.unit_test
     def test_support_narrows_with_c(self):
         dist = np.arange(11.0)
         counts = [np.count_nonzero(cubic_weights(dist, 0.0, cubic_dist_hat_fixed(0.0, 10.0, c)) > 0)
@@ -475,6 +502,7 @@ class TestCubicDistHatFixed:
         assert counts == [10, 5, 2]
 
     @pytest.mark.parametrize("c", [-0.1, 1.0, 1.5])
+    @pytest.mark.unit_test
     def test_out_of_range_c_raises(self, c):
         with pytest.raises(ValueError):
             cubic_dist_hat_fixed(0.0, 1.0, c)
@@ -484,18 +512,21 @@ class TestBasisSizeFloor:
     """The smallest cubic support radius leaving the rb_size nearest
     snapshots a nonzero weight."""
 
+    @pytest.mark.unit_test
     def test_next_larger_distance(self):
         d = np.array([3.0, 0.0, 2.0, 1.0, 5.0])
         floor = basis_size_floor(d, rb_size=3, spread=5.0)
         assert floor == pytest.approx(3.0)            # 3rd smallest is 2 -> next is 3
         assert np.count_nonzero(cubic_weights(d, 0.0, floor) > 1e-10) == 3
 
+    @pytest.mark.unit_test
     def test_ties_at_the_boundary_stay_inside(self):
         d = np.array([0.0, 1.0, 1.0, 1.0, 2.0])
         floor = basis_size_floor(d, rb_size=2, spread=2.0)
         assert floor == pytest.approx(2.0)
         assert np.count_nonzero(cubic_weights(d, 0.0, floor) > 1e-10) == 4
 
+    @pytest.mark.unit_test
     def test_margin_when_the_next_distance_is_barely_larger(self):
         d = np.array([0.0, 1.0, 1.0 + 1e-9, 3.0])
         floor = basis_size_floor(d, rb_size=2, spread=3.0)
@@ -503,6 +534,7 @@ class TestBasisSizeFloor:
         w = cubic_weights(d, 0.0, floor)
         assert w[1] > 1e-6                            # the 2nd snapshot is not pruned
 
+    @pytest.mark.unit_test
     def test_fewer_snapshots_than_rb_size(self):
         d = np.array([0.0, 1.0, 2.0])
         floor = basis_size_floor(d, rb_size=5, spread=2.0)
@@ -538,12 +570,14 @@ class TestPODLocalWeightedBasis:
             pod.destroy()
             template.destroy()
 
+    @pytest.mark.unit_test
     def test_normal_case_basis_width_matches_n_nonzero_weights(self):
         with self._qr_case(self.N_SNAPSHOTS) as (pod, template):
             pod.construct_basis(rb_size=self.N_SNAPSHOTS, n_nonzero_weights=3,
                                 local_parametervector=np.array([0.0]), layout_vec=template)
             assert pod.basis.getSize()[1] == 3
 
+    @pytest.mark.unit_test
     def test_default_n_nonzero_weights_is_rb_size(self):
         widths = []
         for n_nonzero in (None, 4):
@@ -553,6 +587,7 @@ class TestPODLocalWeightedBasis:
                 widths.append(pod.basis.getSize()[1])
         assert widths == [4, 4]
 
+    @pytest.mark.unit_test
     def test_n_nonzero_weights_ge_n_snapshots_uses_every_snapshot(self):
         with self._qr_case(self.N_SNAPSHOTS) as (pod, template):
             pod.construct_basis(rb_size=self.N_SNAPSHOTS, n_nonzero_weights=self.N_SNAPSHOTS + 100,
@@ -569,6 +604,7 @@ class TestPODLocalWeightedBasis:
         (6, 0.8, 6),     # c radius 1.4 < floor 6: the floor keeps rb_size snapshots
         (10, 0.9, 8),    # rb_size above the snapshot count: every snapshot
     ])
+    @pytest.mark.unit_test
     def test_cubic_cutoff_never_narrows_the_basis_below_rb_size(self, rb_size, c, n_weights):
         """Distances 0..7. The support radius is max(c radius, rb_size floor):
         the basis always has min(rb_size, n_snapshots) columns, and c can only
@@ -579,6 +615,7 @@ class TestPODLocalWeightedBasis:
                                 local_parametervector=np.array([0.0]), layout_vec=template)
             assert pod.basis.getSize()[1] == min(rb_size, self.N_SNAPSHOTS)
 
+    @pytest.mark.unit_test
     def test_cubic_cutoff_set_at_construction(self):
         """c given to PODBasis() is construct_basis's default: the basis equals
         the one from passing the same c per call, and differs from the
@@ -602,6 +639,7 @@ class TestPODLocalWeightedBasis:
         assert pod.cubic_cutoff == 0.5
         pod.destroy()
 
+    @pytest.mark.unit_test
     def test_cubic_cutoff_floor_counts_accepted_snapshots_only(self):
         """A duplicate of snapshot 0 (its parameter and state) adds no column,
         so it must not take one of the rb_size places: rb_size 4 still gives 4
@@ -619,12 +657,14 @@ class TestPODLocalWeightedBasis:
                                 layout_vec=template)
             assert pod.basis.getSize()[1] == 4
 
+    @pytest.mark.unit_test
     def test_basis_is_W_orthonormal(self):
         with self._qr_case(self.N_SNAPSHOTS) as (pod, template):
             pod.construct_basis(rb_size=5, local_parametervector=np.array([2.5]), layout_vec=template)
             V = np.vstack(MPI.COMM_WORLD.allgather(pod.basis.getDenseArray().copy()))
             assert V.T @ V == pytest.approx(np.eye(V.shape[1]), abs=1e-12)
 
+    @pytest.mark.verification
     def test_global_basis_is_the_leading_singular_vectors(self):
         comm = MPI.COMM_WORLD
         pod = PODBasis(comm, self.N_DOFS, basis_mode='global')
@@ -667,6 +707,7 @@ class TestPODLocalWeightedBasis:
         set_petsc_vec_array(template, np.asarray(values)[rstart:rend])
         return pod.snapshot_matrix.process_and_append_to_snapshot_lists(template, np.array([par_scalar]))
 
+    @pytest.mark.unit_test
     def test_duplicate_weight_is_redistributed_onto_reconstructing_snapshots(self):
         """Duplicate of snapshot 0's parameter with state 0.5 snap0 + 0.5 snap1
         -> d = [0.5, 0.5, 0]. Linear weights at [0]: distances [0, 10, 20, 0]
@@ -680,12 +721,14 @@ class TestPODLocalWeightedBasis:
             assert w == pytest.approx([0.75, 0.25, 0.0], abs=1e-10)
             assert distnorm.shape == (3,)
 
+    @pytest.mark.unit_test
     def test_n_rej_zero_is_unchanged(self):
         with self._axis_aligned_pod() as (pod, template):
             w, distnorm = pod._local_weighted_snapshot_weights(np.array([0.0]), 'Linear', None, None, 3)
             assert w == pytest.approx([1.0, 0.0, 0.0], abs=1e-10)
             assert distnorm.shape == (3,)
 
+    @pytest.mark.unit_test
     def test_cubic_n_nonzero_weights_counts_rejected_points_too(self):
         """Distances [0, 10, 20, 0], k = 1: the tie at 0 widens k to 2,
         dist_hat = 10 -> [1, 0, 0, 1] -> [0.75, 0.25, 0]; 2 basis columns."""
@@ -697,6 +740,7 @@ class TestPODLocalWeightedBasis:
                                 layout_vec=template)
             assert pod.basis.getSize()[1] == 2
 
+    @pytest.mark.unit_test
     def test_parameter_weights_scale_the_distance(self):
         """Weighting the second parameter by 0 makes it irrelevant."""
         comm = MPI.COMM_WORLD

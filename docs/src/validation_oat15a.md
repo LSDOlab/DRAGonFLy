@@ -21,11 +21,15 @@ experimental data and other solvers will be added later.
 | Static free-stream temperature | 271 K (Sutherland's law), as in DPW8 test case 1a |
 | Angles of attack | $\alpha$ = 1.36°, 1.50°, 2.50°, 3.00°, 3.10° |
 | Model | SA-neg RANS, cell-centred finite volume ($p = 0$), MUSCL inviscid fluxes |
-| Boundary conditions | adiabatic no-slip wall; subsonic inflow/outflow far field |
-| Solver | pseudo-transient continuation from the free stream (CFL$_0$ = 5) to a residual of $10^{-9}$ |
+| Boundary conditions | adiabatic no-slip wall; subsonic inflow/outflow far field (the inflow/outflow split, since replaced by the characteristic far field; these results predate the change) |
+| Solver | pseudo-transient continuation (CFL$_0$ = 5) to a residual of $10^{-9}$, started from the converged first-order RANS solution |
 | Moment reference | quarter chord, positive nose-up |
 
-Every case starts from the same free stream. Cases run one at a time.
+Cases run one at a time. Each starts from the converged first-order solution of the same model: the RANS solve
+without MUSCL, itself started from the free stream, on the same mesh and angle of attack (`--init first-order`,
+the default). In the one case tested, REV02 Level 1 at $\alpha = 1.36^\circ$, this took 98 MUSCL pseudo-time steps
+against 180 from the free stream, and the converged solution is the same to the printed digits. The Rizzi results below were computed before this option existed and start from the free
+stream.
 
 ## Obtaining the meshes
 
@@ -197,6 +201,24 @@ Useful options:
 
 - `--grids` and `--alphas` run a subset, for example `--grids 1 2 --alphas 2.5`.
 - `--mesh-family rizzi` runs the Rizzi grids 1–7 instead.
+- `--init {first-order,rans1,euler,freestream}` selects the starting state: the first-order RANS solution (the
+  default for the RANS model), the first-order RANS or Euler solution by name, or the free stream (the default
+  for `--model euler`). `--init-tol` and
+  `--init-max-steps` control the first-order solve; its wall time is reported in `results.csv` as `init_s` and
+  `init_steps`.
+- `--model euler` runs the Euler equations (slip wall, no turbulence model) instead of SA-neg RANS: the
+  first-order model (HLL flux) by default, started from the free stream. `--muscl` adds MUSCL reconstruction, with
+  the Van Albada limiter, $\epsilon = 0.1$, as its default slope limiter (`--limiter`, `--limiter-eps`; the RANS
+  model defaults to no limiter). The MUSCL Euler model is fragile on the Rizzi grid 1 at
+  $\alpha = 2.5^\circ$, and the results should be treated as experimental. Without a limiter it ended in a
+  positivity-limiter freeze. With the Van Albada limiter it reached one of two different converged steady states,
+  with the upper-surface shock at $x = 0.714$ ($c_l = 1.2245$) or at $x = 0.684$ ($c_l = 1.1977$), both to a
+  residual below $10^{-9}$; in one run it did not converge in 921 steps. The number of steps varies as well
+  (166 to 610 for converged runs), and runs with identical settings did not always give the same outcome. The
+  RANS model, in contrast, gave identical coefficients from every starting state tested. `--init euler` starts
+  the MUSCL Euler model from the first-order Euler solution.
+- `--cfl-rise-min` and `--cfl-rise-max` set how much the pseudo-time CFL number is cut when the residual rises
+  (default: by the residual ratio, between 0.7 and 0.9).
 - `--mesh-dir` points at meshes kept outside `meshes/`.
 
 The SA-neg model, the mesh input and the force coefficients come from `examples/flow_analysis.py` and the

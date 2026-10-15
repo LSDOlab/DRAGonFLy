@@ -13,6 +13,9 @@ from dragonfly_sim.core.turbulence_models import Laminar, SpalartAllmarasNeg
 from cases import rans_square_model, mms_rans_model
 
 
+pytestmark = [pytest.mark.verification]
+
+
 def test_green_gauss_is_exact_for_a_linear_field():
     # Uniform quads: the facet average of a linear field is its value at the
     # facet midpoint, so the Green-Gauss sum is exact in every cell, boundary

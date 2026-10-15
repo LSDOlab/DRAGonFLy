@@ -32,21 +32,35 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
     # the shared mesh, so they must never overlap -- also on a single process.
     ordered_callbacks = True
 
-    def __init__(self, mesh, boundary_dict, shape_parameterization=None, aero_center=None,
-                 mesh_inner_bdry_function=None,
+    def __init__(self, mesh, boundary_dict, shape_parameterization=None, moments=None,
+                 mesh_inner_bdry_function=None, wall_tags=None, symmetry_tags=None,
                  poly_order=1, gamma=1.4,
                  filename_suffix="test",
                  asm_overlap=None, ilu_levels=None,
-                 model_class=CompressibleEulerModel, model_kwargs=None, farfield="split",
+                 model_class=CompressibleEulerModel, model_kwargs=None,
                  reduced_order_model=None):
         """
-        The shape of the object being optimized is defined either through `mesh_inner_bdry_function`
-        or through the shape parameterization's FFD block corners
-        (shape_parameterization.inner_boundary_function()), which bound the box
-        the inner boundary facets are contained in and can therefore supply the
-        same signal. At least one of the two is required; when both are given
-        the explicit function wins, since it can encode exclusions the FFD block
-        cannot.
+        boundary_dict: the free-stream state {'rho', 'p', 'M', 'alpha'} (density,
+        pressure, Mach number, angle of attack in rad). The whole outer boundary
+        is a characteristic far field built from it, so the angle of attack can
+        change by any amount during an optimization; there is no inflow/outflow
+        division to choose or to keep valid.
+
+        The shape of the object being optimized (the wall) is defined in one of
+        three ways, in this order of precedence:
+        1. `mesh_inner_bdry_function`, a function of the boundary facet midpoints
+           (shape (dim, n)) returning a boolean wall mask. It can encode
+           exclusions the FFD block cannot. If the mesh also carries boundary
+           facet tags (utils/mesh_io_utils.py:load_dolfinx_mesh stores them on
+           the mesh), a warning lists them: they could be used instead.
+        2. `wall_tags`: the mesh's boundary facet tags (values or names, one or
+           several) that are the wall, and `symmetry_tags` those that are
+           symmetry planes (slip walls). Every other boundary is far field.
+           In 3D without tags, the symmetry plane is y = 0.
+        3. The shape parameterization's FFD block corners
+           (shape_parameterization.inner_boundary_function()), which bound the
+           box the inner boundary facets are contained in.
+        At least one is required.
 
         shape_parameterization: the wall-shape parameterization, e.g. a
         shape_design.FFDShapeParameterization -- the FFD block and the layers
@@ -60,17 +74,16 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         a forward flow analysis, with derivatives with respect to alpha.
         solve_forward() runs one flow solve without a CSDL graph at all.
 
-        aero_center: moment reference point; defaults to (0.25, 0[, 0]).
+        moments: the moments of the wall force to compute, print and differentiate,
+        a sequence of (name, point, direction[, ref_length]) tuples (see
+        DG_postprocessor); default none. E.g. the pitching moment about the quarter
+        chord of a wing, ("pitch", (0.25, 0., 0.), "pitch"), and its root
+        bending moment, ("root_bending", (0.25, 0., 0.), (1., 0., 0.)).
 
         model_class / model_kwargs select the flow model: CompressibleEulerModel
         (the default) or e.g. core.RANS_model.CompressibleRANSModel with
         model_kwargs={'Re': 6e6}. The body's wall is the model's
         define_wall_bc (slip for Euler, adiabatic no-slip for RANS).
-
-        farfield: "split" divides the outer boundary into a subsonic inflow
-        and outflow perpendicular to the free stream (the default); "riemann"
-        puts the characteristic far field (define_farfield_bc) on all of it,
-        which needs no split and so no guard on large alpha changes.
 
         reduced_order_model: a core.reduced_order_model.ReducedOrderModel to
         try before every flow solve (see _solve), or None for full-order
@@ -108,19 +121,17 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
                             "(e.g. shape_design.FFDShapeParameterization), got {!r}. The FFD "
                             "block arguments (ffd_shape, ffd_degree, ffd_block_corner_list, "
                             "cp_coord_opt_idxs) moved there.".format(shape_parameterization))
-        if mesh_inner_bdry_function is None and shape_parameterization is not None:
+        if mesh_inner_bdry_function is None and wall_tags is None and shape_parameterization is not None:
             mesh_inner_bdry_function = shape_parameterization.inner_boundary_function()
-        if mesh_inner_bdry_function is None:
-            raise ValueError("Provide either mesh_inner_bdry_function or a shape "
-                             "parameterization with FFD block corners to locate the inner "
-                             "boundary facets.")
+        if mesh_inner_bdry_function is None and wall_tags is None:
+            raise ValueError("Provide either mesh_inner_bdry_function, wall_tags (the mesh's own "
+                             "boundary tags) or a shape parameterization with FFD block corners "
+                             "to locate the inner boundary facets.")
 
         # Initial instantiation of mesh and simulation model
         self.mesh = Mesh(mesh, mesh_inner_bdry_function,
-                         node_match_tol=self.mesh_node_match_tol)
-        if farfield not in ("split", "riemann"):
-            raise ValueError("farfield must be 'split' or 'riemann'")
-        self.farfield = farfield
+                         node_match_tol=self.mesh_node_match_tol,
+                         wall_tags=wall_tags, symmetry_tags=symmetry_tags)
         if model_class is CompressibleEulerModel:
             _euler_kwargs = dict(poly_order=poly_order, gamma=gamma)
             self.sim_model = CompressibleEulerModel(self.mesh, **_euler_kwargs)
@@ -162,15 +173,46 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         # Naming suffix for exported files
         self.filename_suffix = filename_suffix
 
-        # Include dc_m/d(alpha) in printed coefficient outputs 
-        # (costs one extra linear solve per print)
-        self.log_cm_alpha = True
-
         # Free the flow solver's matrices after every forward solve and the
         # condensed dR/dU after every condensed adjoint
         # (sim_model.release_solver), so the two never coexist; they are
         # rebuilt when next needed. For memory-bound runs (3D RANS).
         self.release_solver_memory = False
+
+        # Adjoint reuse. The transposed dR/dU and the preconditioned KSP of the
+        # state last linearized (condensed Jacobian), kept for the adjoint
+        # solves of every output of that design: {'key': state key, 'ksp': KSP};
+        # freed when the next flow solve starts or a different state is
+        # linearized.
+        self._adjoint_cache = None
+
+        # Options of the adjoint of a model with a condensed Jacobian (default off;
+        # set_adjoint_options sets them together with those of the reconstruction):
+        #   adjoint_matrix_free   the adjoint operator A_UU^T x + B^T (A_UG^T x), without
+        #                         forming A or the product A_UG B
+        #   cache_jacvec_operators  the dR/dx operator and dR/dalpha of the
+        #                         compute_jacvec_product calls of all outputs of one
+        #                         design are built once (freed with the adjoint cache)
+        self.adjoint_matrix_free = False
+        self.cache_jacvec_operators = False
+        # PETSc options (names without the "adj_" prefix) overriding the adjoint KSP's settings of the
+        # model, e.g. {"ksp_type": "hpddm", "ksp_hpddm_type": "gcrodr", "ksp_hpddm_recycle": 20}; the KSP
+        # is kept for all outputs of a design, so a recycling method carries its subspace between them
+        self.adjoint_ksp_options = None
+        self._dRdx_cache = None
+        self._dRdalpha_cache = None
+
+        # Start each condensed adjoint solve from a first-order solution: the
+        # solution of the same transposed system with the compact (nearest
+        # neighbour, gradients frozen) part A_UU of the Jacobian alone -- the
+        # first-order Jacobian the preconditioner is built from -- solved to a
+        # relative tolerance first_order_adjoint_rtol. It reuses the
+        # preconditioner's factors, so costs only Krylov iterations. Applies to
+        # models with a condensed Jacobian (MUSCL / RANS); the guess is always
+        # used, and its effect is logged (self._last_first_order_guess).
+        self.adjoint_first_order_guess = False
+        self.first_order_adjoint_rtol = 1e-2
+        self._last_first_order_guess = None
 
         # Write mesh_deformation_<suffix>.bp (the node motions of every design
         # evaluation). The solution files are written either way.
@@ -189,14 +231,12 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         self.poly_order:int = poly_order
         self.gamma:float = gamma
         self.boundary_condition_dict = boundary_dict
-        self.aero_center = aero_center
+        self.moments = moments
 
         # Dolfinx mesh tags for the various boundaries
-        self.INLET_TAG = 3  # flow inlet
-        self.OUTLET_TAG = 4  # flow outlet
         self.WALL_TAG = 2  # walls (including wing/airfoil boundaries)
-        self.SYMMETRY_TAG = 5  # symmetry, only used in 3D thus far
-        self.FARFIELD_TAG = 6  # characteristic far field (farfield="riemann")
+        self.SYMMETRY_TAG = 5  # symmetry planes (3D: y = 0, or the mesh's symmetry_tags)
+        self.FARFIELD_TAG = 6  # characteristic far field: the whole outer boundary
 
         # global evaluation index of solve_residual_equations
         self.eval_idx = 0
@@ -206,46 +246,37 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         self.sim_model.residual_conv_limit = self.euler_residual_conv_limit
         self.sim_model.max_newton_iterations = self.max_newton_iterations
 
-        # use the boundary condition dictionary to define inlet and outlet BCs
-        self.sim_model.define_inlet_outlet_conditions(self.boundary_condition_dict)
+        # use the free-stream dictionary to define the far-field conditions
+        self.sim_model.define_farfield_conditions(self.boundary_condition_dict)
 
         # compute boundary facet boolean arrays
         inner_facets = self.mesh.inner_bdry_facet_mask
         
         # Find the symmetry face facets (only relevant in 3D at the moment)
         # NOTE: The symmetry plane is currently hardcoded at y=0
-        if self.sim_model.dimensions == 3:
+        has_symmetry = self.mesh.symmetry_facet_mask is not None or self.sim_model.dimensions == 3
+        if self.mesh.symmetry_facet_mask is not None:
+            symmetry_facets = self.mesh.symmetry_facet_mask  # from the mesh's boundary tags
+        elif self.sim_model.dimensions == 3:
             symmetry_facets = self.mesh.bdry_midpoints[:, 1] <= 1e-6
         else:
             symmetry_facets = np.array([False]*inner_facets.shape[0])
 
-        # Next we split the outer boundaries into inlet and outlet; 
-        # the dividing line is perpendicular to the inflow angle due to angle of attack.
-        # NOTE: This is fixed under angle of attack changes, 
-        # so could be a source of error for large angle of attack changes
-        mesh_x_max, mesh_x_min = self.mesh.mesh.comm.allreduce(self.mesh.mesh.geometry.x[:, 0].max(), MPI.MAX), self.mesh.mesh.comm.allreduce(self.mesh.mesh.geometry.x[:, 0].min(), MPI.MIN)
-
-        alpha_tagging = self.boundary_condition_dict['inlet']['alpha']
-        inlet_outlet_bdry = -np.tan(alpha_tagging)*self.mesh.bdry_midpoints[:, 2] + (mesh_x_max + mesh_x_min) / 2
-
-        inlet_facets = (self.mesh.bdry_midpoints[:, 0] <= inlet_outlet_bdry) & ~np.asarray(inner_facets, dtype=bool) & ~np.asarray(symmetry_facets, dtype=bool)
-        outlet_facets = (self.mesh.bdry_midpoints[:, 0] > inlet_outlet_bdry) & ~np.asarray(inner_facets, dtype=bool) & ~np.asarray(symmetry_facets, dtype=bool)
-        if self.farfield == "riemann":
-            farfield_facets = inlet_facets | outlet_facets
+        # Everything that is neither wall nor symmetry plane is far field. The
+        # characteristic far-field state decides facet by facet whether the flow
+        # enters or leaves, so no inflow/outflow division (and nothing to
+        # re-tag when the angle of attack changes) is needed.
+        farfield_facets = ~np.asarray(inner_facets, dtype=bool) & ~np.asarray(symmetry_facets, dtype=bool)
 
         # Print the local number of facets of each type for each MPI rank
         PETSc.Sys.syncPrint("Rank {}, number of wing boundary facets: {}".format(self.mesh.mesh.comm.Get_rank(), np.count_nonzero(inner_facets)))
         PETSc.Sys.syncPrint("Rank {}, number of symmetry facets: {}".format(self.mesh.mesh.comm.Get_rank(), np.count_nonzero(symmetry_facets)))
-        PETSc.Sys.syncPrint("Rank {}, number of inlet facets: {}".format(self.mesh.mesh.comm.Get_rank(), np.count_nonzero(inlet_facets)))
-        PETSc.Sys.syncPrint("Rank {}, number of outlet facets: {}".format(self.mesh.mesh.comm.Get_rank(), np.count_nonzero(outlet_facets)))
+        PETSc.Sys.syncPrint("Rank {}, number of far-field facets: {}".format(self.mesh.mesh.comm.Get_rank(), np.count_nonzero(farfield_facets)))
         PETSc.Sys.syncFlush()
 
         # Pair the boundary facet sets with the various mesh tags
-        if self.farfield == "riemann":
-            bdry_meshtags_and_ds_list = [(farfield_facets, self.FARFIELD_TAG), (inner_facets, self.WALL_TAG)]
-        else:
-            bdry_meshtags_and_ds_list = [(inlet_facets, self.INLET_TAG), (outlet_facets, self.OUTLET_TAG), (inner_facets, self.WALL_TAG)]
-        if self.sim_model.dimensions == 3:
+        bdry_meshtags_and_ds_list = [(farfield_facets, self.FARFIELD_TAG), (inner_facets, self.WALL_TAG)]
+        if has_symmetry:
             bdry_meshtags_and_ds_list += [(symmetry_facets, self.SYMMETRY_TAG)]
 
         # Build the boundary facet tags and define the corresponding quadrature measure
@@ -253,20 +284,13 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         self.mesh.form_manager.build_boundary_measure(
             measure_metadata={'quadrature_degree': 3*self.poly_order + 1})
 
-        # The inlet-outlet split above is now frozen in the meshtags; arm the guard in
-        # CompressibleEulerModel.set_angle_of_attack against it. The
-        # characteristic far field has no split to guard.
-        self.sim_model.alpha_tagging = alpha_tagging if self.farfield == "split" else None
-
         self.mesh.configure_output(self.filename_suffix,
                                    deformation=self.shape_parameterized and self.write_mesh_deformation)
 
         if self.shape_parameterized:
             # The JAX-based IDWarp implementation as mesh warper
-            anchors = ((self.FARFIELD_TAG,) if self.farfield == "riemann"
-                       else (self.INLET_TAG, self.OUTLET_TAG))
             self.mesh_warper = IDWarp_jax(self.mesh, wall_meshtag_val=self.WALL_TAG,
-                                          anchor_meshtag_vals=anchors)
+                                          anchor_meshtag_vals=(self.FARFIELD_TAG,))
 
             PETSc.Sys.Print("Initialized mesh warping object")
 
@@ -288,7 +312,7 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         # Define the required Dolfinx objects for the simulation, including the initial conditions
         self.sim_model.define_elements_functionspaces()
         self.sim_model.define_trial_testfunctions()
-        self.sim_model.compute_initial_conditions_from_inlet()
+        self.sim_model.compute_initial_conditions_from_farfield()
         self.sim_model.interpolate_solution_vector()
 
         # We output the facet mesh tags to an xdmf file, so we can inspect the BCs in paraview
@@ -300,13 +324,9 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
             xdmf.write_meshtags(self.mesh.meshtags, self.mesh.mesh.geometry)
 
         # Define the boundary condition terms of the Euler weak form
-        if self.farfield == "riemann":
-            self.sim_model.define_farfield_bc(self.FARFIELD_TAG)
-        else:
-            self.sim_model.define_subsonic_inflow_bc(self.INLET_TAG)
-            self.sim_model.define_subsonic_outflow_bc(self.OUTLET_TAG)
+        self.sim_model.define_farfield_bc(self.FARFIELD_TAG)
         self.sim_model.define_wall_bc(self.WALL_TAG)
-        if self.sim_model.dimensions == 3:
+        if has_symmetry:
             self.sim_model.define_slipwall_bc(self.SYMMETRY_TAG)
 
         # Construct the Euler weak form for forward evaluation
@@ -317,18 +337,11 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
                                                file_name_addendum=self.filename_suffix,
                                                mesh_deformation=self.shape_parameterized)
 
-        if self.aero_center is None:
-            self.aero_center = np.array([0.25] + [0.0] * (self.sim_model.dimensions - 1))
-
         # We instantiate a separate DG_postprocessor object here so we can print 
         # forces and moments and coefficients after each forward solve
         self.postprocessor = DG_postprocessor(
             self.mesh, self.sim_model, self.WALL_TAG,
-            aero_center=self.aero_center,
-            linear_solver_rtol=self.linear_solver_rtol,
-            linear_solver_atol=self.linear_solver_atol,
-            linear_solver_max_it=self.linear_solver_max_it,
-            linear_residual_accept_limit=self.linear_residual_accept_limit, 
+            moments=self.moments,
             p_inf_dim=101325.)
 
         if self.reduced_order_model is not None:
@@ -415,7 +428,7 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         alpha (radians; default: the boundary dictionary's), solve, print the
         coefficients. Warm-starts from the previous solve. Call set_up_sim()
         first. Returns (u_vec array, converged, forces), forces being
-        DG_postprocessor.forces_and_coefficients (L, D, M, c_l, c_d, c_m, and
+        DG_postprocessor.forces_and_coefficients (L, D, c_l, c_d, the moments, and
         the friction drag for a viscous model).
         """
         if alpha is not None:
@@ -423,7 +436,7 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
             self.postprocessor.set_angle_of_attack(alpha)
         self.sim_model.compute_weakform()
         solution, converged = self._solve(
-            self._parameter_vector(None, self.sim_model.boundary_conditions['inlet']['alpha']))
+            self._parameter_vector(None, self.sim_model.farfield_conditions['alpha']))
         self.sim_model.last_solve_converged = converged
         if np.isfinite(np.linalg.norm(solution)):
             self.previous_solution = solution
@@ -529,6 +542,8 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         and by then the ROM would reproduce that solution, now a snapshot, and
         accept it.
         """
+        # the forward solve needs the memory of the last design's adjoint operators
+        self._release_adjoint_cache()
         rom = self.reduced_order_model
         if rom is None:
             return self._run_fom_solve()
@@ -578,34 +593,32 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         with _PROF.phase("post:coefficients"):
             _, cl = self.postprocessor.compute_cl(result.solution)
             _, cd = self.postprocessor.compute_cd(result.solution)
-            _, cm = self.postprocessor.compute_cm(result.solution)
+            cms = self._moment_coefficients(result.solution)
         if self.mesh.mesh.comm.Get_rank() == 0:
             self.data_store.ROM_walltime += [(self.eval_idx, result.walltime)]
             self.data_store.rom_relative_residuals += [(self.eval_idx, result.eta)]
-            self.data_store.ROM_force_coefficients += [(self.eval_idx, cd, cl, cm, np.nan)]
+            self.data_store.ROM_force_coefficients += [(self.eval_idx, cd, cl) + cms]
             self.data_store.ROM_meets_threshold += [(self.eval_idx, result.accepted)]
-        PETSc.Sys.Print("ROM coefficients: c_d: {}, c_l: {}, c_m: {}".format(cd, cl, cm))
-        return cd, cl, cm
+        PETSc.Sys.Print("ROM coefficients: c_d: {}, c_l: {}".format(cd, cl) + self._moment_log_string(cms))
+        return (cd, cl) + cms
 
     def _log_rom_error(self, rom_forces):
         # ROM-vs-FOM coefficient errors against the FOM solve just run
         errors = tuple(float(r - f) for r, f in zip(rom_forces, self._last_fom_coefficients))
         if self.mesh.mesh.comm.Get_rank() == 0:
             self.data_store.rom_coefficient_errors += [(self.eval_idx,) + errors]
-        PETSc.Sys.Print("ROM - FOM coefficient errors: c_d: {:.3e}, c_l: {:.3e}, c_m: {:.3e}".format(*errors))
+        PETSc.Sys.Print("ROM - FOM coefficient errors: c_d: {:.3e}, c_l: {:.3e}".format(*errors[:2])
+                        + "".join(", c_m_{}: {:.3e}".format(spec.name, e)
+                                  for spec, e in zip(self.postprocessor.moment_specs, errors[2:])))
 
-    def _cm_alpha_for_logging(self, solution):
-        # Compute d c_m / d alpha: The total derivative of the moment 
-        # coefficient w.r.t. the angle of attack. This step seems 
-        # somewhat unstable and does not come for free, since it requires
-        # solving a linear system (it's a derivative evaluation after all)
-        # TODO: Look into why this solution step is seemingly so unstable,
-        #       even at well-converged states
-        if not self.log_cm_alpha:
-            return np.nan
-        if solution is None or not np.isfinite(np.linalg.norm(solution)):
-            return np.nan
-        return self.postprocessor.compute_cm_alpha(solution)
+    def _moment_coefficients(self, solution):
+        # the coefficient of every moment of the postprocessor, in order
+        return tuple(self.postprocessor.compute_moment(solution, spec)[1]
+                     for spec in self.postprocessor.moment_specs)
+
+    def _moment_log_string(self, coefficients):
+        return "".join(", c_m_{}: {}".format(spec.name, c)
+                       for spec, c in zip(self.postprocessor.moment_specs, coefficients))
 
     def _run_fom_solve(self):
         # Run the FOM model and output its solution
@@ -640,15 +653,14 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         with _PROF.phase("post:coefficients"):
             L_fom, cl_fom = self.postprocessor.compute_cl(solution_fom)
             D_fom, cd_fom = self.postprocessor.compute_cd(solution_fom)
-            M_fom, cm_fom = self.postprocessor.compute_cm(solution_fom)
-            cma_fom = self._cm_alpha_for_logging(solution_fom)
-        self._last_fom_coefficients = (cd_fom, cl_fom, cm_fom)
+            cms_fom = self._moment_coefficients(solution_fom)
+        self._last_fom_coefficients = (cd_fom, cl_fom) + cms_fom
 
         if self.mesh.mesh.comm.Get_rank() == 0:
             self.data_store.FOM_walltime += [(self.eval_idx, fom_post_time - fom_pre_time)]
             self.data_store.fom_relative_residuals += [(self.eval_idx, eta)]
-            self.data_store.FOM_force_coefficients += [(self.eval_idx, cd_fom, cl_fom, cm_fom, cma_fom)]
-        PETSc.Sys.Print("FOM coefficients: c_d: {}, c_l: {}, c_m: {}, c_m_alpha: {}".format(cd_fom, cl_fom, cm_fom, cma_fom))
+            self.data_store.FOM_force_coefficients += [(self.eval_idx, cd_fom, cl_fom) + cms_fom]
+        PETSc.Sys.Print("FOM coefficients: c_d: {}, c_l: {}".format(cd_fom, cl_fom) + self._moment_log_string(cms_fom))
         PETSc.Sys.Print("FOM relative residual norm eta: {} (||r||: {})".format(
             eta, residual_norm))
 
@@ -688,7 +700,8 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
                 return
 
             if self.sim_model.has_condensed_jacobian:
-                self._condensed_adjoint(d_outputs, d_residuals)
+                self._condensed_adjoint(d_outputs, d_residuals,
+                                        self._adjoint_state_key(u_vec, alpha, mesh_node_motions))
                 if self.release_solver_memory:
                     self.sim_model.release_solver()
                 PETSc.garbage_cleanup()
@@ -767,30 +780,149 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
             self.data_store.adjoint_solves += [(self.eval_idx - 1, kind, walltime)]
         PETSc.Sys.Print("apply_inverse_jacobian total time ({} adjoint): {}".format(kind, walltime))
 
-    def _condensed_adjoint(self, d_outputs, d_residuals):
+    def _condensed_adjoint(self, d_outputs, d_residuals, state_key):
         """The adjoint solve for a model whose dR/dU is a condensed product
         (a reconstructed gradient): the model's own transposed linearized
-        solve (CompressibleEulerModel.solve_linearized)."""
-        if self.release_solver_memory:
-            # free queued PETSc objects before the large assembly
-            gc.collect()
-            PETSc.garbage_cleanup(self.mesh.mesh.comm)
-        A = self.sim_model.assemble_dRdu_mat()
+        solve (CompressibleEulerModel.linearized_solver). The transposed
+        matrix and the preconditioned KSP are built once per state and reused
+        by the adjoint solves of all outputs at it."""
+        if self._adjoint_cache_matches(state_key):
+            PETSc.Sys.Print("adj_: reusing the transposed Jacobian and preconditioner of this state")
+        else:
+            self._release_adjoint_cache()
+            if self.release_solver_memory:
+                # free queued PETSc objects before the large assembly
+                gc.collect()
+                PETSc.garbage_cleanup(self.mesh.mesh.comm)
+            # the condensed dR/dU is freed once its transposes exist: only they are used from then on
+            ksp = self.sim_model.linearized_solver(
+                transpose=True, prefix="adj_", rtol=self.linear_solver_rtol,
+                atol=self.linear_solver_atol, max_it=self.linear_solver_max_it,
+                release_operands=True, matrix_free=self.adjoint_matrix_free,
+                ksp_options=self.adjoint_ksp_options)
+            self._adjoint_cache = {'key': state_key, 'ksp': ksp}
+        ksp = self._adjoint_cache['ksp']
+        A = ksp.getOperators()[0]
         rhs, sol = A.createVecLeft(), A.createVecLeft()
         set_petsc_vec_array(rhs, d_outputs['u_vec'])
-        ksp = self.sim_model.solve_linearized(
-            rhs, sol, transpose=True, prefix="adj_", rtol=self.linear_solver_rtol,
-            atol=self.linear_solver_atol, max_it=self.linear_solver_max_it,
-            release_operands=self.release_solver_memory)
+        guess_used = self.adjoint_first_order_guess and self._first_order_adjoint_guess(ksp, A, rhs, sol)
+        ksp.setInitialGuessNonzero(bool(guess_used))
+        ksp.solve(rhs, sol)
         rnorm = ksp.getResidualNorm()
         PETSc.Sys.Print("adj_ solve: {} iterations, residual norm {} [{}]".format(
             ksp.getIterationNumber(), rnorm, ksp_converged_reason_name(ksp.getConvergedReason())))
-        ksp.destroy()
         if rnorm > self.linear_residual_accept_limit:
             raise ValueError(
                 "apply_inverse_jacobian residual norm is too high: {:.6e} > "
                 "linear_residual_accept_limit {:.1e}".format(rnorm, self.linear_residual_accept_limit))
         d_residuals['u_vec'] = sol.getArray().copy()
+        rhs.destroy()
+        sol.destroy()
+
+    # ---- adjoint reuse: cached operators -----------------------------------
+    def _first_order_adjoint_guess(self, ksp, A, rhs, sol):
+        """
+        Fill `sol` with the first-order adjoint solution of `rhs`: the solution
+        of P x = rhs, P the transposed compact part A_UU of the Jacobian (the
+        KSP's preconditioning matrix), to a relative tolerance
+        first_order_adjoint_rtol. The KSP is switched to operator P for the
+        solve, which keeps its preconditioner (P's factors), and back to
+        (A, P) afterwards, with its tolerances. Returns False, leaving `sol`
+        zero, if the first-order solve did not converge. The residual of the
+        exact system at the guess, |rhs - A guess| / |rhs|, the iterations and
+        the time are logged and kept in self._last_first_order_guess.
+        Collective.
+        """
+        P = ksp.getOperators()[1]
+        if P.handle == A.handle:
+            return False                   # direct solver: A is P, nothing to precondition with
+        pre_time = perf_counter()
+        rtol, atol, divtol, max_it = ksp.getTolerances()
+        ksp.setOperators(P, P)
+        ksp.setTolerances(rtol=self.first_order_adjoint_rtol, atol=0.0, max_it=self.linear_solver_max_it)
+        ksp.setInitialGuessNonzero(False)
+        try:
+            ksp.solve(rhs, sol)
+            iterations, reason = ksp.getIterationNumber(), ksp.getConvergedReason()
+        finally:
+            ksp.setOperators(A, P)
+            ksp.setTolerances(rtol=rtol, atol=atol, divtol=divtol, max_it=max_it)
+        if reason <= 0:
+            PETSc.Sys.Print("adj_ first-order guess: no convergence after {} iterations [{}]: zero guess".format(
+                iterations, ksp_converged_reason_name(reason)))
+            sol.zeroEntries()
+            self._last_first_order_guess = dict(iterations=iterations, ratio=np.nan, used=False)
+            return False
+        residual = rhs.duplicate()
+        A.mult(sol, residual)
+        residual.aypx(-1.0, rhs)
+        ratio = residual.norm() / rhs.norm()
+        residual.destroy()
+        walltime = perf_counter() - pre_time
+        PETSc.Sys.Print("adj_ first-order guess: {} iterations, {:.1f} s; the exact system's initial residual is "
+                        "{:.3e} of |rhs|".format(iterations, walltime, ratio))
+        self._last_first_order_guess = dict(iterations=iterations, ratio=float(ratio), used=True, walltime=walltime)
+        return True
+
+    @staticmethod
+    def _adjoint_state_key(u_vec, alpha, mesh_node_motions):
+        """What the adjoint's matrix depends on: the state, alpha and the mesh motion."""
+        return (np.array(u_vec, copy=True), float(alpha),
+                None if mesh_node_motions is None else np.array(mesh_node_motions, copy=True))
+
+    def _state_keys_equal(self, key0, key):
+        u0, alpha0, motions0 = key0
+        u, alpha, motions = key
+        same = (alpha == alpha0 and np.array_equal(u0, u) and (motions0 is None) == (motions is None)
+                and (motions is None or np.array_equal(motions0, motions)))
+        return bool(self.mesh.mesh.comm.allreduce(int(same), op=MPI.MIN))
+
+    def _adjoint_cache_matches(self, state_key):
+        cache = self._adjoint_cache
+        return cache is not None and self._state_keys_equal(cache['key'], state_key)
+
+    def _release_adjoint_cache(self):
+        """Free what the adjoint of the last state keeps: the transposed matrices
+        and KSP, the cached jacvec operators and the derived fields' cached
+        Jacobians."""
+        cache, self._adjoint_cache = self._adjoint_cache, None
+        freed = cache is not None
+        if freed:
+            self.sim_model.destroy_adjoint_operator(cache['ksp'])
+            del cache
+        if self._dRdx_cache is not None:
+            destroy_chained_operator(self._dRdx_cache['op'])
+            self._dRdx_cache = None
+            freed = True
+        if self._dRdalpha_cache is not None:
+            self._dRdalpha_cache = None
+        if self.sim_model.derived_fields:
+            self.sim_model.release_derived_caches()
+            freed = True
+        if freed:
+            self.sim_model._return_freed_memory()
+
+    def set_adjoint_options(self, cell_centre_matrix=False, cache_jacobians=False, structured_gradient=False,
+                            matrix_free=False, cache_jacvec_operators=False):
+        """
+        Switch the speed-ups of the adjoint of a model with a condensed Jacobian
+        (all exact reformulations; each off by default). Frees every cache.
+          cell_centre_matrix       build the constant cell-centre matrix dc/dx vectorized, once
+          cache_jacobians          keep the Green-Gauss Jacobians dG/dU, dG/dalpha, dG/dx
+                                   while the state, alpha and the mesh are unchanged
+          structured_gradient      apply dG/dU as W (x) I plus a boundary part instead of an
+                                   assembled matrix
+          matrix_free              the adjoint operator without forming A or A_UG B
+          cache_jacvec_operators   build the dR/dx operator and dR/dalpha once per design
+        """
+        self._release_adjoint_cache()
+        rec = getattr(self.sim_model, "reconstruction", None)
+        if rec is not None:
+            rec.fast_cell_centre_jacobian = bool(cell_centre_matrix)
+            rec.cache_jacobians = bool(cache_jacobians)
+            rec.structured_state_jacobian = bool(structured_gradient)
+        self.adjoint_matrix_free = bool(matrix_free)
+        self.cache_jacvec_operators = bool(cache_jacvec_operators)
 
     def compute_jacvec_product(self, input_vals, outputs, d_inputs, d_outputs, d_residuals, mode):
         # Here we compute the product of the adjoint solution with d_residual
@@ -816,11 +948,18 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
             if 'alpha' in d_inputs:
                 # alpha is a single global scalar, so dR/d(alpha) is one column
                 # and this reverse product is a plain dot product between vectors
-                dr_dalpha = self.sim_model.assemble_dRdalpha_vec(u_vec)
-
-                # we first have to assert that the MPI objects are compatible
                 local_size = self.sim_model.u_vec.x.petsc_vec.local_size
-                dr_dalpha_local = dr_dalpha.getArray()[:local_size]
+                if self.cache_jacvec_operators and self.sim_model.derived_fields:
+                    key = self._adjoint_state_key(u_vec, alpha, mesh_node_motions)
+                    if self._dRdalpha_cache is None or not self._state_keys_equal(self._dRdalpha_cache[0], key):
+                        dr_dalpha = self.sim_model.assemble_dRdalpha_vec(u_vec)
+                        self._dRdalpha_cache = (key, np.array(dr_dalpha.getArray()[:local_size], copy=True))
+                    dr_dalpha_local = self._dRdalpha_cache[1]
+                else:
+                    dr_dalpha = self.sim_model.assemble_dRdalpha_vec(u_vec)
+
+                    # we first have to assert that the MPI objects are compatible
+                    dr_dalpha_local = dr_dalpha.getArray()[:local_size]
                 assert dr_dalpha_local.shape == d_residuals['u_vec'].shape, (
                     "dR/dalpha local slice {} does not match d_residuals['u_vec'] {}".format(
                         dr_dalpha_local.shape, d_residuals['u_vec'].shape))
@@ -835,7 +974,17 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
                 PETSc.Sys.Print("d_inputs['alpha']: {}".format(d_inputs['alpha']))
 
             if 'mesh_node_motions' in d_inputs:
-                dr_dxmesh = self.sim_model.compute_dRdxmesh_mat(u_vec, self.mesh.coordinate_space)
+                cached_operator = self.cache_jacvec_operators and bool(self.sim_model.derived_fields)
+                if cached_operator:
+                    key = self._adjoint_state_key(u_vec, alpha, mesh_node_motions)
+                    if self._dRdx_cache is None or not self._state_keys_equal(self._dRdx_cache['key'], key):
+                        if self._dRdx_cache is not None:
+                            destroy_chained_operator(self._dRdx_cache['op'])
+                        self._dRdx_cache = {'key': key, 'op': self.sim_model.compute_dRdxmesh_mat(
+                            u_vec, self.mesh.coordinate_space)}
+                    dr_dxmesh = self._dRdx_cache['op']
+                else:
+                    dr_dxmesh = self.sim_model.compute_dRdxmesh_mat(u_vec, self.mesh.coordinate_space)
 
                 if not hasattr(self, '_d_residual_jvp_petsc'):
                     self._d_residual_jvp_petsc = dr_dxmesh.createVecLeft()
@@ -847,7 +996,7 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
                 self._d_input_jvp_petsc.set(0.0)
                 dr_dxmesh.multTranspose(self._d_residual_jvp_petsc, self._d_input_jvp_petsc)
                 d_input = self._d_input_jvp_petsc
-                if self.sim_model.derived_fields:
+                if self.sim_model.derived_fields and not cached_operator:
                     # a fresh chained operator per call (not cached): free it now
                     destroy_chained_operator(dr_dxmesh)
 

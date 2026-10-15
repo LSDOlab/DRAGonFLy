@@ -30,8 +30,9 @@ class DataStore():
         # objective function histories
         self.FOM_force_coefficients = []
         # Dimensional (unnormalized) FOM lift/drag/moment forces, same
-        # (eval_idx, D, L, M, nan) tuple layout and eval_idx indexing as
-        # FOM_force_coefficients' (eval_idx, c_d, c_l, c_m, nan).
+        # (eval_idx, D, L, M_1, ...) tuple layout and eval_idx indexing as
+        # FOM_force_coefficients' (eval_idx, c_d, c_l, c_m_1, ...), with one
+        # moment entry per moment of the postprocessor, in its order.
         self.FOM_forces = []
 
         # Parameter vector histories
@@ -41,9 +42,9 @@ class DataStore():
         self.FOM_walltime = []
 
         # POD reduced-order model (core/reduced_order_model.py), per ROM solve:
-        # wall time, eta, (eval_idx, c_d, c_l, c_m, nan) like
+        # wall time, eta, (eval_idx, c_d, c_l, c_m_1, ...) like
         # FOM_force_coefficients, whether eta met the acceptance threshold,
-        # and (eval_idx, dc_d, dc_l, dc_m) ROM - FOM when the FOM also ran;
+        # and (eval_idx, dc_d, dc_l, dc_m_1, ...) ROM - FOM when the FOM also ran;
         # the snapshot singular values after every snapshot added
         self.ROM_walltime = []
         self.rom_relative_residuals = []

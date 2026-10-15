@@ -86,6 +86,43 @@ class CondensedJacobian:
         return self.A
 
 
+class TransposedCondensedOperator:
+    """
+    Python-Mat context of the transposed condensed Jacobian without forming it:
+
+        A^T x = (A_UU + A_UG B)^T x = P x + B^T (A_UG^T x),    P = A_UU^T
+
+    with B = M_G^-1 dG/dU (any Mat with mult / multTranspose, e.g. the
+    structured GreenGaussStateOperator). Neither A nor the product A_UG B
+    is ever assembled. It owns P (also the preconditioning matrix), A_UG and
+    B (released through `release_B`, a callable) and frees them in destroy().
+    """
+
+    def __init__(self, P, A_UG, B, release_B):
+        self.P, self.A_UG, self.B, self._release_B = P, A_UG, B, release_B
+        self._w = A_UG.createVecRight()
+
+    def mult(self, mat, x, y):
+        self.A_UG.multTranspose(x, self._w)
+        self.B.multTranspose(self._w, y)
+        self.P.multAdd(x, y, y)
+
+    def destroy(self, mat=None):
+        # called by PETSc when the python Mat is destroyed
+        if self.P is None:
+            return
+        self._release_B(self.B)
+        for obj in (self._w, self.A_UG, self.P):
+            obj.destroy()
+        self.P = self.A_UG = self.B = None
+
+    def create_mat(self, comm):
+        M = PETSc.Mat().createPython(self.P.getSizes(), comm=comm)
+        M.setPythonContext(self)
+        M.setUp()
+        return M
+
+
 class CondensedGradientProblem(NonlinearProblem_mod):
     """
     NonlinearProblem_mod for R_U(U, G(U)).

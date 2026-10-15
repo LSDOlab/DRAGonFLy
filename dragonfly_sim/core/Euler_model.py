@@ -16,7 +16,7 @@ from dragonfly_sim.utils.solver_utils import (locate_positivity_limiting_nodes, 
                                               ksp_norm_type_name, ksp_pc_side_name)
 from dragonfly_sim.core.form_manager import FormManager
 from dragonfly_sim.utils.solver_profiling import PROFILER as _PROF, default_group
-from dragonfly_sim.utils.Euler_utils import primitives, pressure, energy_density, flux, subsonic_inflow_state, subsonic_outflow_state, slip_wall_state, hll_flux, boundary_flux
+from dragonfly_sim.utils.Euler_utils import primitives, pressure, energy_density, flux, slip_wall_state, hll_flux, boundary_flux
 from dragonfly_sim.utils.NS_utils import (mean_flow, concat_state, extended_flux, extended_normal_flux,
                                           extended_hll_flux, extended_boundary_flux)
 from dragonfly_sim.utils.farfield_utils import riemann_farfield_state
@@ -45,8 +45,8 @@ class CompressibleEulerModel():
         boundary_terms      callables (U_b, tag, kind) -> UFL form or None,
                             added to every boundary condition
         boundary_scalars    (kind, U, inflow) -> list of the extra variables'
-                            boundary values (kind: inflow, outflow, slip,
-                            farfield, wall); required when n_extra > 0
+                            boundary values (kind: slip, farfield,
+                            wall); required when n_extra > 0
         freestream_scalars  () -> list of the extra variables' free-stream values
         wall_bc             (tag) -> None, replaces the slip wall in define_wall_bc
         wall_traction       (U, n) -> traction added to p n in wall_force_density
@@ -126,6 +126,8 @@ class CompressibleEulerModel():
         self.krylov_type = "gmres"
         self.krylov_diagonal_scale = True
         self.direct_linear_solver = False
+        # relative tolerance of that Krylov solve, set before set_up_solver
+        self.krylov_rtol = 1e-3
 
         # Instantiate the FormManager
         self.forms = FormManager(mesh, model=self,
@@ -133,20 +135,13 @@ class CompressibleEulerModel():
 
         self.functionspaces = None
         self.bcs = []
-        self.boundary_conditions = None
+        self.farfield_conditions = None
         self.initial_conditions = None
         self.F = None
         self.J = None
         self.solver_is_set_up = False
         self.solver_converged = False
 
-
-        # Initial angle of attack at which the boundary conditions are constructed;
-        # most notable the inlet/outlet split. This is important because changing 
-        # the boundary conditions would impose a discontinuity in optimization
-        # problems. Therefore we have to keep track of large angle of attack changes 
-        self.alpha_tagging = None
-        self.alpha_tagging_tol = np.radians(1.0)
 
 
         # Newton steps taken per pass of solve_system's loop
@@ -261,51 +256,62 @@ class CompressibleEulerModel():
         self.u_vec = dolfinx.fem.Function(self.functionspaces["V"], name="u")
         self.v_vec = ufl.TestFunction(self.functionspaces["V"])
 
-    def define_inlet_outlet_conditions(self, bc_dict):
-        # Define the inlet and outlet flow conditions.
-        # NOTE: This explicitly encodes subsonic boundary conditions; 
-        #       supersonic in- and outflows are currently not supported, but can be
-        #       implemented with a few small changes
-        rho = bc_dict['inlet']['rho']  # inlet mass density
-        p = bc_dict['inlet']['p']  # inlet pressure
-        M = bc_dict['inlet']['M']  # inlet Mach number
-        alpha = bc_dict['inlet']['alpha']  # initial inlet angle of attack
+    def define_farfield_conditions(self, farfield):
+        """
+        Set the free-stream state the far-field boundary condition relaxes to.
 
-        c = abs(self.gamma*p/rho)**0.5  # speed of sound
+        `farfield` is {'rho', 'p', 'M', 'alpha'}: density, pressure, Mach
+        number and angle of attack (rad). This is all the user states; the
+        boundary treatment (inflow, outflow) follows from it per facet in
+        define_farfield_bc, through the characteristic state.
+
+        NOTE: the far field is the subsonic characteristic one, so M < 1.
+        A supersonic free stream needs a different boundary state in
+        define_farfield_bc (all variables from the free stream at inflow, all
+        from the interior at outflow); this is the one place that would change.
+        """
+        if not isinstance(farfield, dict) or set(farfield) != {'rho', 'p', 'M', 'alpha'}:
+            raise ValueError(
+                "The far-field conditions are a flat dict {{'rho': ..., 'p': ..., 'M': ..., "
+                "'alpha': ...}} (density, pressure, Mach number, angle of attack in rad); "
+                "got {}. The former {{'inlet': {{...}}, 'outlet': {{...}}}} form is gone: "
+                "pass the contents of 'inlet' and drop 'outlet'.".format(
+                    sorted(farfield) if isinstance(farfield, dict) else type(farfield).__name__))
+        rho, p, M, alpha = (float(farfield[k]) for k in ('rho', 'p', 'M', 'alpha'))
+        if rho <= 0.0 or p <= 0.0:
+            raise ValueError("far-field density and pressure must be positive")
+        if not 0.0 <= M < 1.0:
+            raise NotImplementedError(
+                "far-field Mach number {} outside [0, 1): only the subsonic "
+                "characteristic far field is implemented".format(M))
+
+        c = (self.gamma * p / rho) ** 0.5  # speed of sound
 
         # Since angle of attack is a design parameter we define it as a UFL variable;
         # this allows us to use Dolfin's automatic differentiation for it
-        self.alpha_const = dolfinx.fem.Constant(self.mesh_obj.mesh, float(alpha))
+        self.alpha_const = dolfinx.fem.Constant(self.mesh_obj.mesh, alpha)
         self.alpha_var = ufl.variable(self.alpha_const)
 
         inflow_dir = self._inflow_direction_ufl()
 
-        # inflow and outflow directions
-        n_in = dolfinx.fem.Constant(
-            self.mesh_obj.mesh, -self._inflow_direction_numpy(alpha))
-        n_out = dolfinx.fem.Constant(
+        # unit vector along the free stream (the drag direction)
+        flow_dir = dolfinx.fem.Constant(
             self.mesh_obj.mesh, self._inflow_direction_numpy(alpha))
 
-        # defining the reference and inlet velocity so 
-        # we can update it later if Mach number gets modified
+        # defining the reference velocity so we can update it later
+        # if the Mach number gets modified
         self.u_ref_const = dolfinx.fem.Constant(self.mesh_obj.mesh, M*c)
-        u_in = self.u_ref_const * inflow_dir
+        u_inf = self.u_ref_const * inflow_dir
 
-        # define a dictionary with all of the inlet and outlet conditions
-        self.boundary_conditions = {'inlet': {'rho': rho,
-                                            'p': p,
-                                            'M': M,
-                                            'alpha': float(alpha),
-                                            'inflow_angle': self._inflow_direction_numpy(alpha),
-                                            'c': c,
-                                            'n': n_in,  # outward-pointing normal vector
-                                            'u': u_in,
-                                            'u_ref': self.u_ref_const
-                                            },
-                                    'outlet': {'p': p,
-                                               'n': n_out  # outward-pointing normal vector
-                                               }
-                                 }
+        self.farfield_conditions = {'rho': rho,
+                                    'p': p,
+                                    'M': M,
+                                    'alpha': alpha,
+                                    'inflow_angle': self._inflow_direction_numpy(alpha),
+                                    'c': c,
+                                    'flow_dir': flow_dir,
+                                    'u': u_inf,
+                                    'u_ref': self.u_ref_const}
 
     def _inflow_direction_ufl(self):
         # unit freestream direction as a UFL expression
@@ -331,40 +337,26 @@ class CompressibleEulerModel():
         # propagate the new angle of attack `alpha` to all model dependencies
         alpha = float(alpha)
 
-        if getattr(self, 'alpha_tagging', None) is not None:
-            # we verify whether the angle of attack is changed by a large enough increment
-            # to change the inflow/outflow boundary division
-            if abs(alpha - self.alpha_tagging) > self.alpha_tagging_tol:
-                raise ValueError(
-                    "alpha = {:.6f} rad ({:.3f} deg) is more than {:.6f} rad from the "
-                    "alpha the inlet/outlet facet split was tagged at ({:.6f} rad, "
-                    "{:.3f} deg). The split is frozen at tagging time, so this would "
-                    "silently mis-classify far-field facets. Re-tag the mesh or tighten "
-                    "the design-variable bounds.".format(
-                        alpha, np.degrees(alpha), self.alpha_tagging_tol,
-                        self.alpha_tagging, np.degrees(self.alpha_tagging)))
-
         self.alpha_const.value = alpha
 
         inflow_angle = self._inflow_direction_numpy(alpha)
-        self.boundary_conditions['inlet']['alpha'] = alpha
-        self.boundary_conditions['inlet']['inflow_angle'] = inflow_angle
-        self.boundary_conditions['inlet']['n'].value = -inflow_angle
-        self.boundary_conditions['outlet']['n'].value = inflow_angle
+        self.farfield_conditions['alpha'] = alpha
+        self.farfield_conditions['inflow_angle'] = inflow_angle
+        self.farfield_conditions['flow_dir'].value = inflow_angle
 
     def set_mach(self, M):
         # propagate the new Mach number `M` to all model dependencies
         M = float(M)
-        c = self.boundary_conditions['inlet']['c']
+        c = self.farfield_conditions['c']
         self.u_ref_const.value = M * c
-        self.boundary_conditions['inlet']['M'] = M
+        self.farfield_conditions['M'] = M
 
-    def compute_initial_conditions_from_inlet(self):
-        # The initial guess used in the Newton solver. Here we use the inlet flow.
-        inlet_conditions = self.boundary_conditions['inlet']
-        rho_in = dolfinx.fem.Constant(self.mesh_obj.mesh, inlet_conditions['rho'])
-        rhoE_in_guess = energy_density(inlet_conditions['p'], rho_in, inlet_conditions['u'], self.gamma)        
-        self.initial_conditions = ufl.as_vector((rho_in, *[rho_in*inlet_conditions['u'][i] for i in range(self.dimensions)], rhoE_in_guess))
+    def compute_initial_conditions_from_farfield(self):
+        # The initial guess used in the Newton solver: the free stream.
+        ff = self.farfield_conditions
+        rho_in = dolfinx.fem.Constant(self.mesh_obj.mesh, ff['rho'])
+        rhoE_in_guess = energy_density(ff['p'], rho_in, ff['u'], self.gamma)
+        self.initial_conditions = ufl.as_vector((rho_in, *[rho_in*ff['u'][i] for i in range(self.dimensions)], rhoE_in_guess))
         if self.n_extra:
             # plain numbers become Constants on this mesh, so the initial
             # condition stays interpolable
@@ -441,18 +433,6 @@ class CompressibleEulerModel():
         self.bcs += [F]
         self.boundary_states.append((U_b, meshtag, kind))
 
-    def define_subsonic_inflow_bc(self, meshtag):
-        # define the weak form term for natural enforcement of the inflow boundary condition 
-        inlet_conditions = self.boundary_conditions['inlet']
-        inflow = subsonic_inflow_state(self.mean_flow(self.u_vec), inlet_conditions['rho'], inlet_conditions['u'], self.gamma)
-        self.add_boundary_condition(meshtag, self._boundary_state(inflow, "inflow"), "inflow")
-
-    def define_subsonic_outflow_bc(self, meshtag):
-        # define the weak form term for natural enforcement of the outflow boundary condition
-        outlet_conditions = self.boundary_conditions['outlet']
-        outflow = subsonic_outflow_state(self.mean_flow(self.u_vec), outlet_conditions['p'], self.gamma)
-        self.add_boundary_condition(meshtag, self._boundary_state(outflow, "outflow"), "outflow")
-
     def define_slipwall_bc(self, meshtag):
         # define the weak form term for natural enforcement of the slip wall boundary condition
         u_wall = slip_wall_state(self.mean_flow(self.u_vec), self.mesh_obj.n)
@@ -468,9 +448,10 @@ class CompressibleEulerModel():
 
     def define_farfield_bc(self, meshtag, transverse=None):
         """
-        Characteristic (Riemann-invariant) far field on ds(meshtag), meant
-        for the whole outer boundary in place of the inflow/outflow split.
-        Outgoing acoustic waves leave the domain (exactly at normal incidence)
+        Characteristic (Riemann-invariant) far field on ds(meshtag), for the
+        whole outer boundary: no inflow/outflow division is made, each facet
+        takes its character from the sign of the characteristic speeds, so the
+        angle of attack can change freely. Outgoing acoustic waves leave the domain (exactly at normal incidence)
         instead of reflecting off a fixed state. The inviscid flux is the
         physical flux of the characteristic state, which already carries the
         upwinding; extra variables take their free-stream values where the
@@ -483,10 +464,10 @@ class CompressibleEulerModel():
         The state depends on alpha through the free-stream velocity, so
         dR/dalpha follows automatically.
         """
-        inlet = self.boundary_conditions['inlet']
+        ff = self.farfield_conditions
         R_in = None if transverse is None else transverse.R_in
         U_b, inflow = riemann_farfield_state(self.mean_flow(self.u_vec), self.mesh_obj.n,
-                                             inlet['rho'], inlet['u'], inlet['p'], self.gamma,
+                                             ff['rho'], ff['u'], ff['p'], self.gamma,
                                              R_in=R_in)
         self.add_boundary_condition(meshtag, self._boundary_state(U_b, "farfield", inflow),
                                     "farfield", inviscid_flux="exact")
@@ -547,12 +528,12 @@ class CompressibleEulerModel():
         assembler here. ufl.derivative only accepts Coefficients and
         SpatialCoordinate and rejects a Constant outright; ufl.diff against a
         ufl.variable-wrapped Constant is the route that works. See
-        define_inlet_outlet_conditions for why alpha_var must be the single
+        define_farfield_conditions for why alpha_var must be the single
         stored instance.
 
-        Sparse in practice: alpha only enters the residual through u_in in the
-        subsonic inflow BC, so the result is supported on inlet-adjacent dofs
-        alone. The interior terms, the outflow BC (which prescribes p) and the
+        Sparse in practice: alpha only enters the residual through the
+        free-stream velocity in the far-field boundary state, so the result is
+        supported on far-field-adjacent dofs alone. The interior terms and the
         slip wall (which uses the facet normal) carry no alpha dependence.
 
         Caches its own form and Vec.
@@ -684,7 +665,8 @@ class CompressibleEulerModel():
                 self.solver.set_step_limiter(limiter)
 
                 ksp = self.solver.krylov_solver
-                self.apply_krylov_solver_settings(ksp, monitor_convergence=False, max_it=300)
+                self.apply_krylov_solver_settings(ksp, monitor_convergence=False, max_it=300,
+                                                  rtol=self.krylov_rtol)
                 self.solver_is_set_up = True
 
                 # Print Jacobian matrix block size
@@ -771,9 +753,9 @@ class CompressibleEulerModel():
         flow, then the extra_scales plug-in's values for the extra variables
         (numbers or UFL expressions of Constants).
         """
-        inlet = self.boundary_conditions['inlet']
-        rho, p = inlet['rho'], inlet['p']
-        speed = inlet['M'] * inlet['c']
+        ff = self.farfield_conditions
+        rho, p = ff['rho'], ff['p']
+        speed = ff['M'] * ff['c']
         scales = ([rho] + [rho * speed] * self.dimensions
                   + [p / (self.gamma - 1.0) + 0.5 * rho * speed**2])
         if self.n_extra:
@@ -873,6 +855,11 @@ class CompressibleEulerModel():
         # ("natural", i.e. no reordering, per that log's ksp_view).
         opts[f"{option_prefix}sub_pc_factor_mat_ordering_type"] = "rcm"
 
+        # the options database is global and the prefix is shared by every KSP of that name:
+        # clear a setting an earlier KSP made (diagonal scaling cannot work on a matrix-free operator)
+        for name in ("ksp_diagonal_scale", "ksp_diagonal_scale_fix"):
+            if opts.hasName(option_prefix + name):
+                opts.delValue(option_prefix + name)
         if self.krylov_diagonal_scale:
             opts[f"{option_prefix}ksp_diagonal_scale"] = ""
             opts[f"{option_prefix}ksp_diagonal_scale_fix"] = ""
@@ -912,10 +899,11 @@ class CompressibleEulerModel():
             return np.nan
         return full_norm / u_norm
 
-    def solve_linearized(self, rhs, out, transpose=False, prefix="lin_", rtol=1e-10,
-                         atol=1e-11, max_it=1000, gmres_restart=200, release_operands=False):
+    def linearized_solver(self, transpose=False, prefix="lin_", rtol=1e-10,
+                          atol=1e-11, max_it=1000, gmres_restart=200, release_operands=False,
+                          matrix_free=False, ksp_options=None):
         """
-        Solve dR/dU x = rhs (or its transpose, for the adjoint) at the
+        The KSP of dR/dU x = rhs (or its transpose, for the adjoint) at the
         current state, for models whose dR/dU is a condensed product
         (has_condensed_jacobian). FGMRES on the exact operator, right
         preconditioned with ASM/ILU of the compact A_UU part -- the forward
@@ -923,9 +911,18 @@ class CompressibleEulerModel():
         The transposes are formed explicitly. With release_operands and
         transpose, the condensed dR/dU (and its blocks) is freed once the
         transposes exist, before the preconditioner is set up: only the
-        transposes are used from then on (release_solver). Returns the KSP
-        (iterations, residual norm and reason are read off it).
+        transposes are used from then on (release_solver). The KSP holds its
+        operators and, after its first solve, the preconditioner's factors, so
+        it solves any number of right-hand sides at this state; the caller
+        destroys it. Collective.
+
+        matrix_free (with transpose): the operator is the python Mat of
+        TransposedCondensedOperator, A_UU^T x + B^T (A_UG^T x), which never
+        forms A or the product A_UG B; its context owns the matrices and is
+        destroyed with destroy_adjoint_operator(ksp).
         """
+        if transpose and matrix_free:
+            return self._matrix_free_adjoint_solver(prefix, rtol, atol, max_it, gmres_restart, ksp_options)
         A = self.assemble_dRdu_mat()
         P = self._dRdu_condensed.A_UU
         if transpose:
@@ -945,6 +942,82 @@ class CompressibleEulerModel():
                                               monitor_convergence=False, rtol=rtol, atol=atol)
         finally:
             self.krylov_type, self.krylov_diagonal_scale = saved
+        self._apply_ksp_options(ksp, ksp_options)
+        return ksp
+
+    # PETSc option keys written by _apply_ksp_options: the options database is global, so they are
+    # removed again when the next KSP is configured instead of leaking into it
+    _applied_ksp_option_keys = set()
+
+    @classmethod
+    def _apply_ksp_options(cls, ksp, ksp_options):
+        """Override KSP settings through the PETSc options DB, after the model's own:
+        a dict of option names without the prefix, e.g. {"ksp_type": "dgmres",
+        "ksp_gmres_restart": 400}. The overrides last until the next KSP is configured here
+        (the preconditioner reads its options at the first solve), then are deleted. An option
+        the PETSc build does not know (a KSP type it was not built with) raises a PETSc error."""
+        opts = PETSc.Options()
+        for key in cls._applied_ksp_option_keys:
+            opts.delValue(key)
+        cls._applied_ksp_option_keys = set()
+        if not ksp_options:
+            return
+        prefix = ksp.getOptionsPrefix()
+        for key, value in ksp_options.items():
+            opts[prefix + key] = value
+            cls._applied_ksp_option_keys.add(prefix + key)
+        ksp.setFromOptions()
+
+    def _matrix_free_adjoint_solver(self, prefix, rtol, atol, max_it, gmres_restart, ksp_options=None):
+        from dragonfly_sim.utils.gradient_condensation import TransposedCondensedOperator
+        self.update_derived_fields()
+        rec = self.reconstruction
+        forms = rec.compact_forms(self.F)
+        A_UU = dolfinx.fem.petsc.create_matrix(forms[0])
+        A_UG = dolfinx.fem.petsc.create_matrix(forms[1])
+        for M, a in ((A_UU, forms[0]), (A_UG, forms[1])):
+            M.zeroEntries()
+            dolfinx.fem.petsc.assemble_matrix(M, a)
+            M.assemble()
+        P = A_UU.transpose(PETSc.Mat())
+        A_UU.destroy()
+        gradient = rec.gradient
+        B = gradient.state_jacobian()
+        ctx = TransposedCondensedOperator(P, A_UG, B, gradient.discard)
+        A = ctx.create_mat(self.mesh_obj.mesh.comm)
+        self._return_freed_memory()
+        ksp = PETSc.KSP().create(self.mesh_obj.mesh.comm)
+        ksp.setOptionsPrefix(prefix)
+        ksp.setOperators(A, A if self.direct_linear_solver else P)
+        saved = (self.krylov_type, self.krylov_diagonal_scale)
+        self.krylov_type, self.krylov_diagonal_scale = "fgmres", False
+        try:
+            self.apply_krylov_solver_settings(ksp, max_it=max_it, gmres_restart=gmres_restart,
+                                              monitor_convergence=False, rtol=rtol, atol=atol)
+        finally:
+            self.krylov_type, self.krylov_diagonal_scale = saved
+        self._apply_ksp_options(ksp, ksp_options)
+        return ksp
+
+    @staticmethod
+    def destroy_adjoint_operator(ksp):
+        """Destroy a KSP of linearized_solver and, for a matrix-free one, what
+        its operator's context owns."""
+        A = ksp.getOperators()[0]
+        ksp.destroy()
+        if A.getType() == PETSc.Mat.Type.PYTHON:
+            A.destroy()                  # PETSc calls the context's destroy(mat)
+
+    def release_derived_caches(self):
+        """Free what the derived fields cache between calls (Jacobians kept
+        while the state, alpha and mesh are unchanged). Collective."""
+        for f in self.derived_fields:
+            f.release_cache()
+
+    def solve_linearized(self, rhs, out, **kwargs):
+        """Solve dR/dU x = rhs once (see linearized_solver for the arguments):
+        returns the KSP (iterations, residual norm and reason are read off it)."""
+        ksp = self.linearized_solver(**kwargs)
         ksp.solve(rhs, out)
         return ksp
 

@@ -25,6 +25,9 @@ WING_L3 = os.path.join(MESH_DIR, "wing_vol_L3.cgns")
 needs_wing_l3 = pytest.mark.skipif(not os.path.isfile(WING_L3), reason="wing_vol_L3.cgns not in meshes/")
 
 
+pytestmark = [pytest.mark.unit_test]
+
+
 def two_blocks():
     """Node blocks on [0, 1] x [0, 1] (i along x) and [1, 2] x [0, 1] (i along
     y: left-handed), sharing their 3 nodes on x = 1."""
@@ -136,4 +139,4 @@ def test_load_wing_l3_distributed():
 
 def test_unsupported_extension():
     with pytest.raises(ValueError):
-        load_dolfinx_mesh("mesh.msh")
+        load_dolfinx_mesh("mesh.obj")

@@ -44,13 +44,11 @@ $\hat{H}_b = \mathbf{F}(U)\cdot\mathbf{n} + \lambda\,(U - U_b)$.
 
 | Boundary | $U_b$ |
 |---|---|
-| Subsonic inflow | $\rho_\infty$ and freestream velocity prescribed, pressure from the interior |
-| Subsonic outflow | $p_\infty$ prescribed, density and velocity from the interior |
+| Far field | characteristic state from the Riemann invariants of the interior and the freestream (see [far fields](flow_models.md)) |
 | Slip wall | interior state with the normal velocity reflected, $\mathbf{u}_b = \mathbf{u} - 2(\mathbf{u}\cdot\mathbf{n})\mathbf{n}$ |
 | Symmetry plane (3D, $y=0$) | as the slip wall |
 
-The far-field boundary is split into inflow and outflow by a plane through the middle of the domain,
-normal to the freestream direction at the initial angle of attack.
+The whole outer boundary is one far field; no inflow/outflow division is made, so the angle of attack can change freely.
 
 Viscous (RANS) models, pseudo-transient continuation and unsteady time stepping, and the characteristic far
 field are described in [RANS, time integration and far fields](flow_models.md).
@@ -77,15 +75,17 @@ control points, either individually or through sectional operations, deform the 
 
 ## Mesh deformation
 The volume mesh follows the wall with IDWarp {cite:p}`luke2012fast`: each volume node moves by an
-inverse-distance-weighted average of the surface node displacements and rotations. The inflow and outflow
-boundaries are included as fixed surfaces, so the far field stays in place. The weighted sums are evaluated with
+inverse-distance-weighted average of the surface node displacements and rotations. The far-field
+boundary is included as a fixed surface, so the far field stays in place. The weighted sums are evaluated with
 a kd-tree (the `idwarp_jax` package) and pruned with a relative tolerance `err_tol` (default $10^{-6}$).
 
 ## Outputs
 The pressure force on the wall is $\mathbf{F}_p = \int_{wall} p\,\mathbf{n}\,ds$. Drag $D$ and lift $L$ are its
-components along and normal to the freestream, and the pitching moment $M$ is taken about `aero_center`,
-positive nose-up. The coefficients divide these by $\tfrac{1}{2}\rho_\infty|\mathbf{u}_\infty|^2 S_{ref}$ (and the
-reference chord for $c_m$), with $S_{ref} = 1$ in 2D and the planform area of the half-wing in 3D, unless set by
+components along and normal to the freestream, and each moment $M = \mathbf{d}\cdot(\mathbf{r}\times\mathbf{F}_p)$ is taken about a user-given point along a
+user-given direction `moments=[(name, point, direction), ...]` (the pitching moment about a point, positive
+nose-up, is direction `"pitch"`; the root bending moment of a half-wing is direction $(1, 0, 0)$ about a point
+on the root). The coefficients divide these by $\tfrac{1}{2}\rho_\infty|\mathbf{u}_\infty|^2 S_{ref}$ (and a
+reference length for the moments, the reference chord by default), with $S_{ref} = 1$ in 2D and the planform area of the half-wing in 3D, unless set by
 the user.
 
 ## Derivatives

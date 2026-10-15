@@ -6,46 +6,37 @@ one up, in the order of the scripts in `examples/`. Run the script with MPI
 (`OMP_NUM_THREADS=1 mpirun -n <ranks> python script.py`).
 
 ## 1. Mesh
-Read a DOLFINx mesh, typically from XDMF:
-```python
-with dolfinx.io.XDMFFile(MPI.COMM_WORLD, "naca0012_euler_mesh_quad_v2.xdmf", "r") as xdmf:
-    mesh = xdmf.read_mesh()
-```
-`dragonfly_sim.utils.mesh_io_utils.load_dolfinx_mesh(path)` reads either an XDMF file or a structured
-multi-block CGNS grid, chosen by file extension, and returns `(mesh, info)`:
+Read a DOLFINx mesh with `load_dolfinx_mesh`, which handles XDMF, gmsh `.msh` and structured CGNS files and keeps the
+boundary tags the file carries:
 ```python
 from dragonfly_sim.utils.mesh_io_utils import load_dolfinx_mesh
 
-mesh, info = load_dolfinx_mesh("OAT15A_Rizzi_1.cgns")   # info: chord, cell and boundary-edge counts
+mesh, info = load_dolfinx_mesh("naca0012_euler_mesh_quad_v2.xdmf")
 ```
-A CGNS grid of a 2D case must be one cell thick (or planar). Rank 0 reads it with PyVista, keeps one span plane
-of every block, merges the nodes the blocks share by exact coordinate match, and checks that the boundary edges
-are exactly those of the wall and far-field families (`wall_family="Wall"`, `farfield_family="Farfield"`). By
-default the points are shifted and scaled so that the wall's leading edge is at $x = 0$ and its chord is 1
-(`scale_to_chord`). DOLFINx then distributes the mesh; no converted file is written.
+A mesh read with plain DOLFINx (`xdmf.read_mesh()`) works too, with the boundary function.
 
-A 3D structured grid is read with `tdim=3`, e.g. the Simple Transonic Wing's
-`load_dolfinx_mesh("wing_vol_L3.cgns", tdim=3)`: every block becomes hexahedra, the blocks' shared nodes are merged
-by exact coordinate match, and the mesh is checked for inverted cells and unmerged block interfaces. Its boundary
-conditions are not read (VTK skips them), so the solver finds the boundaries geometrically, as for an XDMF mesh.
+The solver needs to know which boundary facets are the wall (the body) and which are symmetry planes; all others are
+far field. Either pass a function of the facet midpoints (`mesh_inner_bdry_function`, with
+`airfoil_inner_bdry_function` and `wing_inner_bdry_function` in `dragonfly_sim.utils.mesh_manager_utils` for the
+example meshes), or name the mesh's own boundary tags (`wall_tags`, `symmetry_tags`). The function takes precedence
+and, if the mesh also has tags, a warning lists them. Giving the shape parameterization a `block_corner_list` is a
+third way to find the wall. The formats, both options and the checks are described in [Meshes](meshes.md).
 
 Requirements:
 - **Orientation**: the freestream flows in $+x$. In 2D, y is vertical; in 3D, y is spanwise and z vertical.
 - **3D**: model a half-wing whose root lies on the symmetry plane $y = 0$.
-- **Far field**: the outer boundary should be far from the body; it is split automatically into inflow and outflow.
-- **Wall**: identified by a function `mesh_inner_bdry_function(x)` that takes facet midpoints of shape
-  `(dim, n)` and returns a boolean mask. `dragonfly_sim.utils.mesh_manager_utils` provides
-  `airfoil_inner_bdry_function` and `wing_inner_bdry_function` for the meshes used in the examples. Alternatively,
-  give the shape parameterization a `block_corner_list`, and the wall facets inside that FFD block are used.
+- **Far field**: the outer boundary should be far from the body. All of it that is neither wall nor symmetry plane gets the characteristic far-field condition.
 
 ## 2. Flow conditions
 ```python
-boundary_dict = {'inlet':  {'rho': 1.0, 'M': 0.8, 'p': 1.0, 'alpha': np.radians(2)},
-                 'outlet': {'p': 1.0}}
+boundary_dict = {'rho': 1.0, 'M': 0.8, 'p': 1.0, 'alpha': np.radians(2)}
 ```
-Only subsonic inflow and outflow are supported. The inflow/outflow split of the far field is frozen at the initial
-`alpha`; changing the angle of attack by more than 1 degree from it raises an error, so keep the design variable
-bounds within that range.
+This free-stream state is all that is specified: density, pressure, Mach number and angle of attack (radians). The
+whole outer boundary is a characteristic (Riemann-invariant) far field built from it, which takes each facet's
+inflow or outflow character from the flow itself, so the angle of attack can be changed by any amount, for example
+in an optimization over a wide range of angles. The far field is subsonic: $M < 1$.
+
+The former form `{'inlet': {...}, 'outlet': {...}}` is no longer accepted; pass the contents of `'inlet'` and drop `'outlet'`.
 
 ## 3. Flow model
 ```python
@@ -55,7 +46,7 @@ from dragonfly_sim.utils.mesh_manager_utils import airfoil_inner_bdry_function
 
 # 5 x 3 FFD control points; they move vertically, within +/-0.01
 shape = FFDShapeParameterization([5, 3], [2, 2], layers=[ControlPointMotions({1: 0.01})])
-model = DG_windtunnel_model(mesh, boundary_dict, shape, aero_center=np.array([0.25, 0.]),
+model = DG_windtunnel_model(mesh, boundary_dict, shape, moments=[("pitch", (0.25, 0.), "pitch")],
                             mesh_inner_bdry_function=airfoil_inner_bdry_function,
                             poly_order=0, filename_suffix="my_case", asm_overlap=1, ilu_levels=1)
 model.set_up_sim()
@@ -73,14 +64,13 @@ Solver settings are attributes; change them before `set_up_sim()`:
 | `max_newton_iterations` | `100` | total Newton step budget per flow solve |
 | `linear_solver_rtol`, `linear_solver_atol` | `1e-20`, `1e-11` | adjoint and tangent linear solves |
 | `linear_solver_max_it` | `1000` | iteration limit of those solves |
-| `log_cm_alpha` | `True` | print $dc_m/d\alpha$ after each solve (one extra linear solve) |
 
-Constructor options select the flow model and the far field:
+Constructor options select the flow model:
 
 | Argument | Default | Meaning |
 |---|---|---|
 | `model_class`, `model_kwargs` | `CompressibleEulerModel`, `{}` | e.g. `CompressibleRANSModel`, `{'Re': 6e6}` for SA-neg RANS (see [RANS, time integration and far fields](flow_models.md)); the body becomes an adiabatic no-slip wall |
-| `farfield` | `"split"` | `"riemann"`: characteristic far field on the whole outer boundary instead of the inflow/outflow split |
+| `mesh_inner_bdry_function`, `wall_tags`, `symmetry_tags` | `None` | how the wall and symmetry planes are found (see Mesh above) |
 | `reduced_order_model` | `None` | a `ReducedOrderModel` to try before every flow solve (see [Reduced-order modeling](reduced_order_modeling.md)) |
 
 RANS solves use pseudo-transient continuation, so `max_newton_iterations` counts pseudo steps (~60 from the free
@@ -115,9 +105,34 @@ out.D.set_as_objective()
 out.L.set_as_constraint(lower=0.225)
 recorder.stop()
 ```
-`post.evaluate` returns `L`, `D` and `M`, which have derivatives and may be used as objectives and constraints,
-and the coefficients `c_l`, `c_d`, `c_m` and `c_m_alpha`, which are for monitoring only. The flattened shape
-parameter vector `params` is passed along for bookkeeping; it carries no derivatives.
+`post.evaluate` returns `L`, `D` and, for every moment (see [Moments](#moments)), `M_<name>`, which have
+derivatives and may be used as objectives and constraints, and the coefficients `c_l`, `c_d` and `c_m_<name>`,
+which are for monitoring only. The flattened shape parameter vector `params` is passed along for bookkeeping; it
+carries no derivatives.
+
+### Moments
+The moments of the wall force to compute, print after every evaluation and differentiate are given to
+`DG_windtunnel_model` (or `DG_postprocessor`) as `moments`, a list of `(name, point, direction[, ref_length])`
+tuples; there are none by default. Each is $M = \mathbf{d}\cdot(\mathbf{r}\times\mathbf{F})$ with
+$\mathbf{r} = \mathbf{x} - $ `point`, integrated over the wall (right-hand rule). `direction` is any nonzero
+vector (normalised), or `"pitch"`: the nose-up-positive pitching moment, $(0, 1, 0)$ in 3D (spanwise $y$) and
+$(0, 0, -1)$ in 2D, where only the out-of-plane direction $(0, 0, \pm 1)$ exists. The root bending moment of a
+half-wing on the $y = 0$ symmetry plane, and its pitching moment, both about the root quarter chord:
+```python
+moments = [("root_bending", (0.25, 0., 0.), (1., 0., 0.)),
+           ("pitch",        (0.25, 0., 0.), "pitch")]
+model = DG_windtunnel_model(mesh, boundary_dict, shape, moments=moments, ...)
+post = DG_postprocessor(model.mesh, model.sim_model, model.WALL_TAG, moments=moments, p_inf_dim=101325.)
+out = post.evaluate(u, mesh_motion, alpha, params)
+out.M_root_bending.set_as_constraint(upper=...)
+```
+The outputs are `M_<name>` (differentiated with respect to the state, the mesh motion and $\alpha$) and
+`c_m_<name>` (monitoring only). The coefficient divides by $\tfrac{1}{2}\rho_\infty|\mathbf{u}_\infty|^2
+S_{ref}\,L_k$, where $L_k$ is the reference chord unless the fourth tuple entry gives another length, e.g. the
+semi-span for a bending coefficient. The reference area and chord change with the 3D geometry, so constrain
+`M_<name>`, not `c_m_<name>`. The directions are fixed in the geometry axes and the points fixed in space, also
+while a shape variable moves the wall: a variable that moves the root station does not move the point. The names
+must be unique identifiers. Each moment costs one assembly of its value and of each derivative.
 
 ## 6. Running
 ```python
@@ -136,22 +151,22 @@ Leave out the shape parameterization: `set_up_sim()` then builds no FFD block an
 (`model.ffd` and `model.mesh_warper` stay `None`), the mesh stays fixed, and the angle of attack is the only
 input.
 ```python
-model = DG_windtunnel_model(mesh, boundary_dict, mesh_inner_bdry_function=airfoil_inner_bdry_function,
-                            poly_order=0)
+model = DG_windtunnel_model(mesh, boundary_dict, moments=[("pitch", (0.25, 0.), "pitch")],
+                            mesh_inner_bdry_function=airfoil_inner_bdry_function, poly_order=0)
 model.set_up_sim()
 
 # one flow solve, no CSDL graph: the state, a convergence flag, and the forces
 u, converged, forces = model.solve_forward(np.radians(2))
-print(forces["c_l"], forces["c_d"], forces["c_m"])
+print(forces["c_l"], forces["c_d"], forces["moments"]["pitch"]["c_m"])
 
 # or a CSDL graph with alpha as its only input
 u = model.evaluate(alpha=alpha)
 out = model.postprocessor.evaluate(u, alpha=alpha)
 ```
 `DG_postprocessor` needs no FFD definitions either: `post.forces_and_coefficients(u, alpha)` returns `L`, `D`,
-`M`, `c_l`, `c_d`, `c_m` (and, for a viscous model, the friction drag `D_friction`, `c_d_friction`) of any state,
-outside CSDL, and `post.evaluate(u, alpha=alpha)` leaves out the mesh deformation. `aero_center` defaults to
-the quarter chord, $(0.25, 0[, 0])$. See `examples/airfoil_analysis.py`. Time-dependent runs are set up directly
+`c_l`, `c_d`, the `moments` (a dict of `{"M": ..., "c_m": ...}` per name) and, for a viscous model, the
+friction drag `D_friction`, `c_d_friction` of any state, outside CSDL, and `post.evaluate(u, alpha=alpha)` leaves
+out the mesh deformation. See `examples/airfoil_analysis.py`. Time-dependent runs are set up directly
 from the model classes, as in `examples/flow_analysis.py`.
 
 ## Reduced-order model
@@ -192,7 +207,7 @@ Written to the working directory, named with `filename_suffix`:
   deformation on the baseline mesh (apply it with *Warp By Vector*); frame $k$ of each file belongs to the same
   evaluation. `write_mesh_deformation = False` leaves out the mesh deformation file, and
   `write_once_per_design = True` writes one frame per design when the optimizer evaluates a design twice;
-- `output_meshtags.xdmf`: the boundary tags, to check the inflow/outflow/wall/symmetry split;
+- `output_meshtags.xdmf`: the boundary tags, to check the far-field/wall/symmetry tags;
 - `memory_logs/`: peak memory per MPI rank.
 
 `model.data_store` collects per-evaluation results (with a reduced-order model also its wall times, $\eta$,

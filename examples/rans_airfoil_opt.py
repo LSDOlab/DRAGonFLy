@@ -38,8 +38,7 @@ if __name__ == '__main__':
         mesh_from_file = xdmf.read_mesh()
 
     M_0, attack, Re = 0.7, np.radians(2.0), 6e6
-    boundary_dict = {'inlet': {'rho': 1.0, 'M': M_0, 'p': 1.0, 'alpha': attack},
-                     'outlet': {'p': 1.0}}
+    boundary_dict = {'rho': 1.0, 'M': M_0, 'p': 1.0, 'alpha': attack}
 
     ffd_bspline_deg = [2, 2]
     ffd_shape = [5, 3]
@@ -51,7 +50,7 @@ if __name__ == '__main__':
     recorder.start()
 
     windtunnel = DG_windtunnel_model(mesh_from_file, boundary_dict, shape,
-                                     np.array([0.25, 0.], dtype=np.double),
+                                     moments=[("pitch", (0.25, 0.), "pitch")],
                                      mesh_inner_bdry_function=airfoil_inner_bdry_function,
                                      poly_order=0, gamma=1.4,
                                      filename_suffix="rans_airfoil_check_totals",
@@ -66,7 +65,7 @@ if __name__ == '__main__':
     windtunnel.set_up_sim()
 
     coefficients = DG_postprocessor(windtunnel.mesh, windtunnel.sim_model, windtunnel.WALL_TAG,
-                                    np.array([0.25, 0.], dtype=np.double))
+                                    moments=windtunnel.moments)
     shape_param_vector = shape.declare_design_variables()
 
     alpha = csdl.Variable(name='alpha', value=np.array([attack]))

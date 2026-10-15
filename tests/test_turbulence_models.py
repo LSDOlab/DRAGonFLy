@@ -45,6 +45,7 @@ def np_sa_pd(nu_t, nu, Omega, d, ft2=False):
     (-2e-5, 1e-5, 30.0, 1e-2),     # negative branch
 ])
 @pytest.mark.parametrize("ft2", [False, True])
+@pytest.mark.verification
 def test_sa_neg_production_destruction(nu_t, nu, Omega, d, ft2):
     sa = SpalartAllmarasNeg(ft2=ft2)
     P, D = sa.production_destruction(const(nu_t), const(nu), const(Omega), const(d))
@@ -52,6 +53,7 @@ def test_sa_neg_production_destruction(nu_t, nu, Omega, d, ft2):
                                rtol=1e-12)
 
 
+@pytest.mark.verification
 def test_sa_neg_eddy_viscosity_vanishes_for_negative_nu_tilde():
     sa = SpalartAllmarasNeg()
     U = const([1.0, 0.5, 0.0, 2.5, -1e-5])
@@ -86,13 +88,14 @@ class TwoPassiveScalars(TurbulenceModel):
 
 
 @pytest.mark.parametrize("closure", [Laminar(), TwoPassiveScalars()], ids=["laminar", "two-scalar"])
+@pytest.mark.unit_test
 def test_closures_plug_in(closure):
     """A uniform free stream with a characteristic far field all round is an
     exact discrete solution for any closure whose free-stream values make
     its sources vanish."""
     model = rans_square_model(closure, n=4, jitter=0.0)
     assert model.n_state == 4 + closure.n_vars
-    model.compute_initial_conditions_from_inlet()
+    model.compute_initial_conditions_from_farfield()
     model.interpolate_solution_vector()
     model.define_farfield_bc(1)
     model.compute_weakform()

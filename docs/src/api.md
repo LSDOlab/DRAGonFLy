@@ -3,7 +3,7 @@ Auto-generated from the docstrings of the `dragonfly_sim` package.
 
 The main entry points:
 - `dragonfly_sim.core.windtunnel_model.DG_windtunnel_model`: flow model (CSDL implicit operation)
-- `dragonfly_sim.core.postprocessor.DG_postprocessor`: lift, drag and pitching moment
+- `dragonfly_sim.core.postprocessor.DG_postprocessor`: lift, drag and moments about user-given points and directions
 - `dragonfly_sim.core.meshwarping.IDWarp_jax`: volume mesh deformation
 - `dragonfly_sim.core.shape_design`: the shape design variables (`FFDShapeParameterization` and its layers
   `ControlPointMotions`, `SectionalVariables`, `WingShape`)
@@ -18,7 +18,7 @@ The main entry points:
 - `dragonfly_sim.core.farfield.TransverseFarfield`: the transverse (riemann2) far field
 - `dragonfly_sim.core.reduced_order_model`: `ReducedOrderModel`, `LSPGSolver` and `dragonfly_sim.core.pod`:
   `SnapshotMatrix`, `PODBasis` (see [Reduced-order modeling](reduced_order_modeling.md))
-- `dragonfly_sim.utils.mesh_io_utils`: mesh input from XDMF or structured CGNS grids (`load_dolfinx_mesh`,
+- `dragonfly_sim.utils.mesh_io_utils`: mesh input (and boundary tags) from XDMF, gmsh or structured CGNS grids (`load_dolfinx_mesh`,
   `cgns_to_dolfinx_mesh`, `read_cgns_planar`, `read_cgns_volume`)
 - `dragonfly_sim.utils.filewriter.FileWriter`: VTX output for ParaView
 - `dragonfly_sim.utils.solver_profiling`: per-phase wall-time profiling (`PROFILER`; see

@@ -12,12 +12,13 @@ from dragonfly_sim.core.time_integration import bdf_coefficients, CFLController,
 from dragonfly_sim.core.farfield import TransverseFarfield
 from dragonfly_sim.utils.checkpoint import save_checkpoint, load_checkpoint
 
-from cases import euler_channel_model, seed_mean_flow, FREESTREAM, INLET_TAG, OUTLET_TAG, WALL_TAG
+from cases import euler_channel_model, seed_mean_flow, FREESTREAM, WALL_TAG
 
 
 # ----------------------------------------------------------------------
 # pure Python
 # ----------------------------------------------------------------------
+@pytest.mark.verification
 def test_bdf_coefficients():
     assert bdf_coefficients(1) == (1.0, -1.0, 0.0)
     np.testing.assert_allclose(bdf_coefficients(2), (1.5, -2.0, 0.5))
@@ -29,6 +30,7 @@ def test_bdf_coefficients():
         assert abs(a[0] * 1.0 + a[2] * (-1.0 / w) - 1.0) < 1e-14
 
 
+@pytest.mark.unit_test
 def test_cfl_controller_decisions():
     c = CFLController(cfl0=10.0)
     assert c.update(1.0, 0.5) == (True, False) and c.cfl == 20.0      # progress: x2 (cap)
@@ -54,6 +56,27 @@ def test_cfl_controller_decisions():
     assert c.cfl == 10.0
 
 
+@pytest.mark.unit_test
+def test_cfl_controller_milder_cut_on_a_rise():
+    # default: any rise above 5% at least halves the CFL
+    c = CFLController(cfl0=10.0)
+    c.update(1.0, 1.1)
+    assert c.cfl == pytest.approx(5.0)
+    # milder: the cut is the residual ratio, clipped to [rise_factor_min, rise_factor_max]
+    c = CFLController(cfl0=10.0, rise_factor_min=0.7, rise_factor_max=0.9)
+    c.update(1.0, 1.1)                                                 # 1/1.1 = 0.909 -> clipped to 0.9
+    assert c.cfl == pytest.approx(9.0)
+    c.cfl = 10.0
+    c.update(1.0, 1.25)                                                # 1/1.25 = 0.8: proportional
+    assert c.cfl == pytest.approx(8.0)
+    c.cfl = 10.0
+    c.update(1.0, 3.0)                                                 # large rise: no cut below 0.7
+    assert c.cfl == pytest.approx(7.0)
+    c.cfl = 10.0
+    assert c.update(1.0, 20.0) == (False, False) and c.cfl == pytest.approx(1.0)   # rejection is unchanged
+
+
+@pytest.mark.unit_test
 def test_cfl_controller_stops_when_frozen():
     # theta = 0 leaves the state unchanged: max_frozen_steps of them in a row exhaust the controller
     c = CFLController(cfl0=5.0, max_frozen_steps=3)
@@ -69,6 +92,7 @@ def test_cfl_controller_stops_when_frozen():
     assert not c.exhausted and c.frozen_steps == 0
 
 
+@pytest.mark.unit_test
 def test_step_size_controller():
     s = StepSizeController(dt=0.05, dt_start=1e-3, growth=1.5)
     assert s.first(None) == 1e-3 and s.first(1e-3) == pytest.approx(1.5e-3) and s.first(0.04) == 0.05
@@ -78,6 +102,7 @@ def test_step_size_controller():
 # ----------------------------------------------------------------------
 # with a model
 # ----------------------------------------------------------------------
+@pytest.mark.unit_test
 def test_checkpoint_round_trip(tmp_path):
     comm = MPI.COMM_WORLD
     model = euler_channel_model(n=6)
@@ -105,10 +130,10 @@ def _farfield_square(n=6, transverse=False, beta=0.0):
     model = CompressibleEulerModel(mesh_obj)
     model.residual_conv_limit, model.max_newton_iterations = 1e-10, 50
     model.report_positivity_limiter = False
-    model.define_inlet_outlet_conditions(FREESTREAM)
+    model.define_farfield_conditions(FREESTREAM)
     model.define_elements_functionspaces()
     model.define_trial_testfunctions()
-    model.compute_initial_conditions_from_inlet()
+    model.compute_initial_conditions_from_farfield()
     model.interpolate_solution_vector()
     tf = TransverseFarfield(model, 6, beta=beta, relax_length=1.0) if transverse else None
     model.define_farfield_bc(6, transverse=tf)
@@ -130,6 +155,7 @@ def _run_steps(model, tf, steps, dt=0.05):
     return integrator
 
 
+@pytest.mark.verification
 def test_unsteady_freestream_is_preserved():
     model, _ = _farfield_square()
     u0 = model.u_vec.x.array.copy()
@@ -148,6 +174,7 @@ def _perturb(model):
     model.u_vec.x.scatter_forward()
 
 
+@pytest.mark.verification
 def test_transverse_farfield_with_beta_zero_is_riemann():
     states = []
     for transverse, beta in ((False, 0.0), (True, 0.0), (True, 0.5)):
@@ -161,6 +188,7 @@ def test_transverse_farfield_with_beta_zero_is_riemann():
     assert MPI.COMM_WORLD.allreduce(float(np.abs(states[2] - states[0]).max()), MPI.MAX) > 1e-8
 
 
+@pytest.mark.verification
 def test_steady_ptc_and_unsteady_euler_reach_the_same_state():
     """PTC from a perturbed state and many large BDF1 steps converge to the
     same steady channel flow as the release Newton solve."""
@@ -195,6 +223,7 @@ def test_steady_ptc_and_unsteady_euler_reach_the_same_state():
     np.testing.assert_allclose(bdf.u_vec.x.array, ref.u_vec.x.array, rtol=0, atol=1e-7)
 
 
+@pytest.mark.verification
 def test_dual_time_steps_match_newton_steps():
     """Dual time solves the same R* = 0 per physical step, by PTC instead of
     plain Newton: the states agree to the inner tolerance."""
@@ -228,6 +257,7 @@ def _ptc_channel(warm_start):
     return model
 
 
+@pytest.mark.unit_test
 def test_ptc_warm_start_continues_at_the_final_cfl():
     """After a converged steady solve, a solve from that end state at a slightly
     different angle of attack continues at the final CFL instead of ramping up
@@ -241,7 +271,7 @@ def test_ptc_warm_start_continues_at_the_final_cfl():
         assert model.solver_converged
         cold_steps = integrator.last_steady_steps
         assert cold_steps > 3
-        alpha = model.boundary_conditions['inlet']['alpha']
+        alpha = model.farfield_conditions['alpha']
         model.set_angle_of_attack(alpha + np.radians(0.05))
         model.solve_system()
         assert model.solver_converged
@@ -251,6 +281,7 @@ def test_ptc_warm_start_continues_at_the_final_cfl():
     np.testing.assert_allclose(states[True], states[False], rtol=0, atol=1e-7)
 
 
+@pytest.mark.unit_test
 def test_ptc_warm_start_needs_the_end_state_of_the_last_solve():
     model = _ptc_channel(True)
     integrator = model.time_integrator

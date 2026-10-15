@@ -17,10 +17,13 @@ from cases import rans_square_model, manufactured_state, WALL_TAG
 ALPHA = np.radians(3.0)
 
 
+pytestmark = [pytest.mark.verification]
+
+
 @pytest.fixture(scope="module")
 def case():
     model = rans_square_model(SpalartAllmarasNeg(), n=5, Re=200.0, wall_bottom=True, jitter=0.05)
-    model.compute_initial_conditions_from_inlet()
+    model.compute_initial_conditions_from_farfield()
     model.interpolate_solution_vector()
     model.set_angle_of_attack(ALPHA)
     model.define_farfield_bc(1)

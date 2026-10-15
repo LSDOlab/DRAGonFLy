@@ -4,7 +4,11 @@ integration and far-field work: the same residual, Jacobian, dR/dalpha and
 dR/dx, and the same Newton iterates.
 
 The reference (tests/data/euler_reference.npz) was generated on main @ ccca26b
-before those changes by tests/data/make_euler_reference.py. Assembly
+before those changes by tests/data/make_euler_reference.py, and regenerated
+once on branch Riemann_bc_default when the channel's subsonic inflow/outflow
+became the characteristic far field. Only the 16 cells on the far-field
+sides differed in the residual, the Jacobian action and dR/dalpha (checked
+before regenerating); the interior discretization is untouched. Assembly
 quantities are rank-independent (per-cell values ordered by original cell
 index, matrices through their action on fixed smooth fields) and compared on
 any rank count; the Newton history depends on the ASM partitioning and is
@@ -19,6 +23,9 @@ from mpi4py import MPI
 from euler_reference_quantities import euler_reference_quantities
 
 REFERENCE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "euler_reference.npz")
+
+
+pytestmark = [pytest.mark.verification]
 
 
 @pytest.fixture(scope="module")

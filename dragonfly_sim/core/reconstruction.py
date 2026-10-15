@@ -34,7 +34,7 @@ import dolfinx
 import dolfinx.fem.petsc
 
 from dragonfly_sim.utils.derived_fields import (DerivedField, diagonal_mass_inverse,
-                                                mesh_coordinate_argument)
+                                                mesh_coordinate_argument, destroy_operator)
 from dragonfly_sim.utils.gradient_condensation import CondensedGradientProblem
 from dragonfly_sim.utils.solver_profiling import PROFILER as _PROF
 
@@ -50,6 +50,10 @@ class CellCentres(DerivedField):
 
     def __init__(self, mesh_obj):
         self.mesh_obj = mesh_obj
+        # the reconstruction (set by its install()) decides whether dc/dx is built
+        # vectorized and once -- it is a constant matrix -- or per call in a Python loop
+        self.rec = None
+        self._mesh_jac = None
         msh = mesh_obj.mesh
         gdim = msh.geometry.dim
         self.function = dolfinx.fem.Function(
@@ -62,6 +66,51 @@ class CellCentres(DerivedField):
         self.function.x.scatter_forward()
 
     def mesh_jacobian(self):
+        if self.rec is None or not self.rec.fast_cell_centre_jacobian:
+            return self._mesh_jacobian_loop()
+        if self._mesh_jac is None:
+            self._mesh_jac = self._mesh_jacobian_vectorized()
+        return self._mesh_jac
+
+    def discard(self, obj):
+        if obj is not self._mesh_jac:
+            destroy_operator(obj)
+
+    def release_cache(self):
+        # the matrix is constant: kept until the reconstruction's cache is released
+        if self._mesh_jac is not None:
+            self._mesh_jac.destroy()
+            self._mesh_jac = None
+
+    def _mesh_jacobian_vectorized(self):
+        """The same matrix as _mesh_jacobian_loop, as one CSR build: row (cell,
+        component i) holds 1/nv at the cell's vertex dofs' component i."""
+        msh = self.mesh_obj.mesh
+        Vc = self.function.function_space
+        Vx = self.mesh_obj.coordinate_space
+        gdim = msh.geometry.dim
+        n_own = msh.topology.index_map(msh.topology.dim).size_local
+        rows_map, cols_map = Vc.dofmap.index_map, Vx.dofmap.index_map
+        IT = PETSc.IntType
+        # the rows of a CSR are in the order of the owned row dofs, not of the cells
+        cell_dofs = np.asarray(Vc.dofmap.list[:n_own, 0])
+        order = np.argsort(cell_dofs)
+        assert np.array_equal(cell_dofs[order], np.arange(n_own)), "cell centre dofs are not the owned blocks"
+        vertex_dofs = np.asarray(Vx.dofmap.list[:n_own])[order]
+        nv = vertex_dofs.shape[1] if n_own else 1
+        cols = cols_map.local_to_global(vertex_dofs.ravel()).reshape(n_own, nv).astype(np.int64)
+        idx = cols[:, None, :] * gdim + np.arange(gdim)[None, :, None]       # (cell, component, vertex)
+        idx = np.sort(idx.reshape(n_own * gdim, nv), axis=1)
+        indptr = np.arange(n_own * gdim + 1, dtype=np.int64) * nv
+        data = np.full(n_own * gdim * nv, 1.0 / nv)
+        X = PETSc.Mat().createAIJ(
+            ((rows_map.size_local * gdim, rows_map.size_global * gdim),
+             (cols_map.size_local * gdim, cols_map.size_global * gdim)),
+            csr=(indptr.astype(IT), idx.ravel().astype(IT), data), comm=msh.comm)
+        X.assemble()
+        return X
+
+    def _mesh_jacobian_loop(self):
         msh = self.mesh_obj.mesh
         Vc = self.function.function_space
         Vx = self.mesh_obj.coordinate_space
@@ -87,13 +136,25 @@ class CellCentres(DerivedField):
 
 
 class GreenGaussGradient(DerivedField):
-    """G = M^-1 b(U, alpha, x), as a DerivedField (see the module docstring)."""
+    """
+    G = M^-1 b(U, alpha, x), as a DerivedField (see the module docstring).
+
+    Options (attributes of the reconstruction):
+      cache_jacobians          keep dG/dU, dG/dalpha and dG/dx between calls
+                               while the state, alpha and the mesh are unchanged
+                               (several functionals and products of one totals
+                               evaluation share them); freed by release_cache
+      structured_state_jacobian  dG/dU as the operator W (x) I plus a small
+                               boundary part (GreenGaussStateOperator) instead
+                               of an assembled matrix
+    """
 
     def __init__(self, reconstruction):
         self.rec = reconstruction
         self.function = reconstruction.G
         self.depends_on_state = True
         self._forms = {}
+        self._cache = None
 
     def _form(self, key, factory):
         if key not in self._forms:
@@ -106,8 +167,50 @@ class GreenGaussGradient(DerivedField):
     def update_geometry(self):
         self.rec.update_mass()
 
+    # ---- content-keyed cache -------------------------------------------
+    def _key(self):
+        m = self.rec.model
+        n = m.u_vec.x.petsc_vec.local_size
+        return (np.array(m.u_vec.x.array[:n], copy=True), np.array(m.mesh_obj.mesh.geometry.x, copy=True),
+                float(m.farfield_conditions['alpha']))
+
+    def _same_key(self, key):
+        a, b = self._cache["key"], key
+        same = a[2] == b[2] and np.array_equal(a[0], b[0]) and np.array_equal(a[1], b[1])
+        return bool(self.rec.mesh_obj.mesh.comm.allreduce(int(same), op=MPI.MIN))
+
+    def _cached(self, name, build):
+        """build() once per (state, alpha, mesh), or every call if caching is off."""
+        if not self.rec.cache_jacobians:
+            return build()
+        key = self._key()
+        if self._cache is None or not self._same_key(key):
+            self.release_cache()
+            self._cache = {"key": key}
+        if name not in self._cache:
+            self._cache[name] = build()
+        return self._cache[name]
+
+    def release_cache(self):
+        cache, self._cache = self._cache, None
+        if cache is not None:
+            for name, obj in cache.items():
+                if name != "key" and obj is not None:
+                    destroy_operator(obj)
+
+    def discard(self, obj):
+        if self._cache is not None and any(obj is v for k, v in self._cache.items() if k != "key"):
+            return
+        destroy_operator(obj)
+
+    # ---- the Jacobians -------------------------------------------------
     def state_jacobian(self):
+        return self._cached("state", self._build_state_jacobian)
+
+    def _build_state_jacobian(self):
         rec = self.rec
+        if rec.structured_state_jacobian:
+            return rec.state_operator()
         a = self._form("U", lambda: ufl.derivative(
             rec.gg_rhs, rec.model.u_vec, ufl.TrialFunction(rec.model.u_vec.function_space)))
         B = dolfinx.fem.petsc.assemble_matrix(a)
@@ -116,6 +219,9 @@ class GreenGaussGradient(DerivedField):
         return B
 
     def alpha_vector(self):
+        return self._cached("alpha", self._build_alpha_vector)
+
+    def _build_alpha_vector(self):
         rec = self.rec
         if getattr(rec.model, "alpha_var", None) is None:
             return None
@@ -131,6 +237,9 @@ class GreenGaussGradient(DerivedField):
         return v
 
     def mesh_jacobian(self):
+        return self._cached("mesh", self._build_mesh_jacobian)
+
+    def _build_mesh_jacobian(self):
         # r_G(G, U, x) = int G : tau dx - b(U; tau) = 0, so dG/dx = -M^-1 dr_G/dx
         rec = self.rec
         G = rec.G
@@ -144,6 +253,63 @@ class GreenGaussGradient(DerivedField):
         X.diagonalScale(L=rec.inv_mass)
         X.scale(-1.0)
         return X
+
+
+class GreenGaussStateOperator:
+    """
+    dG/dU = M_G^-1 db/dU as a python-context Mat (G layout x state layout)
+    with mult and multTranspose, without assembling the 18-by-6 blocks.
+
+    The interior-facet part of b is a facet average of U times the area
+    vector, component by component: its derivative is W (x) I_n, with W the
+    scalar operator (3 area-vector components per cell pair, assembled once
+    per mesh) and I_n the identity over the n state components. Only the
+    boundary-facet part, U_b(U) of the registered boundary states, couples
+    components; it is assembled per state (boundary cells only).
+    """
+
+    def __init__(self, rec, W, B_bdry):
+        self.rec, self.W, self.B_bdry = rec, W, B_bdry
+        V = rec.model.u_vec.function_space
+        self.n = V.dofmap.index_map.size_local
+        self.ns, self.gdim = rec.model.n_state, rec.model.dimensions
+        self._xk, self._vk = W.createVecRight(), W.createVecLeft()
+        self._t = rec.inv_mass.duplicate()
+
+    def mult(self, mat, x, y):
+        n, ns, gdim = self.n, self.ns, self.gdim
+        xa = x.getArray(readonly=True)[:n * ns].reshape(n, ns)
+        ya = np.empty((n, ns, gdim))
+        for k in range(ns):
+            self._xk.setArray(np.ascontiguousarray(xa[:, k]))
+            self.W.mult(self._xk, self._vk)
+            ya[:, k, :] = self._vk.getArray(readonly=True).reshape(n, gdim)
+        y.setArray(ya.reshape(-1))
+        if self.B_bdry is not None:
+            self.B_bdry.multAdd(x, y, y)
+        y.pointwiseMult(y, self.rec.inv_mass)
+
+    def multTranspose(self, mat, v, y):
+        n, ns, gdim = self.n, self.ns, self.gdim
+        t = self._t
+        t.pointwiseMult(v, self.rec.inv_mass)
+        ta = t.getArray(readonly=True)[:n * ns * gdim].reshape(n, ns, gdim)
+        out = np.empty((n, ns))
+        for k in range(ns):
+            self._vk.setArray(np.ascontiguousarray(ta[:, k, :]).reshape(-1))
+            self.W.multTranspose(self._vk, self._xk)
+            out[:, k] = self._xk.getArray(readonly=True)
+        y.setArray(out.reshape(-1))
+        if self.B_bdry is not None:
+            self.B_bdry.multTransposeAdd(t, y, y)
+
+    def destroy(self, mat=None):
+        # called by PETSc when the python Mat is destroyed; W belongs to the
+        # reconstruction (one per mesh)
+        for obj in (self.B_bdry, self._xk, self._vk, self._t):
+            if obj is not None:
+                obj.destroy()
+        self.B_bdry = self._xk = self._vk = self._t = None
 
 
 class GreenGaussReconstruction:
@@ -175,6 +341,12 @@ class GreenGaussReconstruction:
         self.centres = CellCentres(self.mesh_obj)
         self.xc = self.centres.function
         self.gradient = GreenGaussGradient(self)
+        # options of the adjoint's derived-field Jacobians (see GreenGaussGradient)
+        self.fast_cell_centre_jacobian = False
+        self.cache_jacobians = False
+        self.structured_state_jacobian = False
+        self._W = None
+        self._W_key = None
         self.gg_rhs = None
         self._gg_form = None
         self.inv_mass = None
@@ -184,6 +356,7 @@ class GreenGaussReconstruction:
         m.reconstruction = self
         if self.muscl:
             m.face_traces = self.muscl_traces
+        self.centres.rec = self
         m.derived_fields += [self.centres, self.gradient]
         m.problem_factory = self.make_problem
 
@@ -256,9 +429,12 @@ class GreenGaussReconstruction:
         U, n = self.model.u_vec, self.mesh_obj.n
         forms = self.model.forms
         b = ufl.inner(ufl.outer(0.5 * (U('+') + U('-')), n('+')), tau('+') - tau('-')) * forms.dS
+        b_bdry = None
         for U_b, tag, _ in self.model.boundary_states:
-            b += ufl.inner(ufl.outer(U_b, n), tau) * forms.ds(tag)
-        return b
+            term = ufl.inner(ufl.outer(U_b, n), tau) * forms.ds(tag)
+            b_bdry = term if b_bdry is None else b_bdry + term
+        self.gg_rhs_boundary = b_bdry
+        return b if b_bdry is None else b + b_bdry
 
     # ------------------------------------------------------------------
     # Assembly
@@ -286,6 +462,65 @@ class GreenGaussReconstruction:
         self._gg_vec = dolfinx.fem.petsc.create_vector(self.G.function_space)
         self.inv_mass = diagonal_mass_inverse(self.G.function_space, self.model.forms.dx)
 
+    # ------------------------------------------------------------------
+    # dG/dU without assembling its 18-by-6 blocks (GreenGaussStateOperator)
+    # ------------------------------------------------------------------
+    def _weights(self):
+        """W, the scalar operator of the interior-facet part of dG/dU
+        before M_G^-1: (3 n_cells) x n_cells, assembled once per mesh."""
+        msh = self.mesh_obj.mesh
+        x = msh.geometry.x
+        if self._W is not None:
+            same = self._W_key.shape == x.shape and np.array_equal(self._W_key, x)
+            if bool(msh.comm.allreduce(int(same), op=MPI.MIN)):
+                return self._W
+            self._W.destroy()
+            self._W = None
+        gdim = msh.geometry.dim
+        V1 = dolfinx.fem.functionspace(msh, ("DG", 0))
+        Vg = dolfinx.fem.functionspace(msh, ("DG", 0, (gdim,)))
+        V = self.model.u_vec.function_space
+        n = V.dofmap.index_map.size_local
+        for W_ in (V1, Vg, self.G.function_space):
+            if not np.array_equal(np.asarray(W_.dofmap.list[:n]), np.asarray(V.dofmap.list[:n])):
+                raise RuntimeError("the DG0 dof numbering differs between the state and gradient spaces")
+        u1, t3, nn = ufl.TrialFunction(V1), ufl.TestFunction(Vg), self.mesh_obj.n
+        a = ufl.inner(0.5 * (u1('+') + u1('-')) * nn('+'), t3('+') - t3('-')) * self.model.forms.dS
+        W = dolfinx.fem.petsc.assemble_matrix(dolfinx.fem.form(a, jit_options=_JIT))
+        W.assemble()
+        self._W, self._W_key = W, np.array(x, copy=True)
+        return W
+
+    def state_operator(self):
+        """dG/dU at the current state, as a python-context Mat."""
+        self.set_up()
+        W = self._weights()
+        B_bdry = None
+        if self.gg_rhs_boundary is not None:
+            if getattr(self, "_a_bdry", None) is None:
+                V = self.model.u_vec.function_space
+                d = ufl.algorithms.expand_derivatives(
+                    ufl.derivative(self.gg_rhs_boundary, self.model.u_vec, ufl.TrialFunction(V)))
+                self._a_bdry = False if d.empty() else dolfinx.fem.form(d, jit_options=_JIT)
+            if self._a_bdry is not False:
+                B_bdry = dolfinx.fem.petsc.assemble_matrix(self._a_bdry)
+                B_bdry.assemble()
+        ctx = GreenGaussStateOperator(self, W, B_bdry)
+        nG = self.G.function_space.dofmap.index_map
+        nU = self.model.u_vec.function_space.dofmap.index_map
+        bsG = self.G.function_space.dofmap.index_map_bs
+        bsU = self.model.u_vec.function_space.dofmap.index_map_bs
+        M = PETSc.Mat().createPython(
+            ((nG.size_local * bsG, nG.size_global * bsG), (nU.size_local * bsU, nU.size_global * bsU)),
+            comm=self.mesh_obj.mesh.comm)
+        M.setPythonContext(ctx)
+        M.setUp()
+        return M
+
+    def release_cache(self):
+        self.gradient.release_cache()
+        self.centres.release_cache()
+
     def update_mass(self):
         """Refresh M_G^-1 in place after mesh motion."""
         if self.inv_mass is None:
@@ -310,6 +545,16 @@ class GreenGaussReconstruction:
         self.set_up()
         return CondensedGradientProblem(F_newton, J_newton, self.model.u_vec, self.G, self.gg_rhs,
                                         self.update_gradient, self.inv_mass, jit_options=_JIT)
+
+    def compact_forms(self, F):
+        """(a_UU, a_UG): the compiled forms of dR_U/dU and dR_U/dG, cached for F."""
+        if getattr(self, "_compact_forms", None) is None or self._compact_forms[0] is not F:
+            self.set_up()
+            a_UU = dolfinx.fem.form(ufl.derivative(F, self.model.u_vec), jit_options=_JIT)
+            a_UG = dolfinx.fem.form(ufl.derivative(F, self.G, ufl.TrialFunction(self.G.function_space)),
+                                    jit_options=_JIT)
+            self._compact_forms = (F, (a_UU, a_UG))
+        return self._compact_forms[1]
 
     def condensed_jacobian(self, F):
         """The exact dR/dU of the residual form F, as a CondensedJacobian."""

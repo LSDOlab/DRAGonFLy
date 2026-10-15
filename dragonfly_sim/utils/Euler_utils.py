@@ -49,27 +49,6 @@ def normal_flux(U, n_normal, gamma):
     return ufl.dot(flux_U, n_normal)
 
 
-def subsonic_inflow_state(U, rho_in, u_in, gamma):
-    p_in = pressure(U, gamma)
-    rhoE_in = energy_density(p_in, rho_in, u_in, gamma)
-
-    return ufl.as_vector([
-        rho_in,
-        *[rho_in*u_in[i] for i in range(u_in.ufl_shape[0])],
-        rhoE_in
-    ])
-
-def subsonic_outflow_state(U, p_out, gamma):
-    rho, u, _ = primitives(U)
-
-    rhoE_out = energy_density(p_out, rho, u, gamma)
-
-    return ufl.as_vector([
-        rho,
-        *[U[i] for i in range(1, 1+u.ufl_shape[0])],
-        rhoE_out
-    ])
-
 def slip_wall_state(U, n):
     rho, u, E = primitives(U)
 
