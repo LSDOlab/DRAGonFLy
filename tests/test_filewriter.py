@@ -38,6 +38,9 @@ from dragonfly_sim.utils.filewriter import FileWriter
 _MPI_CHILD_ENV = "FILEWRITER_TEST_MPI_CHILD"
 
 
+pytestmark = [pytest.mark.unit_test]
+
+
 @pytest.fixture
 def make_writer():
     """FileWriter factory writing into a temporary directory shared by all ranks.

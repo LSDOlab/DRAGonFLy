@@ -31,7 +31,7 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
     # the shared mesh, so they must never overlap -- also on a single process.
     ordered_callbacks = True
 
-    def __init__(self, mesh, boundary_dict, shape_parameterization=None, aero_center=None,
+    def __init__(self, mesh, boundary_dict, shape_parameterization=None, moments=None,
                  mesh_inner_bdry_function=None,
                  poly_order=1, gamma=1.4,
                  filename_suffix="test",
@@ -65,7 +65,11 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         a forward flow analysis, with derivatives with respect to alpha.
         solve_forward() runs one flow solve without a CSDL graph at all.
 
-        aero_center: moment reference point; defaults to (0.25, 0[, 0]).
+        moments: the moments of the wall force to compute, print and differentiate,
+        a sequence of (name, point, direction[, ref_length]) tuples (see
+        DG_postprocessor); default none. E.g. the pitching moment about the quarter
+        chord of a wing, ("pitch", (0.25, 0., 0.), "pitch"), and its root
+        bending moment, ("root_bending", (0.25, 0., 0.), (1., 0., 0.)).
 
         model_class / model_kwargs select the flow model: CompressibleEulerModel
         (the default) or e.g. core.RANS_model.CompressibleRANSModel with
@@ -159,15 +163,46 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         # Naming suffix for exported files
         self.filename_suffix = filename_suffix
 
-        # Include dc_m/d(alpha) in printed coefficient outputs 
-        # (costs one extra linear solve per print)
-        self.log_cm_alpha = True
-
         # Free the flow solver's matrices after every forward solve and the
         # condensed dR/dU after every condensed adjoint
         # (sim_model.release_solver), so the two never coexist; they are
         # rebuilt when next needed. For memory-bound runs (3D RANS).
         self.release_solver_memory = False
+
+        # Adjoint reuse. The transposed dR/dU and the preconditioned KSP of the
+        # state last linearized (condensed Jacobian), kept for the adjoint
+        # solves of every output of that design: {'key': state key, 'ksp': KSP};
+        # freed when the next flow solve starts or a different state is
+        # linearized.
+        self._adjoint_cache = None
+
+        # Options of the adjoint of a model with a condensed Jacobian (default off;
+        # set_adjoint_options sets them together with those of the reconstruction):
+        #   adjoint_matrix_free   the adjoint operator A_UU^T x + B^T (A_UG^T x), without
+        #                         forming A or the product A_UG B
+        #   cache_jacvec_operators  the dR/dx operator and dR/dalpha of the
+        #                         compute_jacvec_product calls of all outputs of one
+        #                         design are built once (freed with the adjoint cache)
+        self.adjoint_matrix_free = False
+        self.cache_jacvec_operators = False
+        # PETSc options (names without the "adj_" prefix) overriding the adjoint KSP's settings of the
+        # model, e.g. {"ksp_type": "hpddm", "ksp_hpddm_type": "gcrodr", "ksp_hpddm_recycle": 20}; the KSP
+        # is kept for all outputs of a design, so a recycling method carries its subspace between them
+        self.adjoint_ksp_options = None
+        self._dRdx_cache = None
+        self._dRdalpha_cache = None
+
+        # Start each condensed adjoint solve from a first-order solution: the
+        # solution of the same transposed system with the compact (nearest
+        # neighbour, gradients frozen) part A_UU of the Jacobian alone -- the
+        # first-order Jacobian the preconditioner is built from -- solved to a
+        # relative tolerance first_order_adjoint_rtol. It reuses the
+        # preconditioner's factors, so costs only Krylov iterations. Applies to
+        # models with a condensed Jacobian (MUSCL / RANS); the guess is always
+        # used, and its effect is logged (self._last_first_order_guess).
+        self.adjoint_first_order_guess = False
+        self.first_order_adjoint_rtol = 1e-2
+        self._last_first_order_guess = None
 
         # Write mesh_deformation_<suffix>.bp (the node motions of every design
         # evaluation). The solution files are written either way.
@@ -186,7 +221,7 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         self.poly_order:int = poly_order
         self.gamma:float = gamma
         self.boundary_condition_dict = boundary_dict
-        self.aero_center = aero_center
+        self.moments = moments
 
         # Dolfinx mesh tags for the various boundaries
         self.WALL_TAG = 2  # walls (including wing/airfoil boundaries)
@@ -289,18 +324,11 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
                                                file_name_addendum=self.filename_suffix,
                                                mesh_deformation=self.shape_parameterized)
 
-        if self.aero_center is None:
-            self.aero_center = np.array([0.25] + [0.0] * (self.sim_model.dimensions - 1))
-
         # We instantiate a separate DG_postprocessor object here so we can print 
         # forces and moments and coefficients after each forward solve
         self.postprocessor = DG_postprocessor(
             self.mesh, self.sim_model, self.WALL_TAG,
-            aero_center=self.aero_center,
-            linear_solver_rtol=self.linear_solver_rtol,
-            linear_solver_atol=self.linear_solver_atol,
-            linear_solver_max_it=self.linear_solver_max_it,
-            linear_residual_accept_limit=self.linear_residual_accept_limit, 
+            moments=self.moments,
             p_inf_dim=101325.)
 
         if self.reduced_order_model is not None:
@@ -387,7 +415,7 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         alpha (radians; default: the boundary dictionary's), solve, print the
         coefficients. Warm-starts from the previous solve. Call set_up_sim()
         first. Returns (u_vec array, converged, forces), forces being
-        DG_postprocessor.forces_and_coefficients (L, D, M, c_l, c_d, c_m, and
+        DG_postprocessor.forces_and_coefficients (L, D, c_l, c_d, the moments, and
         the friction drag for a viscous model).
         """
         if alpha is not None:
@@ -500,6 +528,8 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         and by then the ROM would reproduce that solution, now a snapshot, and
         accept it.
         """
+        # the forward solve needs the memory of the last design's adjoint operators
+        self._release_adjoint_cache()
         rom = self.reduced_order_model
         if rom is None:
             return self._run_fom_solve()
@@ -548,34 +578,32 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         # coefficients of the ROM solution, logged like the FOM's
         _, cl = self.postprocessor.compute_cl(result.solution)
         _, cd = self.postprocessor.compute_cd(result.solution)
-        _, cm = self.postprocessor.compute_cm(result.solution)
+        cms = self._moment_coefficients(result.solution)
         if self.mesh.mesh.comm.Get_rank() == 0:
             self.data_store.ROM_walltime += [(self.eval_idx, result.walltime)]
             self.data_store.rom_relative_residuals += [(self.eval_idx, result.eta)]
-            self.data_store.ROM_force_coefficients += [(self.eval_idx, cd, cl, cm, np.nan)]
+            self.data_store.ROM_force_coefficients += [(self.eval_idx, cd, cl) + cms]
             self.data_store.ROM_meets_threshold += [(self.eval_idx, result.accepted)]
-        PETSc.Sys.Print("ROM coefficients: c_d: {}, c_l: {}, c_m: {}".format(cd, cl, cm))
-        return cd, cl, cm
+        PETSc.Sys.Print("ROM coefficients: c_d: {}, c_l: {}".format(cd, cl) + self._moment_log_string(cms))
+        return (cd, cl) + cms
 
     def _log_rom_error(self, rom_forces):
         # ROM-vs-FOM coefficient errors against the FOM solve just run
         errors = tuple(float(r - f) for r, f in zip(rom_forces, self._last_fom_coefficients))
         if self.mesh.mesh.comm.Get_rank() == 0:
             self.data_store.rom_coefficient_errors += [(self.eval_idx,) + errors]
-        PETSc.Sys.Print("ROM - FOM coefficient errors: c_d: {:.3e}, c_l: {:.3e}, c_m: {:.3e}".format(*errors))
+        PETSc.Sys.Print("ROM - FOM coefficient errors: c_d: {:.3e}, c_l: {:.3e}".format(*errors[:2])
+                        + "".join(", c_m_{}: {:.3e}".format(spec.name, e)
+                                  for spec, e in zip(self.postprocessor.moment_specs, errors[2:])))
 
-    def _cm_alpha_for_logging(self, solution):
-        # Compute d c_m / d alpha: The total derivative of the moment 
-        # coefficient w.r.t. the angle of attack. This step seems 
-        # somewhat unstable and does not come for free, since it requires
-        # solving a linear system (it's a derivative evaluation after all)
-        # TODO: Look into why this solution step is seemingly so unstable,
-        #       even at well-converged states
-        if not self.log_cm_alpha:
-            return np.nan
-        if solution is None or not np.isfinite(np.linalg.norm(solution)):
-            return np.nan
-        return self.postprocessor.compute_cm_alpha(solution)
+    def _moment_coefficients(self, solution):
+        # the coefficient of every moment of the postprocessor, in order
+        return tuple(self.postprocessor.compute_moment(solution, spec)[1]
+                     for spec in self.postprocessor.moment_specs)
+
+    def _moment_log_string(self, coefficients):
+        return "".join(", c_m_{}: {}".format(spec.name, c)
+                       for spec, c in zip(self.postprocessor.moment_specs, coefficients))
 
     def _run_fom_solve(self):
         # Run the FOM model and output its solution
@@ -609,15 +637,14 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
 
         L_fom, cl_fom = self.postprocessor.compute_cl(solution_fom)
         D_fom, cd_fom = self.postprocessor.compute_cd(solution_fom)
-        M_fom, cm_fom = self.postprocessor.compute_cm(solution_fom)
-        cma_fom = self._cm_alpha_for_logging(solution_fom)
-        self._last_fom_coefficients = (cd_fom, cl_fom, cm_fom)
+        cms_fom = self._moment_coefficients(solution_fom)
+        self._last_fom_coefficients = (cd_fom, cl_fom) + cms_fom
 
         if self.mesh.mesh.comm.Get_rank() == 0:
             self.data_store.FOM_walltime += [(self.eval_idx, fom_post_time - fom_pre_time)]
             self.data_store.fom_relative_residuals += [(self.eval_idx, eta)]
-            self.data_store.FOM_force_coefficients += [(self.eval_idx, cd_fom, cl_fom, cm_fom, cma_fom)]
-        PETSc.Sys.Print("FOM coefficients: c_d: {}, c_l: {}, c_m: {}, c_m_alpha: {}".format(cd_fom, cl_fom, cm_fom, cma_fom))
+            self.data_store.FOM_force_coefficients += [(self.eval_idx, cd_fom, cl_fom) + cms_fom]
+        PETSc.Sys.Print("FOM coefficients: c_d: {}, c_l: {}".format(cd_fom, cl_fom) + self._moment_log_string(cms_fom))
         PETSc.Sys.Print("FOM relative residual norm eta: {} (||r||: {})".format(
             eta, residual_norm))
 
@@ -657,7 +684,8 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
                 return
 
             if self.sim_model.has_condensed_jacobian:
-                self._condensed_adjoint(d_outputs, d_residuals)
+                self._condensed_adjoint(d_outputs, d_residuals,
+                                        self._adjoint_state_key(u_vec, alpha, mesh_node_motions))
                 if self.release_solver_memory:
                     self.sim_model.release_solver()
                 PETSc.garbage_cleanup()
@@ -736,30 +764,149 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
             self.data_store.adjoint_solves += [(self.eval_idx - 1, kind, walltime)]
         PETSc.Sys.Print("apply_inverse_jacobian total time ({} adjoint): {}".format(kind, walltime))
 
-    def _condensed_adjoint(self, d_outputs, d_residuals):
+    def _condensed_adjoint(self, d_outputs, d_residuals, state_key):
         """The adjoint solve for a model whose dR/dU is a condensed product
         (a reconstructed gradient): the model's own transposed linearized
-        solve (CompressibleEulerModel.solve_linearized)."""
-        if self.release_solver_memory:
-            # free queued PETSc objects before the large assembly
-            gc.collect()
-            PETSc.garbage_cleanup(self.mesh.mesh.comm)
-        A = self.sim_model.assemble_dRdu_mat()
+        solve (CompressibleEulerModel.linearized_solver). The transposed
+        matrix and the preconditioned KSP are built once per state and reused
+        by the adjoint solves of all outputs at it."""
+        if self._adjoint_cache_matches(state_key):
+            PETSc.Sys.Print("adj_: reusing the transposed Jacobian and preconditioner of this state")
+        else:
+            self._release_adjoint_cache()
+            if self.release_solver_memory:
+                # free queued PETSc objects before the large assembly
+                gc.collect()
+                PETSc.garbage_cleanup(self.mesh.mesh.comm)
+            # the condensed dR/dU is freed once its transposes exist: only they are used from then on
+            ksp = self.sim_model.linearized_solver(
+                transpose=True, prefix="adj_", rtol=self.linear_solver_rtol,
+                atol=self.linear_solver_atol, max_it=self.linear_solver_max_it,
+                release_operands=True, matrix_free=self.adjoint_matrix_free,
+                ksp_options=self.adjoint_ksp_options)
+            self._adjoint_cache = {'key': state_key, 'ksp': ksp}
+        ksp = self._adjoint_cache['ksp']
+        A = ksp.getOperators()[0]
         rhs, sol = A.createVecLeft(), A.createVecLeft()
         set_petsc_vec_array(rhs, d_outputs['u_vec'])
-        ksp = self.sim_model.solve_linearized(
-            rhs, sol, transpose=True, prefix="adj_", rtol=self.linear_solver_rtol,
-            atol=self.linear_solver_atol, max_it=self.linear_solver_max_it,
-            release_operands=self.release_solver_memory)
+        guess_used = self.adjoint_first_order_guess and self._first_order_adjoint_guess(ksp, A, rhs, sol)
+        ksp.setInitialGuessNonzero(bool(guess_used))
+        ksp.solve(rhs, sol)
         rnorm = ksp.getResidualNorm()
         PETSc.Sys.Print("adj_ solve: {} iterations, residual norm {} [{}]".format(
             ksp.getIterationNumber(), rnorm, ksp_converged_reason_name(ksp.getConvergedReason())))
-        ksp.destroy()
         if rnorm > self.linear_residual_accept_limit:
             raise ValueError(
                 "apply_inverse_jacobian residual norm is too high: {:.6e} > "
                 "linear_residual_accept_limit {:.1e}".format(rnorm, self.linear_residual_accept_limit))
         d_residuals['u_vec'] = sol.getArray().copy()
+        rhs.destroy()
+        sol.destroy()
+
+    # ---- adjoint reuse: cached operators -----------------------------------
+    def _first_order_adjoint_guess(self, ksp, A, rhs, sol):
+        """
+        Fill `sol` with the first-order adjoint solution of `rhs`: the solution
+        of P x = rhs, P the transposed compact part A_UU of the Jacobian (the
+        KSP's preconditioning matrix), to a relative tolerance
+        first_order_adjoint_rtol. The KSP is switched to operator P for the
+        solve, which keeps its preconditioner (P's factors), and back to
+        (A, P) afterwards, with its tolerances. Returns False, leaving `sol`
+        zero, if the first-order solve did not converge. The residual of the
+        exact system at the guess, |rhs - A guess| / |rhs|, the iterations and
+        the time are logged and kept in self._last_first_order_guess.
+        Collective.
+        """
+        P = ksp.getOperators()[1]
+        if P.handle == A.handle:
+            return False                   # direct solver: A is P, nothing to precondition with
+        pre_time = perf_counter()
+        rtol, atol, divtol, max_it = ksp.getTolerances()
+        ksp.setOperators(P, P)
+        ksp.setTolerances(rtol=self.first_order_adjoint_rtol, atol=0.0, max_it=self.linear_solver_max_it)
+        ksp.setInitialGuessNonzero(False)
+        try:
+            ksp.solve(rhs, sol)
+            iterations, reason = ksp.getIterationNumber(), ksp.getConvergedReason()
+        finally:
+            ksp.setOperators(A, P)
+            ksp.setTolerances(rtol=rtol, atol=atol, divtol=divtol, max_it=max_it)
+        if reason <= 0:
+            PETSc.Sys.Print("adj_ first-order guess: no convergence after {} iterations [{}]: zero guess".format(
+                iterations, ksp_converged_reason_name(reason)))
+            sol.zeroEntries()
+            self._last_first_order_guess = dict(iterations=iterations, ratio=np.nan, used=False)
+            return False
+        residual = rhs.duplicate()
+        A.mult(sol, residual)
+        residual.aypx(-1.0, rhs)
+        ratio = residual.norm() / rhs.norm()
+        residual.destroy()
+        walltime = perf_counter() - pre_time
+        PETSc.Sys.Print("adj_ first-order guess: {} iterations, {:.1f} s; the exact system's initial residual is "
+                        "{:.3e} of |rhs|".format(iterations, walltime, ratio))
+        self._last_first_order_guess = dict(iterations=iterations, ratio=float(ratio), used=True, walltime=walltime)
+        return True
+
+    @staticmethod
+    def _adjoint_state_key(u_vec, alpha, mesh_node_motions):
+        """What the adjoint's matrix depends on: the state, alpha and the mesh motion."""
+        return (np.array(u_vec, copy=True), float(alpha),
+                None if mesh_node_motions is None else np.array(mesh_node_motions, copy=True))
+
+    def _state_keys_equal(self, key0, key):
+        u0, alpha0, motions0 = key0
+        u, alpha, motions = key
+        same = (alpha == alpha0 and np.array_equal(u0, u) and (motions0 is None) == (motions is None)
+                and (motions is None or np.array_equal(motions0, motions)))
+        return bool(self.mesh.mesh.comm.allreduce(int(same), op=MPI.MIN))
+
+    def _adjoint_cache_matches(self, state_key):
+        cache = self._adjoint_cache
+        return cache is not None and self._state_keys_equal(cache['key'], state_key)
+
+    def _release_adjoint_cache(self):
+        """Free what the adjoint of the last state keeps: the transposed matrices
+        and KSP, the cached jacvec operators and the derived fields' cached
+        Jacobians."""
+        cache, self._adjoint_cache = self._adjoint_cache, None
+        freed = cache is not None
+        if freed:
+            self.sim_model.destroy_adjoint_operator(cache['ksp'])
+            del cache
+        if self._dRdx_cache is not None:
+            destroy_chained_operator(self._dRdx_cache['op'])
+            self._dRdx_cache = None
+            freed = True
+        if self._dRdalpha_cache is not None:
+            self._dRdalpha_cache = None
+        if self.sim_model.derived_fields:
+            self.sim_model.release_derived_caches()
+            freed = True
+        if freed:
+            self.sim_model._return_freed_memory()
+
+    def set_adjoint_options(self, cell_centre_matrix=False, cache_jacobians=False, structured_gradient=False,
+                            matrix_free=False, cache_jacvec_operators=False):
+        """
+        Switch the speed-ups of the adjoint of a model with a condensed Jacobian
+        (all exact reformulations; each off by default). Frees every cache.
+          cell_centre_matrix       build the constant cell-centre matrix dc/dx vectorized, once
+          cache_jacobians          keep the Green-Gauss Jacobians dG/dU, dG/dalpha, dG/dx
+                                   while the state, alpha and the mesh are unchanged
+          structured_gradient      apply dG/dU as W (x) I plus a boundary part instead of an
+                                   assembled matrix
+          matrix_free              the adjoint operator without forming A or A_UG B
+          cache_jacvec_operators   build the dR/dx operator and dR/dalpha once per design
+        """
+        self._release_adjoint_cache()
+        rec = getattr(self.sim_model, "reconstruction", None)
+        if rec is not None:
+            rec.fast_cell_centre_jacobian = bool(cell_centre_matrix)
+            rec.cache_jacobians = bool(cache_jacobians)
+            rec.structured_state_jacobian = bool(structured_gradient)
+        self.adjoint_matrix_free = bool(matrix_free)
+        self.cache_jacvec_operators = bool(cache_jacvec_operators)
 
     def compute_jacvec_product(self, input_vals, outputs, d_inputs, d_outputs, d_residuals, mode):
         # Here we compute the product of the adjoint solution with d_residual
@@ -785,11 +932,18 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
             if 'alpha' in d_inputs:
                 # alpha is a single global scalar, so dR/d(alpha) is one column
                 # and this reverse product is a plain dot product between vectors
-                dr_dalpha = self.sim_model.assemble_dRdalpha_vec(u_vec)
-
-                # we first have to assert that the MPI objects are compatible
                 local_size = self.sim_model.u_vec.x.petsc_vec.local_size
-                dr_dalpha_local = dr_dalpha.getArray()[:local_size]
+                if self.cache_jacvec_operators and self.sim_model.derived_fields:
+                    key = self._adjoint_state_key(u_vec, alpha, mesh_node_motions)
+                    if self._dRdalpha_cache is None or not self._state_keys_equal(self._dRdalpha_cache[0], key):
+                        dr_dalpha = self.sim_model.assemble_dRdalpha_vec(u_vec)
+                        self._dRdalpha_cache = (key, np.array(dr_dalpha.getArray()[:local_size], copy=True))
+                    dr_dalpha_local = self._dRdalpha_cache[1]
+                else:
+                    dr_dalpha = self.sim_model.assemble_dRdalpha_vec(u_vec)
+
+                    # we first have to assert that the MPI objects are compatible
+                    dr_dalpha_local = dr_dalpha.getArray()[:local_size]
                 assert dr_dalpha_local.shape == d_residuals['u_vec'].shape, (
                     "dR/dalpha local slice {} does not match d_residuals['u_vec'] {}".format(
                         dr_dalpha_local.shape, d_residuals['u_vec'].shape))
@@ -804,7 +958,17 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
                 PETSc.Sys.Print("d_inputs['alpha']: {}".format(d_inputs['alpha']))
 
             if 'mesh_node_motions' in d_inputs:
-                dr_dxmesh = self.sim_model.compute_dRdxmesh_mat(u_vec, self.mesh.coordinate_space)
+                cached_operator = self.cache_jacvec_operators and bool(self.sim_model.derived_fields)
+                if cached_operator:
+                    key = self._adjoint_state_key(u_vec, alpha, mesh_node_motions)
+                    if self._dRdx_cache is None or not self._state_keys_equal(self._dRdx_cache['key'], key):
+                        if self._dRdx_cache is not None:
+                            destroy_chained_operator(self._dRdx_cache['op'])
+                        self._dRdx_cache = {'key': key, 'op': self.sim_model.compute_dRdxmesh_mat(
+                            u_vec, self.mesh.coordinate_space)}
+                    dr_dxmesh = self._dRdx_cache['op']
+                else:
+                    dr_dxmesh = self.sim_model.compute_dRdxmesh_mat(u_vec, self.mesh.coordinate_space)
 
                 if not hasattr(self, '_d_residual_jvp_petsc'):
                     self._d_residual_jvp_petsc = dr_dxmesh.createVecLeft()
@@ -816,7 +980,7 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
                 self._d_input_jvp_petsc.set(0.0)
                 dr_dxmesh.multTranspose(self._d_residual_jvp_petsc, self._d_input_jvp_petsc)
                 d_input = self._d_input_jvp_petsc
-                if self.sim_model.derived_fields:
+                if self.sim_model.derived_fields and not cached_operator:
                     # a fresh chained operator per call (not cached): free it now
                     destroy_chained_operator(dr_dxmesh)
 

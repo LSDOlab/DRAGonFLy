@@ -6,19 +6,57 @@ import dolfinx
 
 import csdl_alpha as csdl
 
-from dragonfly_sim.utils.petsc_utils import set_petsc_vec_array
-from dragonfly_sim.utils.postprocessor_utils import moment_integrand
-from dragonfly_sim.utils.solver_utils import ksp_converged_reason_name
+from dragonfly_sim.utils.postprocessor_utils import moment_about
 from dragonfly_sim.utils.Euler_utils import pressure
 
 
+class MomentSpec:
+    """One moment of the wall force: about `point`, along unit `direction`
+    (a 3-vector in 2D too, where only the z entry is read), normalised in the
+    coefficient by q*S_ref*ref_length. The values are dolfinx Constants, so the
+    forms built on them stay valid when they change."""
+
+    def __init__(self, mesh, name, point, direction, ref_length=None):
+        self.name = name
+        self.point = dolfinx.fem.Constant(mesh, point)
+        self.direction = dolfinx.fem.Constant(mesh, direction)
+        # None: the postprocessor's reference chord
+        self.ref_length = None if ref_length is None else dolfinx.fem.Constant(mesh, float(ref_length))
+        self.point_array = point
+        self.direction_array = direction
+
+
 class DG_postprocessor(csdl.CustomExplicitOperation):
+    """
+    Forces, and moments about user-given points and directions, of the wall
+    force (pressure, plus the viscous traction for a viscous model), with their
+    derivatives for CSDL.
+
+    moments: sequence of (name, point, direction[, ref_length]) tuples, each
+    giving the moment M = d . (r x F), r = X - point, of the wall force F along
+    the direction d (right-hand rule); CSDL outputs M_<name> and c_m_<name>.
+    point has one entry per dimension; direction is a nonzero vector,
+    normalised to unit length, or the string "pitch": the nose-up-positive
+    pitching moment, (0, 1, 0) in 3D (y spanwise) and (0, 0, -1) in 2D. In 2D
+    only the out-of-plane direction (0, 0, +-1) exists. c_m_<name> is
+    M / (q S_ref ref_length), the reference chord by default. The directions
+    are fixed in the geometry axes and the points fixed in space, also while
+    a shape design variable moves the wall. Only M_<name> is differentiated:
+    S_ref and the reference chord change with the 3D geometry, so constrain
+    M_<name>, not c_m_<name>. For a half-wing on a symmetry plane y = 0, the
+    root bending moment is ("root_bending", (x0, 0, 0), (1, 0, 0)).
+
+    Each moment costs its own value, state-derivative and mesh-derivative
+    assembly (a chain-rule evaluation per form for derived-field models).
+    Since M_k = d_k . int(X x f) - (d_k x x0_k) . int(f), all moments are
+    linear combinations of 6 base functionals (3 in 2D), so only 6 derivative
+    evaluations would suffice regardless of the number of moments; this is not
+    yet exploited.
+    """
     ordered_callbacks = True    # as DG_windtunnel_model: collectives and the shared mesh
 
-    def __init__(self, Mesh_obj, sim_model, wall_meshtag_val, aero_center=None,
+    def __init__(self, Mesh_obj, sim_model, wall_meshtag_val, moments=None,
                  ref_area_dim=None, ref_chord_dim=None, testing_mode=False,
-                 linear_solver_rtol=1e-16, linear_solver_atol=1e-11,
-                 linear_solver_max_it=1000, linear_residual_accept_limit=1e-10,
                  p_inf_dim=None, L_ref_dim=1.0):
         super().__init__()
 
@@ -26,21 +64,8 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
 
         self.mesh_obj = Mesh_obj
         self.sim_model = sim_model
-        self.linear_solver_rtol = linear_solver_rtol
-        self.linear_solver_atol = linear_solver_atol
-        self.linear_solver_max_it = linear_solver_max_it
-        self.linear_residual_accept_limit = linear_residual_accept_limit
-        # c_m_alpha is MONITORED ONLY -- no objective or constraint uses it,
-        # and nothing supplies its derivative. It nevertheless costs a tangent
-        # solve per evaluation and RAISES when that solve degrades, which is
-        # enough to abort a long sweep over a quantity nobody consumed. Set
-        # False to skip it and report nan.
-        self.log_cm_alpha = True
         self.wall_meshtag_val = wall_meshtag_val
-        if aero_center is None:
-            # quarter chord of a unit chord at the origin
-            aero_center = np.array([0.25] + [0.0] * (sim_model.dimensions - 1))
-        self.aero_center = dolfinx.fem.Constant(self.mesh_obj.mesh, np.asarray(aero_center, dtype=np.double))
+        self.moment_specs = self._parse_moments(moments)
 
         # Reference quantities
         self.ref_area_dim = ref_area_dim  # reference area (if None, set to 1 in 2D and computed planform area in 3D)
@@ -51,6 +76,43 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
         # Compute quantities that are constant over the course of an optimization
         self.compute_initial_and_constant_quantities()
 
+
+    def _parse_moments(self, moments):
+        # Validate the user's (name, point, direction[, ref_length]) tuples and
+        # turn them into MomentSpecs
+        dim = self.sim_model.dimensions
+        specs = []
+        for entry in (moments if moments is not None else ()):
+            if not isinstance(entry, (tuple, list)) or len(entry) not in (3, 4):
+                raise ValueError("a moment is a (name, point, direction[, ref_length]) tuple, got {!r}".format(entry))
+            name, point, direction = entry[:3]
+            ref_length = entry[3] if len(entry) == 4 else None
+            if not isinstance(name, str) or not name.isidentifier():
+                raise ValueError("moment name {!r} is not a valid identifier".format(name))
+            if name in [spec.name for spec in specs]:
+                raise ValueError("duplicate moment name {!r}".format(name))
+            point = np.asarray(point, dtype=np.double)
+            if point.shape != (dim,):
+                raise ValueError("moment {!r}: point needs {} entries, got {}".format(name, dim, point.shape))
+            if isinstance(direction, str):
+                if direction != "pitch":
+                    raise ValueError("moment {!r}: unknown direction preset {!r}".format(name, direction))
+                direction = [0., 1., 0.] if dim == 3 else [0., 0., -1.]
+            elif np.ndim(direction) == 0 and dim == 2:
+                direction = [0., 0., direction]     # scalar shorthand for the out-of-plane axis
+            direction = np.asarray(direction, dtype=np.double)
+            if direction.shape != (3,):
+                raise ValueError("moment {!r}: direction needs 3 entries, got {}".format(name, direction.shape))
+            norm = np.linalg.norm(direction)
+            if not norm > 0.0:
+                raise ValueError("moment {!r}: direction is zero".format(name))
+            direction = direction / norm
+            if dim == 2 and (direction[0] != 0.0 or direction[1] != 0.0):
+                raise ValueError("moment {!r}: in 2D only the out-of-plane direction (0, 0, +-1) exists".format(name))
+            if ref_length is not None and not float(ref_length) > 0.0:
+                raise ValueError("moment {!r}: ref_length must be positive".format(name))
+            specs.append(MomentSpec(self.mesh_obj.mesh, name, point, direction, ref_length))
+        return specs
 
     def compute_initial_and_constant_quantities(self):
         # This function computes quantities that are unchanged during an optimization,
@@ -70,7 +132,6 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
         self._chord_ref_const = dolfinx.fem.Constant(self.mesh_obj.mesh, self._compute_chord_ref(self._S_ref_const.value))
 
         self.C_infty = 0.5*rho_in*(u_ref**2)*self._S_ref_const
-        self.C_infty_moment = self.C_infty * self._chord_ref_const
 
         # Drag and lift vector directions
         self.psi_drag = self.sim_model.farfield_conditions['flow_dir']
@@ -232,94 +293,47 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
         drag = self.compute_force_in_direction(u_dof_vec, self.psi_drag)
         return self._assemble_mesh_derivative(drag, "dD_dmesh")
 
-    def compute_moment_form(self, u_dof_vec):
+    def _moment_normalizer(self, spec):
+        ref_length = self._chord_ref_const if spec.ref_length is None else spec.ref_length
+        return self.C_infty * ref_length
+
+    def compute_moment_form(self, u_dof_vec, spec):
+        """The moment M = d . (r x F) of the wall force about spec.point along
+        spec.direction, as a scalar form."""
         force_density = self._pressure_force_vector(u_dof_vec)
         coords = ufl.SpatialCoordinate(self.mesh_obj.mesh)
-        return moment_integrand(force_density, coords - self.aero_center,
-                                self.sim_model.dimensions) * self.mesh_obj.form_manager.ds(self.wall_meshtag_val)
+        return moment_about(force_density, coords - spec.point, spec.direction,
+                            self.sim_model.dimensions) * self.mesh_obj.form_manager.ds(self.wall_meshtag_val)
 
-    def compute_cm(self, u_dof_vec):
-        moment = self.compute_moment_form(u_dof_vec)
-        return self._assemble_value_and_coefficient(moment, self.C_infty_moment)
+    def compute_moment(self, u_dof_vec, spec):
+        """(M, c_m) of one moment."""
+        moment = self.compute_moment_form(u_dof_vec, spec)
+        return self._assemble_value_and_coefficient(moment, self._moment_normalizer(spec))
 
-    def compute_cm_deriv(self, u_dof_vec):
-        moment_coeff = (1.0/self.C_infty_moment)*self.compute_moment_form(u_dof_vec)
-        return self._assemble_state_derivative(moment_coeff, "dCm_duvec")
+    def compute_moment_deriv(self, u_dof_vec, spec):
+        moment = self.compute_moment_form(u_dof_vec, spec)
+        return self._assemble_state_derivative(moment, "dM_{}_duvec".format(spec.name))
 
-    def compute_M_deriv(self, u_dof_vec):
-        moment = self.compute_moment_form(u_dof_vec)
-        return self._assemble_state_derivative(moment, "dM_duvec")
+    def compute_moment_meshderiv(self, u_dof_vec, spec):
+        moment = self.compute_moment_form(u_dof_vec, spec)
+        return self._assemble_mesh_derivative(moment, "dM_{}_dmesh".format(spec.name))
 
-    def compute_cm_alpha(self, u_dof_vec):
-        # Compute d cm / d alpha by solving a linear system;
-        # NOTE: this quantity is not used in the optimization, and is merely present as a logging output
-        local_size = self.sim_model.u_vec.x.petsc_vec.local_size
-
-        if self.sim_model.has_condensed_jacobian:
-            # condensed dR/dU: the model's own linearized solve
-            self.sim_model.set_u_vec(u_dof_vec)
-            dr_dalpha = self.sim_model.assemble_dRdalpha_vec()
-            A = self.sim_model.assemble_dRdu_mat()
-            rhs, sol = A.createVecRight(), A.createVecRight()
-            set_petsc_vec_array(rhs, -dr_dalpha.getArray()[:local_size])
-            ksp = self.sim_model.solve_linearized(
-                rhs, sol, prefix="tangent_", rtol=self.linear_solver_rtol,
-                atol=self.linear_solver_atol, max_it=self.linear_solver_max_it)
-            PETSc.Sys.Print("tangent_ solve: {} iterations, residual norm {} [{}]".format(
-                ksp.getIterationNumber(), ksp.getResidualNorm(),
-                ksp_converged_reason_name(ksp.getConvergedReason())))
-            ksp.destroy()
-            dcm_du = self.compute_cm_deriv(u_dof_vec)
-            local_contribution = float(np.dot(dcm_du, sol.getArray()[:local_size]))
-            moment_coeff = (1.0/self.C_infty_moment)*self.compute_moment_form(u_dof_vec)
-            return (self.mesh_obj.mesh.comm.allreduce(local_contribution, op=MPI.SUM)
-                    + self._assemble_alpha_derivative(moment_coeff))
-
-        drdu_mat = self.sim_model.assemble_dRdu_mat(u_dof_vec)
-        dr_dalpha = self.sim_model.assemble_dRdalpha_vec(u_dof_vec)
-
-        if not hasattr(self, '_tangent_solver'):
-            # build a tangent solver if it doesn't exist already
-            self._tangent_solver = PETSc.KSP().create(self.mesh_obj.mesh.comm)
-            self._tangent_solver.setOperators(drdu_mat)
-            self._tangent_solver.setOptionsPrefix("tangent_")
-
-            self.sim_model.apply_krylov_solver_settings(
-                self._tangent_solver, max_it=self.linear_solver_max_it,
-                gmres_restart=100,
-                monitor_convergence=False,
-                rtol=self.linear_solver_rtol,
-                atol=self.linear_solver_atol)
-            self._tangent_rhs = drdu_mat.createVecRight()
-            self._tangent_sol = drdu_mat.createVecRight()
-
-        set_petsc_vec_array(self._tangent_rhs, -dr_dalpha.getArray()[:local_size])
-
-        self._tangent_solver.solve(self._tangent_rhs, self._tangent_sol)
-
-        rnorm = self._tangent_solver.getResidualNorm()
-        PETSc.Sys.Print("tangent_ solve: {} iterations, residual norm {} [{}]".format(
-            self._tangent_solver.getIterationNumber(), rnorm,
-            ksp_converged_reason_name(self._tangent_solver.getConvergedReason())))
-        if rnorm > self.linear_residual_accept_limit:
-            raise Warning(
-                "compute_cm_alpha tangent solve residual norm is too high: "
-                "{:.6e} > linear_residual_accept_limit {:.1e}".format(
-                    rnorm, self.linear_residual_accept_limit))
-
-        dcm_du = self.compute_cm_deriv(u_dof_vec)
-        local_contribution = float(np.dot(dcm_du, self._tangent_sol.getArray()[:local_size]))
-        return self.mesh_obj.mesh.comm.allreduce(local_contribution, op=MPI.SUM)
+    def compute_moment_alphaderiv(self, u_dof_vec, spec):
+        # explicit alpha dependence at fixed state: the direction is fixed in the geometry axes,
+        # so only the derived fields carry any
+        return self._assemble_alpha_derivative(self.compute_moment_form(u_dof_vec, spec))
 
     def forces_and_coefficients(self, u_dof_vec=None, alpha=None):
         """
-        Lift, drag and pitching moment and their coefficients of a flow state,
-        outside any CSDL graph: no FFD block, mesh motion or recorder needed.
+        Lift and drag and their coefficients of a flow state, and the moments
+        and their coefficients, outside any CSDL graph: no FFD block, mesh
+        motion or recorder needed.
 
         u_dof_vec: the owned state entries (default: the model's current
         u_vec); alpha: angle of attack in radians (default: the model's). For a
         viscous model, D_friction / c_d_friction is the part of the drag from
-        the viscous wall traction. Collective. Returns a dict.
+        the viscous wall traction. Collective. Returns a dict; "moments" maps
+        each moment name to dict(M=..., c_m=...).
         """
         if u_dof_vec is None:
             u_dof_vec = self.sim_model.u_vec.x.petsc_vec.getArray().copy()
@@ -328,8 +342,11 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
         self.refresh_geometry_dependent_reference_quantities()
         L, c_l = self.compute_cl(u_dof_vec)
         D, c_d = self.compute_cd(u_dof_vec)
-        M, c_m = self.compute_cm(u_dof_vec)
-        out = dict(L=L, D=D, M=M, c_l=c_l, c_d=c_d, c_m=c_m)
+        out = dict(L=L, D=D, c_l=c_l, c_d=c_d)
+        out["moments"] = {}
+        for spec in self.moment_specs:
+            M, c_m = self.compute_moment(u_dof_vec, spec)
+            out["moments"][spec.name] = dict(M=M, c_m=c_m)
         if getattr(self.sim_model, "wall_traction", None) is not None:
             # drag of the viscous traction alone
             self.sim_model.set_u_vec(u_dof_vec)
@@ -338,10 +355,6 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
             form = ufl.dot(self.psi_drag, t) * self.mesh_obj.form_manager.ds(self.wall_meshtag_val)
             out["D_friction"], out["c_d_friction"] = self._assemble_value_and_coefficient(form, self.C_infty)
         return out
-
-    def compute_M_meshderiv(self, u_dof_vec):
-        moment = self.compute_moment_form(u_dof_vec)
-        return self._assemble_mesh_derivative(moment, "dM_dmesh")
 
     def evaluate(self, u_vec, mesh_deformation=None, alpha=None, shape_param_inputs=None):
         """Forces and coefficients of the state u_vec. mesh_deformation is the
@@ -360,19 +373,20 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
         # declare output variables
         c_l = self.create_output('c_l', (1,))
         c_d = self.create_output('c_d', (1,))
-        c_m = self.create_output('c_m', (1,))
-        c_m_alpha = self.create_output('c_m_alpha', (1,))
         L = self.create_output('L', (1,))
         D = self.create_output('D', (1,))
-        M = self.create_output('M', (1,))
+        M = {spec.name: self.create_output('M_' + spec.name, (1,)) for spec in self.moment_specs}
+        c_m = {spec.name: self.create_output('c_m_' + spec.name, (1,)) for spec in self.moment_specs}
 
-        # Force and moment coefficients (and derivatives) are only used as monitoring outputs;
+        # Force and moment coefficients are only used as monitoring outputs;
         # to avoid CSDL from computing its derivatives we set these to zero
-        for _input_name in ('u_vec', 'alpha') + (('mesh_deformation',) if mesh_deformation is not None else ()):
-            for _output_name in ('c_l', 'c_d', 'c_m', 'c_m_alpha'):
+        input_names = ('u_vec', 'alpha') + (('mesh_deformation',) if mesh_deformation is not None else ())
+        coefficient_names = ('c_l', 'c_d') + tuple('c_m_' + spec.name for spec in self.moment_specs)
+        for _input_name in input_names:
+            for _output_name in coefficient_names:
                 self.declare_derivative_parameters(of=_output_name, wrt=_input_name, dependent=False)
         if shape_param_inputs is not None:
-            for _output_name in ('c_l', 'c_d', 'c_m', 'c_m_alpha', 'L', 'D', 'M'):
+            for _output_name in coefficient_names + ('L', 'D') + tuple('M_' + spec.name for spec in self.moment_specs):
                 self.declare_derivative_parameters(of=_output_name, wrt='shape_param_inputs',
                                                    dependent=False)
 
@@ -380,14 +394,14 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
         output = csdl.VariableGroup()
         output.c_l = c_l
         output.c_d = c_d
-        output.c_m = c_m
-        output.c_m_alpha = c_m_alpha
         output.L = L
         output.D = D
-        output.M = M
+        for spec in self.moment_specs:
+            setattr(output, 'M_' + spec.name, M[spec.name])
+            setattr(output, 'c_m_' + spec.name, c_m[spec.name])
 
         return output
-    
+
     def compute(self, input_vals, output_vals):
         PETSc.Sys.Print("starting compute in DG_postprocessor...")
 
@@ -415,25 +429,28 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
             drag_val, c_d_initial = self.compute_cd(u_vec)
             output_vals['D'] = drag_val
             output_vals['c_d'] = c_d_initial #+ max(0., 10.*(0.285 - c_l))
-            moment_val, output_vals['c_m'] = self.compute_cm(u_vec)
-            output_vals['M'] = moment_val
-            output_vals['c_m_alpha'] = (self.compute_cm_alpha(u_vec)
-                                        if self.log_cm_alpha else np.nan)
 
-            PETSc.Sys.Print("c_d: {}, c_l: {}, c_m: {}, c_m_alpha: {}".format(np.round(c_d_initial, 6), np.round(output_vals['c_l'], 6), np.round(output_vals['c_m'], 6), np.round(output_vals['c_m_alpha'], 6)))
-            PETSc.Sys.Print("D: {}, L: {}, M: {} (nondimensional)".format(np.round(output_vals['D'], 6), np.round(output_vals['L'], 6), np.round(output_vals['M'], 6)))
-            
-            # print dimensional forces and moments, just for monitoring purposes
-            PETSc.Sys.Print("D: {}, L: {}, M: {} (dimensional)".format(
+            PETSc.Sys.Print("c_d: {}, c_l: {}".format(np.round(c_d_initial, 6), np.round(output_vals['c_l'], 6)))
+            PETSc.Sys.Print("D: {}, L: {} (nondimensional)".format(np.round(output_vals['D'], 6), np.round(output_vals['L'], 6)))
+
+            # print dimensional forces, just for monitoring purposes
+            PETSc.Sys.Print("D: {}, L: {} (dimensional)".format(
                 np.round(output_vals['D'] * self.force_scale, 6),
-                np.round(output_vals['L'] * self.force_scale, 6),
-                np.round(output_vals['M'] * self.moment_scale, 6)))
+                np.round(output_vals['L'] * self.force_scale, 6)))
+
+            for spec in self.moment_specs:
+                moment_val, output_vals['c_m_' + spec.name] = self.compute_moment(u_vec, spec)
+                output_vals['M_' + spec.name] = moment_val
+                PETSc.Sys.Print("moment {} (point {}, direction {}): M: {} (nondimensional), c_m: {}, M: {} (dimensional)".format(
+                    spec.name, np.round(spec.point_array, 6), np.round(spec.direction_array, 6),
+                    np.round(moment_val, 6), np.round(output_vals['c_m_' + spec.name], 6),
+                    np.round(moment_val * self.moment_scale, 6)))
         else:
             PETSc.Sys.Print("Mesh or solution is not valid, setting outputs to high drag.")
             output_vals['L'], output_vals['c_l'] = 0.0, 0.0
             output_vals['D'], output_vals['c_d'] = 10., 1.0
-            output_vals['M'], output_vals['c_m'] = 0.0, 0.0
-            output_vals['c_m_alpha'] = 0.0
+            for spec in self.moment_specs:
+                output_vals['M_' + spec.name], output_vals['c_m_' + spec.name] = 0.0, 0.0
 
     def compute_derivatives(self, input_vals, outputs_vals, derivatives):
         # Compute the derivatives of the output quantities w.r.t. the inputs
@@ -455,12 +472,14 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
         # Compute all force and moment derivatives w.r.t. the nondimensional state and mesh vertex movement
         derivatives['L', 'u_vec'] = self.compute_L_deriv(u_vec)[None, :]
         derivatives['D', 'u_vec'] = self.compute_D_deriv(u_vec)[None, :]
-        derivatives['M', 'u_vec'] = self.compute_M_deriv(u_vec)[None, :]
+        for spec in self.moment_specs:
+            derivatives['M_' + spec.name, 'u_vec'] = self.compute_moment_deriv(u_vec, spec)[None, :]
 
         if deform_array is not None:
             derivatives['L', 'mesh_deformation'] = self.compute_L_meshderiv(u_vec)[None, :]
             derivatives['D', 'mesh_deformation'] = self.compute_D_meshderiv(u_vec)[None, :]
-            derivatives['M', 'mesh_deformation'] = self.compute_M_meshderiv(u_vec)[None, :]
+            for spec in self.moment_specs:
+                derivatives['M_' + spec.name, 'mesh_deformation'] = self.compute_moment_meshderiv(u_vec, spec)[None, :]
 
         # Compute the force derivatives w.r.t. angle of attack changes at fixed u_vec: the
         # rotation of the lift and drag directions (dL = -D dalpha, dD = L dalpha), plus
@@ -469,7 +488,8 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
         D_val, _ = self.compute_cd(u_vec)
         dL = self._assemble_alpha_derivative(self.compute_force_in_direction(u_vec, self.psi_lift))
         dD = self._assemble_alpha_derivative(self.compute_force_in_direction(u_vec, self.psi_drag))
-        dM = self._assemble_alpha_derivative(self.compute_moment_form(u_vec))
         derivatives['L', 'alpha'] = np.array([[-D_val + dL]], dtype=np.float64)
         derivatives['D', 'alpha'] = np.array([[ L_val + dD]], dtype=np.float64)
-        derivatives['M', 'alpha'] = np.array([[dM]], dtype=np.float64)
+        for spec in self.moment_specs:
+            derivatives['M_' + spec.name, 'alpha'] = np.array(
+                [[self.compute_moment_alphaderiv(u_vec, spec)]], dtype=np.float64)

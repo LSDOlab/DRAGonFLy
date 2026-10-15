@@ -57,7 +57,7 @@ from dragonfly_sim.utils.mesh_manager_utils import airfoil_inner_bdry_function
 
 # 5 x 3 FFD control points; they move vertically, within +/-0.01
 shape = FFDShapeParameterization([5, 3], [2, 2], layers=[ControlPointMotions({1: 0.01})])
-model = DG_windtunnel_model(mesh, boundary_dict, shape, aero_center=np.array([0.25, 0.]),
+model = DG_windtunnel_model(mesh, boundary_dict, shape, moments=[("pitch", (0.25, 0.), "pitch")],
                             mesh_inner_bdry_function=airfoil_inner_bdry_function,
                             poly_order=0, filename_suffix="my_case", asm_overlap=1, ilu_levels=1)
 model.set_up_sim()
@@ -75,7 +75,6 @@ Solver settings are attributes; change them before `set_up_sim()`:
 | `max_newton_iterations` | `100` | total Newton step budget per flow solve |
 | `linear_solver_rtol`, `linear_solver_atol` | `1e-20`, `1e-11` | adjoint and tangent linear solves |
 | `linear_solver_max_it` | `1000` | iteration limit of those solves |
-| `log_cm_alpha` | `True` | print $dc_m/d\alpha$ after each solve (one extra linear solve) |
 
 Constructor options select the flow model:
 
@@ -116,9 +115,34 @@ out.D.set_as_objective()
 out.L.set_as_constraint(lower=0.225)
 recorder.stop()
 ```
-`post.evaluate` returns `L`, `D` and `M`, which have derivatives and may be used as objectives and constraints,
-and the coefficients `c_l`, `c_d`, `c_m` and `c_m_alpha`, which are for monitoring only. The flattened shape
-parameter vector `params` is passed along for bookkeeping; it carries no derivatives.
+`post.evaluate` returns `L`, `D` and, for every moment (see [Moments](#moments)), `M_<name>`, which have
+derivatives and may be used as objectives and constraints, and the coefficients `c_l`, `c_d` and `c_m_<name>`,
+which are for monitoring only. The flattened shape parameter vector `params` is passed along for bookkeeping; it
+carries no derivatives.
+
+### Moments
+The moments of the wall force to compute, print after every evaluation and differentiate are given to
+`DG_windtunnel_model` (or `DG_postprocessor`) as `moments`, a list of `(name, point, direction[, ref_length])`
+tuples; there are none by default. Each is $M = \mathbf{d}\cdot(\mathbf{r}\times\mathbf{F})$ with
+$\mathbf{r} = \mathbf{x} - $ `point`, integrated over the wall (right-hand rule). `direction` is any nonzero
+vector (normalised), or `"pitch"`: the nose-up-positive pitching moment, $(0, 1, 0)$ in 3D (spanwise $y$) and
+$(0, 0, -1)$ in 2D, where only the out-of-plane direction $(0, 0, \pm 1)$ exists. The root bending moment of a
+half-wing on the $y = 0$ symmetry plane, and its pitching moment, both about the root quarter chord:
+```python
+moments = [("root_bending", (0.25, 0., 0.), (1., 0., 0.)),
+           ("pitch",        (0.25, 0., 0.), "pitch")]
+model = DG_windtunnel_model(mesh, boundary_dict, shape, moments=moments, ...)
+post = DG_postprocessor(model.mesh, model.sim_model, model.WALL_TAG, moments=moments, p_inf_dim=101325.)
+out = post.evaluate(u, mesh_motion, alpha, params)
+out.M_root_bending.set_as_constraint(upper=...)
+```
+The outputs are `M_<name>` (differentiated with respect to the state, the mesh motion and $\alpha$) and
+`c_m_<name>` (monitoring only). The coefficient divides by $\tfrac{1}{2}\rho_\infty|\mathbf{u}_\infty|^2
+S_{ref}\,L_k$, where $L_k$ is the reference chord unless the fourth tuple entry gives another length, e.g. the
+semi-span for a bending coefficient. The reference area and chord change with the 3D geometry, so constrain
+`M_<name>`, not `c_m_<name>`. The directions are fixed in the geometry axes and the points fixed in space, also
+while a shape variable moves the wall: a variable that moves the root station does not move the point. The names
+must be unique identifiers. Each moment costs one assembly of its value and of each derivative.
 
 ## 6. Running
 ```python
@@ -137,22 +161,22 @@ Leave out the shape parameterization: `set_up_sim()` then builds no FFD block an
 (`model.ffd` and `model.mesh_warper` stay `None`), the mesh stays fixed, and the angle of attack is the only
 input.
 ```python
-model = DG_windtunnel_model(mesh, boundary_dict, mesh_inner_bdry_function=airfoil_inner_bdry_function,
-                            poly_order=0)
+model = DG_windtunnel_model(mesh, boundary_dict, moments=[("pitch", (0.25, 0.), "pitch")],
+                            mesh_inner_bdry_function=airfoil_inner_bdry_function, poly_order=0)
 model.set_up_sim()
 
 # one flow solve, no CSDL graph: the state, a convergence flag, and the forces
 u, converged, forces = model.solve_forward(np.radians(2))
-print(forces["c_l"], forces["c_d"], forces["c_m"])
+print(forces["c_l"], forces["c_d"], forces["moments"]["pitch"]["c_m"])
 
 # or a CSDL graph with alpha as its only input
 u = model.evaluate(alpha=alpha)
 out = model.postprocessor.evaluate(u, alpha=alpha)
 ```
 `DG_postprocessor` needs no FFD definitions either: `post.forces_and_coefficients(u, alpha)` returns `L`, `D`,
-`M`, `c_l`, `c_d`, `c_m` (and, for a viscous model, the friction drag `D_friction`, `c_d_friction`) of any state,
-outside CSDL, and `post.evaluate(u, alpha=alpha)` leaves out the mesh deformation. `aero_center` defaults to
-the quarter chord, $(0.25, 0[, 0])$. See `examples/airfoil_analysis.py`. Time-dependent runs are set up directly
+`c_l`, `c_d`, the `moments` (a dict of `{"M": ..., "c_m": ...}` per name) and, for a viscous model, the
+friction drag `D_friction`, `c_d_friction` of any state, outside CSDL, and `post.evaluate(u, alpha=alpha)` leaves
+out the mesh deformation. See `examples/airfoil_analysis.py`. Time-dependent runs are set up directly
 from the model classes, as in `examples/flow_analysis.py`.
 
 ## Reduced-order model

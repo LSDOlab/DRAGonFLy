@@ -12,6 +12,9 @@ from dragonfly_sim.core.turbulence_models import Laminar, SpalartAllmarasNeg
 from cases import mms_rans_model, l2_error
 
 
+pytestmark = [pytest.mark.verification]
+
+
 def solve_mms(closure, n):
     model, U_e = mms_rans_model(closure, n=n)
     model.interpolate_solution_vector(U_e)

@@ -60,6 +60,22 @@ class DerivedField:
     def mesh_jacobian(self):
         return None
 
+    def discard(self, obj):
+        """Free a matrix or vector returned by state_jacobian / alpha_vector /
+        mesh_jacobian once the caller is done with it. A field that caches
+        them keeps its own (override); a python-context operator also frees
+        what its context holds."""
+        destroy_operator(obj)
+
+    def release_cache(self):
+        """Free whatever the field caches between calls (nothing by default)."""
+
+
+def destroy_operator(obj):
+    """Destroy a PETSc Mat or Vec. A python-context Mat's context frees what it
+    owns in its destroy(mat) method, which PETSc calls with the Mat."""
+    obj.destroy()
+
 
 def _nonempty(form):
     """The form with derivatives expanded, or None if it is identically zero."""
@@ -138,12 +154,12 @@ class DerivedFieldChainRule:
                 continue
             dFdf = self._partial_field(F, key, field)
             if dFdf is None:
-                a.destroy()
+                field.discard(a)
                 continue
             A = _assemble_mat(dFdf)
             A.multAdd(a, out, out)
             A.destroy()
-            a.destroy()
+            field.discard(a)
         return out
 
     def residual_mesh_operator(self, F, key):
@@ -162,9 +178,9 @@ class DerivedFieldChainRule:
                 continue
             dFdf = self._partial_field(F, key, field)
             if dFdf is None:
-                X.destroy()
+                field.discard(X)
                 continue
-            chains.append((_assemble_mat(dFdf), X))
+            chains.append((_assemble_mat(dFdf), X, field))
         return _shell_matrix(A_x, chains)
 
     # ----------------------------------------------------------------
@@ -186,8 +202,9 @@ class DerivedFieldChainRule:
                 B.multTransposeAdd(v, g, g)
                 v.destroy()
             # a fresh matrix per call: free it now, not at the next
-            # PETSc.garbage_cleanup (several GB for a 3D Green-Gauss gradient)
-            B.destroy()
+            # PETSc.garbage_cleanup (several GB for a 3D Green-Gauss gradient);
+            # a field that caches it keeps it
+            field.discard(B)
         return g
 
     def functional_alpha(self, J, key):
@@ -206,7 +223,7 @@ class DerivedFieldChainRule:
                 v = _assemble_vec(dJdf)
                 total += v.dot(a)
                 v.destroy()
-            a.destroy()
+            field.discard(a)
         return total
 
     def functional_mesh(self, J, key):
@@ -225,7 +242,7 @@ class DerivedFieldChainRule:
                 v = _assemble_vec(dJdf)
                 X.multTransposeAdd(v, g, g)
                 v.destroy()
-            X.destroy()
+            field.discard(X)
         return g
 
 
@@ -235,17 +252,17 @@ class _ChainedMeshOperator:
     def __init__(self, A_x, chains):
         self.A_x = A_x
         self.chains = chains
-        self._work = [(A.createVecRight(), A.createVecLeft()) for A, _ in chains]
+        self._work = [(A.createVecRight(), A.createVecLeft()) for A, _, _ in chains]
 
     def mult(self, mat, v, y):
         self.A_x.mult(v, y)
-        for (A, X), (w_f, _) in zip(self.chains, self._work):
+        for (A, X, _), (w_f, _) in zip(self.chains, self._work):
             X.mult(v, w_f)
             A.multAdd(w_f, y, y)
 
     def multTranspose(self, mat, w, y):
         self.A_x.multTranspose(w, y)
-        for (A, X), (w_f, _) in zip(self.chains, self._work):
+        for (A, X, _), (w_f, _) in zip(self.chains, self._work):
             A.multTranspose(w, w_f)
             X.multTransposeAdd(w_f, y, y)
 
@@ -266,9 +283,11 @@ def destroy_chained_operator(M):
     ctx = M.getPythonContext()
     M.destroy()
     ctx.A_x.destroy()
-    for (A, X), (w_f, w_r) in zip(ctx.chains, ctx._work):
-        for obj in (A, X, w_f, w_r):
-            obj.destroy()
+    for (A, X, field), (w_f, w_r) in zip(ctx.chains, ctx._work):
+        A.destroy()
+        field.discard(X)             # a field that caches its mesh Jacobian keeps it
+        w_f.destroy()
+        w_r.destroy()
     ctx.chains, ctx._work = [], []
 
 

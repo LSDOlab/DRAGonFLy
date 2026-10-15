@@ -81,9 +81,11 @@ a kd-tree (the `idwarp_jax` package) and pruned with a relative tolerance `err_t
 
 ## Outputs
 The pressure force on the wall is $\mathbf{F}_p = \int_{wall} p\,\mathbf{n}\,ds$. Drag $D$ and lift $L$ are its
-components along and normal to the freestream, and the pitching moment $M$ is taken about `aero_center`,
-positive nose-up. The coefficients divide these by $\tfrac{1}{2}\rho_\infty|\mathbf{u}_\infty|^2 S_{ref}$ (and the
-reference chord for $c_m$), with $S_{ref} = 1$ in 2D and the planform area of the half-wing in 3D, unless set by
+components along and normal to the freestream, and each moment $M = \mathbf{d}\cdot(\mathbf{r}\times\mathbf{F}_p)$ is taken about a user-given point along a
+user-given direction `moments=[(name, point, direction), ...]` (the pitching moment about a point, positive
+nose-up, is direction `"pitch"`; the root bending moment of a half-wing is direction $(1, 0, 0)$ about a point
+on the root). The coefficients divide these by $\tfrac{1}{2}\rho_\infty|\mathbf{u}_\infty|^2 S_{ref}$ (and a
+reference length for the moments, the reference chord by default), with $S_{ref} = 1$ in 2D and the planform area of the half-wing in 3D, unless set by
 the user.
 
 ## Derivatives

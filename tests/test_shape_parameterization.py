@@ -98,6 +98,7 @@ def old_corner_list_lattice(shape, corner_list, margin=1e-4):
 
 # ---- block construction and raw control-point motions ---------------------
 
+@pytest.mark.unit_test
 def test_automatic_lattice_is_the_uniform_bounding_box_grid():
     X, _ = ellipse()
     ffd = WallFFD(COMM, X, np.arange(len(X)), [10, 3], [2, 2])
@@ -108,6 +109,7 @@ def test_automatic_lattice_is_the_uniform_bounding_box_grid():
 
 
 @pytest.mark.parametrize("shape", [[3, 5, 2], [10, 5, 2], [4, 5, 3]])
+@pytest.mark.verification
 def test_corner_list_lattice_matches_the_old_lofted_block(shape):
     ref = old_corner_list_lattice(shape, WING_CORNERS)
     X, _ = swept_wing()
@@ -115,6 +117,7 @@ def test_corner_list_lattice_matches_the_old_lofted_block(shape):
     np.testing.assert_allclose(ffd.baseline_coefficients, ref, rtol=0, atol=1e-13)
 
 
+@pytest.mark.verification
 def test_wall_displacement_is_the_bspline_map_of_the_cp_motions():
     X, _ = ellipse()
     ffd = WallFFD(COMM, X, np.arange(len(X)), [10, 3], [2, 2])
@@ -129,6 +132,7 @@ def test_wall_displacement_is_the_bspline_map_of_the_cp_motions():
     np.testing.assert_allclose(B @ ffd.baseline_coefficients.reshape(-1, 2), X, atol=1e-10)
 
 
+@pytest.mark.unit_test
 def test_cp_motion_shape_and_direction_checks():
     X, _ = ellipse()
     ffd = WallFFD(COMM, X, np.arange(len(X)), [5, 3], 2)
@@ -140,6 +144,7 @@ def test_cp_motion_shape_and_direction_checks():
         validate_cp_coord_opt_idxs([2], 2)
 
 
+@pytest.mark.verification
 def test_probe_points_move_with_the_wall():
     X, _ = ellipse()
     ffd = WallFFD(COMM, X, np.arange(len(X)), [10, 3], [2, 2])
@@ -152,6 +157,7 @@ def test_probe_points_move_with_the_wall():
 
 # ---- sectional layer -------------------------------------------------------
 
+@pytest.mark.verification
 def test_zero_sectional_variables_are_the_identity():
     X, _ = ellipse()
     ffd = WallFFD(COMM, X, np.arange(len(X)), [10, 3], [2, 2])
@@ -162,6 +168,7 @@ def test_zero_sectional_variables_are_the_identity():
     np.testing.assert_array_equal(C.value, ffd.baseline_coefficients)
 
 
+@pytest.mark.verification
 def test_camber_and_thickness_move_only_the_vertical_coordinate():
     X, _ = ellipse()
     ffd = WallFFD(COMM, X, np.arange(len(X)), [10, 3], [2, 2])
@@ -176,6 +183,7 @@ def test_camber_and_thickness_move_only_the_vertical_coordinate():
     np.testing.assert_allclose(disp[:, 1], 0.01 + 0.02 * (X[:, 1] - mid) / height, atol=1e-12)
 
 
+@pytest.mark.verification
 def test_twist_keeps_the_root_on_the_symmetry_plane():
     X, _ = swept_wing()
     ffd = WallFFD(COMM, X, np.arange(len(X)), [4, 5, 2], [2, 2, 1],
@@ -189,6 +197,7 @@ def test_twist_keeps_the_root_on_the_symmetry_plane():
     assert np.abs(disp[root, 2]).max() > 1e-3   # but the root section did twist
 
 
+@pytest.mark.unit_test
 def test_sectional_variable_size_is_checked():
     X, _ = ellipse()
     ffd = WallFFD(COMM, X, np.arange(len(X)), [10, 3], [2, 2])
@@ -202,6 +211,7 @@ def test_sectional_variable_size_is_checked():
 
 # ---- geometric constraints -------------------------------------------------
 
+@pytest.mark.verification
 def test_enclosed_area_and_thickness_of_an_ellipse():
     X, segments = ellipse()
     ffd = WallFFD(COMM, X, np.arange(len(X)), [10, 3], [2, 2])
@@ -218,6 +228,7 @@ def test_enclosed_area_and_thickness_of_an_ellipse():
     assert geo.enclosed_measure(ffd.wall_displacement(C)).value[0] == pytest.approx(polygon, rel=1e-12)
 
 
+@pytest.mark.verification
 def test_half_wing_volume_thickness_and_planform():
     X, tris = half_wing()
     ffd = WallFFD(COMM, X, np.arange(len(X)), [4, 5, 2], [2, 2, 1])
@@ -233,6 +244,7 @@ def test_half_wing_volume_thickness_and_planform():
     assert pf['area'].value[0] == pytest.approx(5. * 13.5, rel=1e-3)
 
 
+@pytest.mark.verification
 def test_constraint_derivatives_match_finite_differences():
     X, segments = ellipse()
     ffd = WallFFD(COMM, X, np.arange(len(X)), [6, 3], [2, 2])
@@ -268,6 +280,7 @@ def test_constraint_derivatives_match_finite_differences():
             np.testing.assert_allclose(an_col, fd_col, rtol=1e-6, atol=1e-9)
 
 
+@pytest.mark.unit_test
 def test_wall_facet_checks():
     X, segments = ellipse()
     ffd = WallFFD(COMM, X, np.arange(len(X)), [5, 3], 2)
@@ -277,6 +290,7 @@ def test_wall_facet_checks():
 
 # ---- design-variable sets ---------------------------------------------------
 
+@pytest.mark.unit_test
 def test_shape_dv_set_layout():
     coeffs = np.random.default_rng(3).uniform(size=(4, 5, 2, 3))
     cp_dv = build_cp_motion_dv(coeffs, {2: spanwise_linear_bounds(0.1, 1., 0.5, 14.1)})
@@ -291,6 +305,7 @@ def test_shape_dv_set_layout():
         dvs.add('twist', tw_dv)
 
 
+@pytest.mark.unit_test
 def test_build_sectional_dv_bounds():
     dv = build_sectional_dv(3, 0.02)
     np.testing.assert_array_equal(dv.lower, -0.02)
@@ -299,6 +314,7 @@ def test_build_sectional_dv_bounds():
         build_sectional_dv(3, (0.01, 0.02))
 
 
+@pytest.mark.verification
 def test_parameterization_solver_hits_a_planform_area_target():
     """lsdo_geo's ParameterizationSolver on sectional states: the chord
     stretches become implicit states driven so that the planform area equals a
@@ -335,6 +351,7 @@ def test_parameterization_solver_hits_a_planform_area_target():
     np.testing.assert_allclose(an.ravel(), (vals[0] - vals[1]) / (2 * h), rtol=1e-5)
 
 
+@pytest.mark.unit_test
 def test_sectional_layer_under_a_non_inline_recorder():
     """The drivers record with inline=False, where intermediate values are None
     until a simulator runs; lsdo_geo's stretch needs them at build time."""

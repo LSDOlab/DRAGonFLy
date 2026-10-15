@@ -3,7 +3,7 @@ Auto-generated from the docstrings of the `dragonfly_sim` package.
 
 The main entry points:
 - `dragonfly_sim.core.windtunnel_model.DG_windtunnel_model`: flow model (CSDL implicit operation)
-- `dragonfly_sim.core.postprocessor.DG_postprocessor`: lift, drag and pitching moment
+- `dragonfly_sim.core.postprocessor.DG_postprocessor`: lift, drag and moments about user-given points and directions
 - `dragonfly_sim.core.meshwarping.IDWarp_jax`: volume mesh deformation
 - `dragonfly_sim.core.shape_design`: the shape design variables (`FFDShapeParameterization` and its layers
   `ControlPointMotions`, `SectionalVariables`, `WingShape`)

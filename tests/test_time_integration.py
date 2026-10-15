@@ -18,6 +18,7 @@ from cases import euler_channel_model, seed_mean_flow, FREESTREAM, WALL_TAG
 # ----------------------------------------------------------------------
 # pure Python
 # ----------------------------------------------------------------------
+@pytest.mark.verification
 def test_bdf_coefficients():
     assert bdf_coefficients(1) == (1.0, -1.0, 0.0)
     np.testing.assert_allclose(bdf_coefficients(2), (1.5, -2.0, 0.5))
@@ -29,6 +30,7 @@ def test_bdf_coefficients():
         assert abs(a[0] * 1.0 + a[2] * (-1.0 / w) - 1.0) < 1e-14
 
 
+@pytest.mark.unit_test
 def test_cfl_controller_decisions():
     c = CFLController(cfl0=10.0)
     assert c.update(1.0, 0.5) == (True, False) and c.cfl == 20.0      # progress: x2 (cap)
@@ -54,6 +56,7 @@ def test_cfl_controller_decisions():
     assert c.cfl == 10.0
 
 
+@pytest.mark.unit_test
 def test_cfl_controller_milder_cut_on_a_rise():
     # default: any rise above 5% at least halves the CFL
     c = CFLController(cfl0=10.0)
@@ -73,6 +76,7 @@ def test_cfl_controller_milder_cut_on_a_rise():
     assert c.update(1.0, 20.0) == (False, False) and c.cfl == pytest.approx(1.0)   # rejection is unchanged
 
 
+@pytest.mark.unit_test
 def test_cfl_controller_stops_when_frozen():
     # theta = 0 leaves the state unchanged: max_frozen_steps of them in a row exhaust the controller
     c = CFLController(cfl0=5.0, max_frozen_steps=3)
@@ -88,6 +92,7 @@ def test_cfl_controller_stops_when_frozen():
     assert not c.exhausted and c.frozen_steps == 0
 
 
+@pytest.mark.unit_test
 def test_step_size_controller():
     s = StepSizeController(dt=0.05, dt_start=1e-3, growth=1.5)
     assert s.first(None) == 1e-3 and s.first(1e-3) == pytest.approx(1.5e-3) and s.first(0.04) == 0.05
@@ -97,6 +102,7 @@ def test_step_size_controller():
 # ----------------------------------------------------------------------
 # with a model
 # ----------------------------------------------------------------------
+@pytest.mark.unit_test
 def test_checkpoint_round_trip(tmp_path):
     comm = MPI.COMM_WORLD
     model = euler_channel_model(n=6)
@@ -149,6 +155,7 @@ def _run_steps(model, tf, steps, dt=0.05):
     return integrator
 
 
+@pytest.mark.verification
 def test_unsteady_freestream_is_preserved():
     model, _ = _farfield_square()
     u0 = model.u_vec.x.array.copy()
@@ -167,6 +174,7 @@ def _perturb(model):
     model.u_vec.x.scatter_forward()
 
 
+@pytest.mark.verification
 def test_transverse_farfield_with_beta_zero_is_riemann():
     states = []
     for transverse, beta in ((False, 0.0), (True, 0.0), (True, 0.5)):
@@ -180,6 +188,7 @@ def test_transverse_farfield_with_beta_zero_is_riemann():
     assert MPI.COMM_WORLD.allreduce(float(np.abs(states[2] - states[0]).max()), MPI.MAX) > 1e-8
 
 
+@pytest.mark.verification
 def test_steady_ptc_and_unsteady_euler_reach_the_same_state():
     """PTC from a perturbed state and many large BDF1 steps converge to the
     same steady channel flow as the release Newton solve."""
@@ -214,6 +223,7 @@ def test_steady_ptc_and_unsteady_euler_reach_the_same_state():
     np.testing.assert_allclose(bdf.u_vec.x.array, ref.u_vec.x.array, rtol=0, atol=1e-7)
 
 
+@pytest.mark.verification
 def test_dual_time_steps_match_newton_steps():
     """Dual time solves the same R* = 0 per physical step, by PTC instead of
     plain Newton: the states agree to the inner tolerance."""
@@ -247,6 +257,7 @@ def _ptc_channel(warm_start):
     return model
 
 
+@pytest.mark.unit_test
 def test_ptc_warm_start_continues_at_the_final_cfl():
     """After a converged steady solve, a solve from that end state at a slightly
     different angle of attack continues at the final CFL instead of ramping up
@@ -270,6 +281,7 @@ def test_ptc_warm_start_continues_at_the_final_cfl():
     np.testing.assert_allclose(states[True], states[False], rtol=0, atol=1e-7)
 
 
+@pytest.mark.unit_test
 def test_ptc_warm_start_needs_the_end_state_of_the_last_solve():
     model = _ptc_channel(True)
     integrator = model.time_integrator
