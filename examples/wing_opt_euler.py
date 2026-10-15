@@ -188,7 +188,6 @@ if __name__ == '__main__':
     M_pitch, M_root_bending = outputs.M_pitch, outputs.M_root_bending
 
     D.add_name('drag')
-    D.set_as_objective()
 
     # Define lower limit constraint on lift
     with csdl.namespace('Constraint 2'):
@@ -200,12 +199,19 @@ if __name__ == '__main__':
         # (M 0.75, alpha 2 deg), from a converged forward solve
         # first order (2026-10-08: 8 Newton steps to |R| 3.0e-10; c_l 0.34803, c_d 0.047778)
         L_baseline = 6.240966914666039
+        D_baseline = L_baseline * 0.047778 / 0.34803    # D = L c_d / c_l (same q S normalization)
         if muscl:
             # MUSCL (2026-10-08: 80 PTC steps to |R| 7.4e-10; c_l 0.53780, c_d 0.012229)
             L_baseline = 9.64391809932878
+            D_baseline = L_baseline * 0.012229 / 0.53780
         L_constraint = L
         L_constraint.add_name('L_limit')
-        L_constraint.set_as_constraint(lower=L_baseline)
+        L_constraint.set_as_constraint(lower=L_baseline, scaler=1./L_baseline)
+
+    # The objective and the constraint are scaled by their undeformed-wing values, so that SLSQP's
+    # absolute ftol acts as a relative tolerance (SLSQP has no rtol option): the convergence test
+    # is then on the relative drag change and the relative constraint violation.
+    D.set_as_objective(scaler=1./D_baseline)
 
     # Geometric constraints. The wing's planform quantities follow directly from
     # its variables (shape.outputs()['wing']: area, span, semi_span, root_chord,
@@ -246,7 +252,7 @@ if __name__ == '__main__':
 
     # modopt writes its outputs into a timestamped folder that every rank would
     # create at once (a FileExistsError race): only rank 0 writes them
-    optimizer = SLSQP(prob, solver_options={'ftol':1e-8, 'maxiter':150},
+    optimizer = SLSQP(prob, solver_options={'ftol':1e-6, 'maxiter':150},
                       turn_off_outputs=mesh_from_file.comm.Get_rank() != 0)
     # optimizer = PySLSQP(prob, solver_options={'acc':1e-8, 'maxiter':100})
 

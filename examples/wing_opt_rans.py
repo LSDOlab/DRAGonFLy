@@ -170,9 +170,14 @@ if __name__ == '__main__':
     # are reused by the adjoint solves of all its outputs (see DG_windtunnel_model).
     csdl_flow_model.linear_solver_atol = 1e-9
     csdl_flow_model.linear_residual_accept_limit = 1e-8
-    # Each adjoint solve starts from the first-order adjoint solution (the compact part of the
-    # Jacobian alone, solved to a relative tolerance of 1e-2).
-    csdl_flow_model.adjoint_first_order_guess = True
+    # Adjoint speed-ups, measured in examples/benchmark_adjoint_options.py and benchmark_adjoint_ksp.py
+    # (the derivative evaluation takes 498 s instead of 674 s on 6 ranks, with identical derivatives):
+    # the derived-field Jacobians, the dR/dx operator and the cell-centre matrix are built once per
+    # design, and the adjoint's Krylov method is DGMRES(200) with 30 deflated vectors instead of FGMRES(200).
+    # They are applied after set_up_sim(), below.
+    adjoint_ksp_options = {"ksp_type": "dgmres", "ksp_gmres_restart": 200, "ksp_dgmres_eigen": 30,
+                           "ksp_dgmres_max_eigen": 60, "ksp_pc_side": "right",
+                           "ksp_norm_type": "unpreconditioned"}
     # Free the solver's matrices after each forward solve and the adjoint's
     # after each design's adjoints, so the two never coexist (rebuilt when next needed).
     csdl_flow_model.release_solver_memory = True
@@ -181,6 +186,9 @@ if __name__ == '__main__':
     # One solution frame per design (CSDL evaluates each design twice)
     csdl_flow_model.write_once_per_design = True
     csdl_flow_model.set_up_sim()
+    csdl_flow_model.set_adjoint_options(cell_centre_matrix=True, cache_jacobians=True, structured_gradient=True,
+                                        cache_jacvec_operators=True)
+    csdl_flow_model.adjoint_ksp_options = adjoint_ksp_options
 
     # Moments of the wall force (see DG_postprocessor), both constrained below:
     #   root_bending: about the x direction (chordwise axis) through the origin, on the
@@ -205,7 +213,8 @@ if __name__ == '__main__':
     u_baseline, baseline_converged, _ = csdl_flow_model.solve_forward(attack)
     if not baseline_converged:
         raise RuntimeError("the baseline flow solve did not converge: no baseline moments for the constraints")
-    baseline_moments = csdl_coeff_model.forces_and_coefficients(u_baseline)["moments"]
+    baseline_forces = csdl_coeff_model.forces_and_coefficients(u_baseline)
+    baseline_moments = baseline_forces["moments"]
     PETSc.Sys.Print("Baseline moments (nondimensional): " + ", ".join(
         "{} {:.8f}".format(name, m["M"]) for name, m in baseline_moments.items()))
 
@@ -238,7 +247,10 @@ if __name__ == '__main__':
     M_root_bending, M_pitch = outputs.M_root_bending, outputs.M_pitch
 
     D.add_name('drag')
-    D.set_as_objective()
+    # The objective and the constraints are scaled by their undeformed-wing values, so that SLSQP's
+    # absolute ftol acts as a relative tolerance (SLSQP has no rtol option): the convergence test is
+    # then on the relative drag change and the relative constraint violation.
+    D.set_as_objective(scaler=1./baseline_forces["D"])
 
     # Define lower limit constraint on lift
     with csdl.namespace('Constraint 2'):
@@ -252,16 +264,18 @@ if __name__ == '__main__':
         L_baseline = 7.633754061772796
         L_constraint = L
         L_constraint.add_name('L_limit')
-        L_constraint.set_as_constraint(lower=L_baseline)
+        L_constraint.set_as_constraint(lower=L_baseline, scaler=1./L_baseline)
 
     # Moment constraints: the root bending moment may not exceed, and the pitching moment may not
     # fall below, its value on the undeformed wing. M_<name> are the raw nondimensional moment integrals (like
     # L), the quantities to constrain; their coefficients are monitoring only.
     with csdl.namespace('Constraint 3'):
         M_root_bending.add_name('root_bending_limit')
-        M_root_bending.set_as_constraint(upper=baseline_moments["root_bending"]["M"])
+        M_root_bending.set_as_constraint(upper=baseline_moments["root_bending"]["M"],
+                                         scaler=1./abs(baseline_moments["root_bending"]["M"]))
         M_pitch.add_name('pitch_limit')
-        M_pitch.set_as_constraint(lower=baseline_moments["pitch"]["M"])
+        M_pitch.set_as_constraint(lower=baseline_moments["pitch"]["M"],
+                                  scaler=1./abs(baseline_moments["pitch"]["M"]))
 
     # Geometric constraints. The wing's planform quantities follow directly from
     # its variables (shape.outputs()['wing']: area, span, semi_span, root_chord,
@@ -302,7 +316,7 @@ if __name__ == '__main__':
 
     # modopt writes its outputs into a timestamped folder that every rank would
     # create at once (a FileExistsError race): only rank 0 writes them
-    optimizer = SLSQP(prob, solver_options={'ftol':1e-8, 'maxiter':150},
+    optimizer = SLSQP(prob, solver_options={'ftol':1e-6, 'maxiter':150},
                       turn_off_outputs=mesh_from_file.comm.Get_rank() != 0)
     # optimizer = PySLSQP(prob, solver_options={'acc':1e-8, 'maxiter':100})
 

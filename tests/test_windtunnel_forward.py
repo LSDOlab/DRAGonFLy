@@ -34,6 +34,12 @@ def in_tmp_dir(tmp_path):
     cwd = os.getcwd()
     os.chdir(path)
     yield
+    # collect what the test left unreferenced while the working directory still exists: an ADIOS2
+    # writer destroyed later, after the chdir, aborts the process
+    import gc
+    from petsc4py import PETSc
+    gc.collect()
+    PETSc.garbage_cleanup(comm)       # PETSc objects of parallel communicators are freed in a queue
     comm.Barrier()
     os.chdir(cwd)
 

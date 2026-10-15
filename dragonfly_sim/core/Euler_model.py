@@ -844,6 +844,11 @@ class CompressibleEulerModel():
         # ("natural", i.e. no reordering, per that log's ksp_view).
         opts[f"{option_prefix}sub_pc_factor_mat_ordering_type"] = "rcm"
 
+        # the options database is global and the prefix is shared by every KSP of that name:
+        # clear a setting an earlier KSP made (diagonal scaling cannot work on a matrix-free operator)
+        for name in ("ksp_diagonal_scale", "ksp_diagonal_scale_fix"):
+            if opts.hasName(option_prefix + name):
+                opts.delValue(option_prefix + name)
         if self.krylov_diagonal_scale:
             opts[f"{option_prefix}ksp_diagonal_scale"] = ""
             opts[f"{option_prefix}ksp_diagonal_scale_fix"] = ""
@@ -928,17 +933,27 @@ class CompressibleEulerModel():
         self._apply_ksp_options(ksp, ksp_options)
         return ksp
 
-    @staticmethod
-    def _apply_ksp_options(ksp, ksp_options):
+    # PETSc option keys written by _apply_ksp_options: the options database is global, so they are
+    # removed again when the next KSP is configured instead of leaking into it
+    _applied_ksp_option_keys = set()
+
+    @classmethod
+    def _apply_ksp_options(cls, ksp, ksp_options):
         """Override KSP settings through the PETSc options DB, after the model's own:
         a dict of option names without the prefix, e.g. {"ksp_type": "dgmres",
-        "ksp_gmres_restart": 400}. An option the PETSc build does not know (a KSP type
-        it was not built with) raises a PETSc error."""
+        "ksp_gmres_restart": 400}. The overrides last until the next KSP is configured here
+        (the preconditioner reads its options at the first solve), then are deleted. An option
+        the PETSc build does not know (a KSP type it was not built with) raises a PETSc error."""
+        opts = PETSc.Options()
+        for key in cls._applied_ksp_option_keys:
+            opts.delValue(key)
+        cls._applied_ksp_option_keys = set()
         if not ksp_options:
             return
-        opts, prefix = PETSc.Options(), ksp.getOptionsPrefix()
+        prefix = ksp.getOptionsPrefix()
         for key, value in ksp_options.items():
             opts[prefix + key] = value
+            cls._applied_ksp_option_keys.add(prefix + key)
         ksp.setFromOptions()
 
     def _matrix_free_adjoint_solver(self, prefix, rtol, atol, max_it, gmres_restart, ksp_options=None):
