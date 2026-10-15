@@ -36,6 +36,11 @@
   `("pitch", aero_center, "pitch")`. The FOM/ROM coefficient histories hold one $c_m$ per moment.
 - Partition-independent checkpoints; `examples/flow_analysis.py`, `examples/airfoil_analysis.py` and
   `examples/rans_airfoil_opt.py`.
+- Boundary tags of the mesh can define the wall and symmetry planes: `load_dolfinx_mesh` reads and stores the facet
+  tags of XDMF ("Facet tags"), gmsh `.msh` (physical groups, now readable) and planar CGNS (Wall, Farfield) meshes, and
+  `DG_windtunnel_model(wall_tags=..., symmetry_tags=...)` uses them in place of `mesh_inner_bdry_function`; every other
+  boundary is far field. The function is used if given, with a warning that lists the mesh's tags. `examples/flow_analysis.py`
+  takes `--wall-tags` and `--symmetry-tags`.
 - Mesh input from structured multi-block CGNS grids one cell thick (`utils/mesh_io_utils.py`:
   `load_dolfinx_mesh`, `cgns_to_dolfinx_mesh`), reduced to a 2D quadrilateral mesh in memory;
   `examples/flow_analysis.py --mesh` accepts them. 3D structured grids are read as hexahedra (`tdim=3`);

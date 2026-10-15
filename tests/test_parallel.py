@@ -24,7 +24,8 @@ LAUNCHES = {
                               "test_derivatives.py", "test_time_integration.py", "test_windtunnel_forward.py",
                               "test_pod.py", "test_reduced_order_model.py"],
     "caches_and_moments": ["test_mesh_deformation_cache.py", "test_incoming_state_converged.py",
-                           "test_meshwarping_cache.py", "test_moments.py", "test_adjoint_reuse.py"],
+                           "test_meshwarping_cache.py", "test_moments.py", "test_adjoint_reuse.py",
+                           "test_boundary_tags.py"],
 }
 TIMEOUT = 900
 

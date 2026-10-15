@@ -28,7 +28,7 @@ The Python package is distributed as `dragonfly-sim` and imported as `dragonfly_
 - Forward analysis on a fixed mesh, without shape variables.
 - An optional POD reduced-order model (least-squares Petrov-Galerkin) of the steady flow solve, with a
   fallback to the full-order solve (see [Reduced-order modeling](src/reduced_order_modeling.md)).
-- Mesh input from XDMF files or structured CGNS grids; VTX output for ParaView.
+- Mesh input from XDMF, gmsh or structured CGNS files, with the wall and symmetry planes defined by a function or by the mesh's boundary tags ([Meshes](src/meshes.md)); VTX output for ParaView.
 
 ```{toctree}
 :maxdepth: 1
@@ -38,6 +38,7 @@ src/getting_started
 src/background
 src/flow_models
 src/reduced_order_modeling
+src/meshes
 src/user_guide
 src/shape_parameterization
 src/examples

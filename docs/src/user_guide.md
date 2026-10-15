@@ -6,37 +6,26 @@ one up, in the order of the scripts in `examples/`. Run the script with MPI
 (`OMP_NUM_THREADS=1 mpirun -n <ranks> python script.py`).
 
 ## 1. Mesh
-Read a DOLFINx mesh, typically from XDMF:
-```python
-with dolfinx.io.XDMFFile(MPI.COMM_WORLD, "naca0012_euler_mesh_quad_v2.xdmf", "r") as xdmf:
-    mesh = xdmf.read_mesh()
-```
-`dragonfly_sim.utils.mesh_io_utils.load_dolfinx_mesh(path)` reads either an XDMF file or a structured
-multi-block CGNS grid, chosen by file extension, and returns `(mesh, info)`:
+Read a DOLFINx mesh with `load_dolfinx_mesh`, which handles XDMF, gmsh `.msh` and structured CGNS files and keeps the
+boundary tags the file carries:
 ```python
 from dragonfly_sim.utils.mesh_io_utils import load_dolfinx_mesh
 
-mesh, info = load_dolfinx_mesh("OAT15A_Rizzi_1.cgns")   # info: chord, cell and boundary-edge counts
+mesh, info = load_dolfinx_mesh("naca0012_euler_mesh_quad_v2.xdmf")
 ```
-A CGNS grid of a 2D case must be one cell thick (or planar). Rank 0 reads it with PyVista, keeps one span plane
-of every block, merges the nodes the blocks share by exact coordinate match, and checks that the boundary edges
-are exactly those of the wall and far-field families (`wall_family="Wall"`, `farfield_family="Farfield"`). By
-default the points are shifted and scaled so that the wall's leading edge is at $x = 0$ and its chord is 1
-(`scale_to_chord`). DOLFINx then distributes the mesh; no converted file is written.
+A mesh read with plain DOLFINx (`xdmf.read_mesh()`) works too, with the boundary function.
 
-A 3D structured grid is read with `tdim=3`, e.g. the Simple Transonic Wing's
-`load_dolfinx_mesh("wing_vol_L3.cgns", tdim=3)`: every block becomes hexahedra, the blocks' shared nodes are merged
-by exact coordinate match, and the mesh is checked for inverted cells and unmerged block interfaces. Its boundary
-conditions are not read (VTK skips them), so the solver finds the boundaries geometrically, as for an XDMF mesh.
+The solver needs to know which boundary facets are the wall (the body) and which are symmetry planes; all others are
+far field. Either pass a function of the facet midpoints (`mesh_inner_bdry_function`, with
+`airfoil_inner_bdry_function` and `wing_inner_bdry_function` in `dragonfly_sim.utils.mesh_manager_utils` for the
+example meshes), or name the mesh's own boundary tags (`wall_tags`, `symmetry_tags`). The function takes precedence
+and, if the mesh also has tags, a warning lists them. Giving the shape parameterization a `block_corner_list` is a
+third way to find the wall. The formats, both options and the checks are described in [Meshes](meshes.md).
 
 Requirements:
 - **Orientation**: the freestream flows in $+x$. In 2D, y is vertical; in 3D, y is spanwise and z vertical.
 - **3D**: model a half-wing whose root lies on the symmetry plane $y = 0$.
 - **Far field**: the outer boundary should be far from the body. All of it that is neither wall nor symmetry plane gets the characteristic far-field condition.
-- **Wall**: identified by a function `mesh_inner_bdry_function(x)` that takes facet midpoints of shape
-  `(dim, n)` and returns a boolean mask. `dragonfly_sim.utils.mesh_manager_utils` provides
-  `airfoil_inner_bdry_function` and `wing_inner_bdry_function` for the meshes used in the examples. Alternatively,
-  give the shape parameterization a `block_corner_list`, and the wall facets inside that FFD block are used.
 
 ## 2. Flow conditions
 ```python
@@ -81,6 +70,7 @@ Constructor options select the flow model:
 | Argument | Default | Meaning |
 |---|---|---|
 | `model_class`, `model_kwargs` | `CompressibleEulerModel`, `{}` | e.g. `CompressibleRANSModel`, `{'Re': 6e6}` for SA-neg RANS (see [RANS, time integration and far fields](flow_models.md)); the body becomes an adiabatic no-slip wall |
+| `mesh_inner_bdry_function`, `wall_tags`, `symmetry_tags` | `None` | how the wall and symmetry planes are found (see Mesh above) |
 | `reduced_order_model` | `None` | a `ReducedOrderModel` to try before every flow solve (see [Reduced-order modeling](reduced_order_modeling.md)) |
 
 RANS solves use pseudo-transient continuation, so `max_newton_iterations` counts pseudo steps (~60 from the free

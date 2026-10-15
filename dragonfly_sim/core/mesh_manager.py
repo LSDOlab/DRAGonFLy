@@ -1,4 +1,6 @@
 from dataclasses import dataclass
+import warnings
+
 import numpy as np
 from mpi4py import MPI
 from petsc4py import PETSc
@@ -47,7 +49,25 @@ class Mesh():
     # traverses the quad as a bowtie; this permutation makes it cyclic.
     _QUAD_CYCLIC_PERM = np.array([0, 1, 3, 2], dtype=np.int64)
 
-    def __init__(self, inp_mesh, inner_bdry_function, node_match_tol=1e-10):
+    def __init__(self, inp_mesh, inner_bdry_function=None, node_match_tol=1e-10,
+                 wall_tags=None, symmetry_tags=None, facet_tags=None):
+        """
+        The wall (the body) is found in one of two ways:
+
+        inner_bdry_function  a function of the boundary facet midpoints, shape
+            (dim, n), returning a boolean mask: True for the wall. Used if given.
+        wall_tags            the tags of the mesh's own boundary facet tags that
+            are the wall (a tag value or name, or a sequence of them), and
+            symmetry_tags those that are symmetry planes. Used if there is no
+            function. Every other boundary facet is far field.
+
+        The facet tags are `facet_tags` (a dolfinx MeshTags of the facets) or,
+        if None, `inp_mesh.facet_tags`, which utils/mesh_io_utils.py:load_dolfinx_mesh
+        sets (with `inp_mesh.facet_tag_names`, a {name: value} dict). If the
+        function is used and the mesh also has tags, a UserWarning lists them.
+        With the function, symmetry planes are not marked here (3D: y = 0 in
+        DG_windtunnel_model); `symmetry_facet_mask` is None.
+        """
         # define input Dolfinx mesh object
         self.mesh = inp_mesh
 
@@ -101,13 +121,110 @@ class Mesh():
             self.mesh, self.mesh.topology.dim-1, self.bdry_facets)
 
         # from all boundary facets, isolate the boundary of the wing/airfoil/etc.
-        self.inner_bdry_facet_mask = inner_bdry_function(self.bdry_midpoints.T)
+        self.inner_bdry_facet_mask, self.symmetry_facet_mask = self._wall_and_symmetry_masks(
+            inner_bdry_function, wall_tags, symmetry_tags, facet_tags)
 
         # Initialize the meshtags object; used to define integration domains for boundary terms
         self.meshtags = None
 
         # Instantiate FormManager for handling UFL forms and integration measures
         self.form_manager = FormManager(self)
+
+    # ------------------------------------------------------------------
+    # Wall and symmetry boundaries: from a function or from the mesh's tags
+    # ------------------------------------------------------------------
+    def _tag_summary(self, facet_tags, names):
+        """
+        '{value: (name, number of boundary facets)}' lines for the tags on the
+        exterior facets, the same on every rank. Owned facets only, so a facet
+        shared between ranks is counted once.
+        """
+        comm = self.mesh.comm
+        n_owned = self.mesh.topology.index_map(self.mesh.topology.dim - 1).size_local
+        on_bdry = np.isin(facet_tags.indices, self.bdry_facets) & (facet_tags.indices < n_owned)
+        values, counts = np.unique(facet_tags.values[on_bdry], return_counts=True)
+        total = {}
+        for v_c in comm.allgather(dict(zip(values.tolist(), counts.tolist()))):
+            for v, c in v_c.items():
+                total[v] = total.get(v, 0) + c
+        by_value = {v: n for n, v in names.items()}
+        return {v: (by_value.get(v), total[v]) for v in sorted(total)}
+
+    @staticmethod
+    def _describe(summary):
+        return ", ".join("{}{} ({} facets)".format(v, " '{}'".format(n) if n else "", c)
+                         for v, (n, c) in summary.items())
+
+    def _resolve_tags(self, tags, summary, names, what):
+        """Tag values from a value, a name, or a sequence of them; checked to be present."""
+        if tags is None:
+            return set()
+        tags = [tags] if isinstance(tags, (int, np.integer, str)) else list(tags)
+        values = set()
+        for t in tags:
+            if isinstance(t, str):
+                if t not in names:
+                    raise ValueError("{}: the mesh has no boundary tag named '{}' (named tags: {})".format(
+                        what, t, sorted(names) or "none"))
+                t = names[t]
+            t = int(t)
+            if t not in summary:
+                raise ValueError("{}: tag {} is not on the mesh's boundary facets (tags present: {})".format(
+                    what, t, self._describe(summary) or "none"))
+            values.add(t)
+        return values
+
+    def _wall_and_symmetry_masks(self, inner_bdry_function, wall_tags, symmetry_tags, facet_tags):
+        """(wall mask, symmetry mask or None) over self.bdry_facets; see __init__."""
+        facet_tags = facet_tags if facet_tags is not None else getattr(self.mesh, "facet_tags", None)
+        names = getattr(self.mesh, "facet_tag_names", None) or {}
+        summary = self._tag_summary(facet_tags, names) if facet_tags is not None else {}
+
+        if inner_bdry_function is not None:
+            if self.mesh.comm.rank == 0 and (summary or wall_tags is not None
+                                             or symmetry_tags is not None):
+                if summary:
+                    message = ("The input mesh has boundary facet tags: {}. The boundary function "
+                               "is used to find the wall, so the boundary facet tags are "
+                               "currently unused.{} To use the tags "
+                               "instead, leave out the boundary function and pass wall_tags (the "
+                               "tags of the body) and, if there is a symmetry plane, "
+                               "symmetry_tags; all other boundaries are far field.").format(
+                        self._describe(summary),
+                        " wall_tags and symmetry_tags are ignored." if (
+                            wall_tags is not None or symmetry_tags is not None) else "")
+                else:
+                    message = ("wall_tags and symmetry_tags are ignored: the boundary function "
+                               "defines the wall.")
+                warnings.warn(message, UserWarning, stacklevel=4)
+            return np.asarray(inner_bdry_function(self.bdry_midpoints.T), dtype=bool), None
+
+        if wall_tags is None:
+            if summary:
+                raise ValueError(
+                    "No boundary function was given, and wall_tags was not set. The mesh has "
+                    "boundary facet tags: {}. Pass wall_tags (and symmetry_tags for symmetry "
+                    "planes); the other boundaries are far field.".format(self._describe(summary)))
+            raise ValueError("Provide either a boundary function (facet midpoints -> wall mask) "
+                             "or wall_tags with a mesh that has boundary facet tags.")
+        if facet_tags is None:
+            raise ValueError("wall_tags was given but the mesh has no boundary facet tags (read it "
+                             "with load_dolfinx_mesh, or pass facet_tags)")
+        wall = self._resolve_tags(wall_tags, summary, names, "wall_tags")
+        sym = self._resolve_tags(symmetry_tags, summary, names, "symmetry_tags")
+        if not wall:
+            raise ValueError("wall_tags is empty")
+        if wall & sym:
+            raise ValueError("tags {} are both wall and symmetry".format(sorted(wall & sym)))
+
+        # tag value of every boundary facet of this rank (0: untagged)
+        n_facets = self.mesh.topology.index_map(self.mesh.topology.dim - 1)
+        value = np.zeros(n_facets.size_local + n_facets.num_ghosts, dtype=np.int64)
+        value[facet_tags.indices] = facet_tags.values
+        value = value[self.bdry_facets]
+        wall_mask = np.isin(value, list(wall))
+        sym_mask = np.isin(value, list(sym)) if sym else None
+        return wall_mask, sym_mask
 
     def tag_boundary_facets(self, bdry_facet_value_tuples):
         # Construct the boundary mesh tags from a list of tuples (boundary facets, domain_boundary_ID)

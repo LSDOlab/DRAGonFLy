@@ -32,7 +32,7 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
     ordered_callbacks = True
 
     def __init__(self, mesh, boundary_dict, shape_parameterization=None, moments=None,
-                 mesh_inner_bdry_function=None,
+                 mesh_inner_bdry_function=None, wall_tags=None, symmetry_tags=None,
                  poly_order=1, gamma=1.4,
                  filename_suffix="test",
                  asm_overlap=None, ilu_levels=None,
@@ -45,13 +45,21 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         change by any amount during an optimization; there is no inflow/outflow
         division to choose or to keep valid.
 
-        The shape of the object being optimized is defined either through `mesh_inner_bdry_function`
-        or through the shape parameterization's FFD block corners
-        (shape_parameterization.inner_boundary_function()), which bound the box
-        the inner boundary facets are contained in and can therefore supply the
-        same signal. At least one of the two is required; when both are given
-        the explicit function wins, since it can encode exclusions the FFD block
-        cannot.
+        The shape of the object being optimized (the wall) is defined in one of
+        three ways, in this order of precedence:
+        1. `mesh_inner_bdry_function`, a function of the boundary facet midpoints
+           (shape (dim, n)) returning a boolean wall mask. It can encode
+           exclusions the FFD block cannot. If the mesh also carries boundary
+           facet tags (utils/mesh_io_utils.py:load_dolfinx_mesh stores them on
+           the mesh), a warning lists them: they could be used instead.
+        2. `wall_tags`: the mesh's boundary facet tags (values or names, one or
+           several) that are the wall, and `symmetry_tags` those that are
+           symmetry planes (slip walls). Every other boundary is far field.
+           In 3D without tags, the symmetry plane is y = 0.
+        3. The shape parameterization's FFD block corners
+           (shape_parameterization.inner_boundary_function()), which bound the
+           box the inner boundary facets are contained in.
+        At least one is required.
 
         shape_parameterization: the wall-shape parameterization, e.g. a
         shape_design.FFDShapeParameterization -- the FFD block and the layers
@@ -112,16 +120,17 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
                             "(e.g. shape_design.FFDShapeParameterization), got {!r}. The FFD "
                             "block arguments (ffd_shape, ffd_degree, ffd_block_corner_list, "
                             "cp_coord_opt_idxs) moved there.".format(shape_parameterization))
-        if mesh_inner_bdry_function is None and shape_parameterization is not None:
+        if mesh_inner_bdry_function is None and wall_tags is None and shape_parameterization is not None:
             mesh_inner_bdry_function = shape_parameterization.inner_boundary_function()
-        if mesh_inner_bdry_function is None:
-            raise ValueError("Provide either mesh_inner_bdry_function or a shape "
-                             "parameterization with FFD block corners to locate the inner "
-                             "boundary facets.")
+        if mesh_inner_bdry_function is None and wall_tags is None:
+            raise ValueError("Provide either mesh_inner_bdry_function, wall_tags (the mesh's own "
+                             "boundary tags) or a shape parameterization with FFD block corners "
+                             "to locate the inner boundary facets.")
 
         # Initial instantiation of mesh and simulation model
         self.mesh = Mesh(mesh, mesh_inner_bdry_function,
-                         node_match_tol=self.mesh_node_match_tol)
+                         node_match_tol=self.mesh_node_match_tol,
+                         wall_tags=wall_tags, symmetry_tags=symmetry_tags)
         if model_class is CompressibleEulerModel:
             _euler_kwargs = dict(poly_order=poly_order, gamma=gamma)
             self.sim_model = CompressibleEulerModel(self.mesh, **_euler_kwargs)
@@ -225,7 +234,7 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
 
         # Dolfinx mesh tags for the various boundaries
         self.WALL_TAG = 2  # walls (including wing/airfoil boundaries)
-        self.SYMMETRY_TAG = 5  # symmetry, only used in 3D thus far
+        self.SYMMETRY_TAG = 5  # symmetry planes (3D: y = 0, or the mesh's symmetry_tags)
         self.FARFIELD_TAG = 6  # characteristic far field: the whole outer boundary
 
         # global evaluation index of solve_residual_equations
@@ -244,7 +253,10 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         
         # Find the symmetry face facets (only relevant in 3D at the moment)
         # NOTE: The symmetry plane is currently hardcoded at y=0
-        if self.sim_model.dimensions == 3:
+        has_symmetry = self.mesh.symmetry_facet_mask is not None or self.sim_model.dimensions == 3
+        if self.mesh.symmetry_facet_mask is not None:
+            symmetry_facets = self.mesh.symmetry_facet_mask  # from the mesh's boundary tags
+        elif self.sim_model.dimensions == 3:
             symmetry_facets = self.mesh.bdry_midpoints[:, 1] <= 1e-6
         else:
             symmetry_facets = np.array([False]*inner_facets.shape[0])
@@ -263,7 +275,7 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
 
         # Pair the boundary facet sets with the various mesh tags
         bdry_meshtags_and_ds_list = [(farfield_facets, self.FARFIELD_TAG), (inner_facets, self.WALL_TAG)]
-        if self.sim_model.dimensions == 3:
+        if has_symmetry:
             bdry_meshtags_and_ds_list += [(symmetry_facets, self.SYMMETRY_TAG)]
 
         # Build the boundary facet tags and define the corresponding quadrature measure
@@ -313,7 +325,7 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         # Define the boundary condition terms of the Euler weak form
         self.sim_model.define_farfield_bc(self.FARFIELD_TAG)
         self.sim_model.define_wall_bc(self.WALL_TAG)
-        if self.sim_model.dimensions == 3:
+        if has_symmetry:
             self.sim_model.define_slipwall_bc(self.SYMMETRY_TAG)
 
         # Construct the Euler weak form for forward evaluation

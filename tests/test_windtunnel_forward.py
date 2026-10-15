@@ -108,7 +108,7 @@ def rans_alpha_derivative(release, alphas):
     wt.max_newton_iterations = 400
     wt.release_solver_memory = release
     wt.set_up_sim()
-    alpha = csdl.Variable(name='alpha', value=np.array([BC['inlet']['alpha']]))
+    alpha = csdl.Variable(name='alpha', value=np.array([BC['alpha']]))
     alpha.set_as_design_variable()
     u_vec = wt.evaluate(alpha=alpha)
     out = wt.postprocessor.evaluate(u_vec, alpha=alpha)

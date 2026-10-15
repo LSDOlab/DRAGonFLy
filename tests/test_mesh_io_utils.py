@@ -139,4 +139,4 @@ def test_load_wing_l3_distributed():
 
 def test_unsupported_extension():
     with pytest.raises(ValueError):
-        load_dolfinx_mesh("mesh.msh")
+        load_dolfinx_mesh("mesh.obj")
