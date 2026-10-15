@@ -24,7 +24,7 @@ pytestmark = [pytest.mark.verification]
 def graph(wt):
     recorder = csdl.Recorder(inline=False)
     recorder.start()
-    alpha = csdl.Variable(name='alpha', value=np.array([BC['inlet']['alpha']]))
+    alpha = csdl.Variable(name='alpha', value=np.array([BC['alpha']]))
     alpha.set_as_design_variable()
     u_vec = wt.evaluate(alpha=alpha)
     out = wt.postprocessor.evaluate(u_vec, alpha=alpha)

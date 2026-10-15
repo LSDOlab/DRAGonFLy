@@ -32,8 +32,6 @@ mu_inf = rho_inf U_inf / Re (Re held fixed under set_mach).
 
 Boundary conditions (kind: extra-variable values)
 -------------------------------------------------
-inflow    the Euler subsonic inflow state; free-stream scalars
-outflow   the Euler subsonic outflow state; scalars extrapolated
 farfield  the characteristic state; scalars from the free stream where it
           flows in, from the interior where it flows out
 wall      adiabatic no-slip (define_wall_bc): u = 0, interior density and
@@ -135,17 +133,17 @@ class CompressibleRANSModel:
                 limiter_scales=self._limiter_scales)
             self.reconstruction.install()
 
-    def define_inlet_outlet_conditions(self, bc_dict):
-        self.flow.define_inlet_outlet_conditions(bc_dict)
-        inlet = self.flow.boundary_conditions['inlet']
+    def define_farfield_conditions(self, bc_dict):
+        self.flow.define_farfield_conditions(bc_dict)
+        ff = self.flow.farfield_conditions
         self.mu_inf_const = dolfinx.fem.Constant(
-            self.flow.mesh_obj.mesh, inlet['rho'] * inlet['M'] * inlet['c'] / self.Re)
+            self.flow.mesh_obj.mesh, ff['rho'] * ff['M'] * ff['c'] / self.Re)
 
     def set_mach(self, M):
         # Re is held fixed, so mu_inf follows U_inf
         self.flow.set_mach(M)
-        inlet = self.flow.boundary_conditions['inlet']
-        self.mu_inf_const.value = inlet['rho'] * inlet['M'] * inlet['c'] / self.Re
+        ff = self.flow.farfield_conditions
+        self.mu_inf_const.value = ff['rho'] * ff['M'] * ff['c'] / self.Re
 
     def set_up_solver(self):
         flow = self.flow
@@ -164,9 +162,9 @@ class CompressibleRANSModel:
     def laminar_viscosity(self, U):
         if self.viscosity_law == "constant":
             return self.mu_inf_const
-        inlet = self.flow.boundary_conditions['inlet']
+        ff = self.flow.farfield_conditions
         return sutherland_viscosity(U, self.flow.gamma, self.flow.n_mean, self.mu_inf_const,
-                                    inlet['p'] / inlet['rho'], self.sutherland_S_ratio)
+                                    ff['p'] / ff['rho'], self.sutherland_S_ratio)
 
     def eddy_viscosity(self, U):
         return self.turbulence_model.eddy_viscosity(U, self.laminar_viscosity(U), self.flow.n_mean)
@@ -182,9 +180,9 @@ class CompressibleRANSModel:
 
     def freestream(self):
         """The free-stream dict TurbulenceModel methods take."""
-        inlet = self.flow.boundary_conditions['inlet']
-        return {"rho": inlet['rho'], "p": inlet['p'], "c": inlet['c'], "M": inlet['M'],
-                "speed": inlet['M'] * inlet['c'], "mu": self.mu_inf_const}
+        ff = self.flow.farfield_conditions
+        return {"rho": ff['rho'], "p": ff['p'], "c": ff['c'], "M": ff['M'],
+                "speed": ff['M'] * ff['c'], "mu": self.mu_inf_const}
 
     def _freestream_extras(self):
         return self.turbulence_model.freestream_values(self.freestream())
@@ -197,9 +195,7 @@ class CompressibleRANSModel:
 
     def _boundary_scalars(self, kind, U, inflow):
         nm = self.flow.n_mean
-        if kind == "inflow":
-            return self._freestream_extras()
-        if kind in ("outflow", "slip"):
+        if kind == "slip":
             return extra_components(U, nm)
         if kind == "farfield":
             return [ufl.conditional(inflow, s_inf, s)

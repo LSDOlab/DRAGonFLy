@@ -35,7 +35,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", choices=("euler", "rans"), default="euler")
     parser.add_argument("--mesh", default=None)
-    parser.add_argument("--farfield", choices=("split", "riemann"), default="split")
     args = parser.parse_args()
 
     if args.model == "rans":
@@ -49,8 +48,7 @@ if __name__ == '__main__':
         mesh_from_file = xdmf.read_mesh()
 
     attack = np.radians(2.0)
-    boundary_dict = {'inlet': {'rho': 1.0, 'M': mach, 'p': 1.0, 'alpha': attack},
-                     'outlet': {'p': 1.0}}
+    boundary_dict = {'rho': 1.0, 'M': mach, 'p': 1.0, 'alpha': attack}
 
     # No shape parameterization: no FFD block, no mesh warper -- a forward analysis.
     recorder = csdl.Recorder(inline=False)
@@ -59,7 +57,7 @@ if __name__ == '__main__':
                                      moments=[("pitch", (0.25, 0.), "pitch")],
                                      mesh_inner_bdry_function=airfoil_inner_bdry_function,
                                      poly_order=0, filename_suffix="airfoil_analysis_" + args.model,
-                                     farfield=args.farfield, **model_kwargs)
+                                     **model_kwargs)
     windtunnel.euler_residual_conv_limit = 1e-12
     windtunnel.max_newton_iterations = 400
     windtunnel.set_up_sim()

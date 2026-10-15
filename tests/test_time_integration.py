@@ -12,7 +12,7 @@ from dragonfly_sim.core.time_integration import bdf_coefficients, CFLController,
 from dragonfly_sim.core.farfield import TransverseFarfield
 from dragonfly_sim.utils.checkpoint import save_checkpoint, load_checkpoint
 
-from cases import euler_channel_model, seed_mean_flow, FREESTREAM, INLET_TAG, OUTLET_TAG, WALL_TAG
+from cases import euler_channel_model, seed_mean_flow, FREESTREAM, WALL_TAG
 
 
 # ----------------------------------------------------------------------
@@ -130,10 +130,10 @@ def _farfield_square(n=6, transverse=False, beta=0.0):
     model = CompressibleEulerModel(mesh_obj)
     model.residual_conv_limit, model.max_newton_iterations = 1e-10, 50
     model.report_positivity_limiter = False
-    model.define_inlet_outlet_conditions(FREESTREAM)
+    model.define_farfield_conditions(FREESTREAM)
     model.define_elements_functionspaces()
     model.define_trial_testfunctions()
-    model.compute_initial_conditions_from_inlet()
+    model.compute_initial_conditions_from_farfield()
     model.interpolate_solution_vector()
     tf = TransverseFarfield(model, 6, beta=beta, relax_length=1.0) if transverse else None
     model.define_farfield_bc(6, transverse=tf)
@@ -271,7 +271,7 @@ def test_ptc_warm_start_continues_at_the_final_cfl():
         assert model.solver_converged
         cold_steps = integrator.last_steady_steps
         assert cold_steps > 3
-        alpha = model.boundary_conditions['inlet']['alpha']
+        alpha = model.farfield_conditions['alpha']
         model.set_angle_of_attack(alpha + np.radians(0.05))
         model.solve_system()
         assert model.solver_converged

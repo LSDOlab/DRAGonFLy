@@ -59,9 +59,9 @@ class MUSCLEulerModel(CompressibleEulerModel):
 
     def _limiter_scales(self):
         """Free-stream magnitude of each state component (van Albada limiter)."""
-        inlet = self.boundary_conditions['inlet']
-        rho, p = inlet['rho'], inlet['p']
-        speed = inlet['M'] * inlet['c']
+        ff = self.farfield_conditions
+        rho, p = ff['rho'], ff['p']
+        speed = ff['M'] * ff['c']
         return ([rho] + [rho * speed] * self.dimensions
                 + [p / (self.gamma - 1.0) + 0.5 * rho * speed**2])
 

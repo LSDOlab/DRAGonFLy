@@ -171,7 +171,7 @@ class GreenGaussGradient(DerivedField):
         m = self.rec.model
         n = m.u_vec.x.petsc_vec.local_size
         return (np.array(m.u_vec.x.array[:n], copy=True), np.array(m.mesh_obj.mesh.geometry.x, copy=True),
-                float(m.boundary_conditions['inlet']['alpha']))
+                float(m.farfield_conditions['alpha']))
 
     def _same_key(self, key):
         a, b = self._cache["key"], key

@@ -2,7 +2,9 @@
 Regenerate euler_reference.npz, the bit-level guard for the default Euler path.
 
 The reference was generated on branch main @ ccca26b, BEFORE the RANS / time
-integration / far-field work, and must not be regenerated casually: the
+integration / far-field work, and regenerated once when the channel's far
+sides became the characteristic far field (see test_euler_regression.py). It
+must not be regenerated casually: the
 point of tests/test_euler_regression.py is that the default Euler forms stay
 the same expressions. Only regenerate after a deliberate, reviewed change
 to the Euler discretization.

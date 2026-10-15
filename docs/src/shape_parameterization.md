@@ -22,7 +22,7 @@ u_vec = model.evaluate(model.deform_mesh(), shape_parameters, alpha)
 tapered or swept wing, pass a `block_corner_list`: two rectangular end surfaces (root and tip), each given by
 two opposite corners, e.g.
 `[[(-0.1, 0., 0.32), (5.1, 0., -0.3)], [(7.4, 14.1, 0.32), (9.1, 14.1, -0.3)]]`.
-Without an explicit `mesh_inner_bdry_function`, the model uses the block corners to find the wall facets.
+Without an explicit `mesh_inner_bdry_function` or `wall_tags`, the model uses the block corners to find the wall facets.
 
 ## Layers
 The design variables come from the layers, which are applied in order and declared in order:

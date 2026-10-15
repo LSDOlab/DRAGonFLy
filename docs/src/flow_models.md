@@ -120,8 +120,7 @@ number of ranks.
 
 | Option | Boundary condition |
 |---|---|
-| Inflow/outflow split | Subsonic inflow and outflow states, split by a plane normal to the free stream. The default, and what `DG_windtunnel_model(farfield="split")` uses. Fixed states reflect outgoing acoustic waves. |
-| `define_farfield_bc(tag)` (`"riemann"`) | The characteristic state from the Riemann invariants on the whole outer boundary. Outgoing waves leave exactly at normal incidence. The free stream is preserved exactly. Usable steady and unsteady, and with the windtunnel (`farfield="riemann"`). |
+| `define_farfield_bc(tag)` (`"riemann"`) | The characteristic state from the Riemann invariants on the whole outer boundary: the far field of `DG_windtunnel_model` and the default of `examples/flow_analysis.py`. It takes the free-stream state `{'rho', 'p', 'M', 'alpha'}` only; no inflow/outflow division is made, so the angle of attack can change freely. Outgoing waves leave exactly at normal incidence. The free stream is preserved exactly. Usable steady and unsteady. |
 | `TransverseFarfield` (`"riemann2"`, 2D, unsteady) | Adds the transverse terms of the incoming characteristic (Engquist-Majda / Higdon type, $\beta = 1/2$). They are integrated explicitly with the time integrator's BDF coefficients. At p = 0 the tangential derivatives come from a Green-Gauss gradient. |
 
 On the NACA 0012 quadrilateral mesh (far field 50 chords out, Euler, $M = 0.6$, p = 0), `riemann2` cuts the

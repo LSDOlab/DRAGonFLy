@@ -33,8 +33,8 @@ one plain `solve_forward`, then a CSDL graph with the angle of attack as its onl
 $dD/d\alpha$ and $dL/d\alpha$.
 
 ## `flow_analysis.py`: steady and unsteady analysis
-Euler, laminar or SA-neg RANS from any XDMF mesh or structured CGNS grid (`--mesh`), steady (PTC) or unsteady (`--unsteady`, BDF2, optional
-`--dual-time`), with the split, `riemann` or `riemann2` far field. Writes `result.csv` or `history.csv`, wall
+Euler, laminar or SA-neg RANS from any XDMF or gmsh mesh or structured CGNS grid (`--mesh`; see [Meshes](meshes.md)), steady (PTC) or unsteady (`--unsteady`, BDF2, optional
+`--dual-time`), with the `riemann` (default) or `riemann2` far field. Writes `result.csv` or `history.csv`, wall
 $C_p$/$c_f$ files, optional VTX fields, and a checkpoint for `--restart`. See `--help`.
 
 ## `wing_opt.py`: 3D wing

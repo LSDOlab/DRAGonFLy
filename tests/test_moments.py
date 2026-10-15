@@ -253,7 +253,7 @@ def test_3D_csdl_alpha_derivative(in_tmp_dir):
     wt = make_windtunnel_3d()
     names = [spec[0] for spec in MOMENTS_3D]
     totals = alpha_totals(wt, names)
-    a0, h = BC['inlet']['alpha'], 1e-5
+    a0, h = BC['alpha'], 1e-5
     Mp = wt.solve_forward(a0 + h)[2]["moments"]
     Mm = wt.solve_forward(a0 - h)[2]["moments"]
     for n in names:
@@ -265,7 +265,7 @@ def alpha_totals(wt, names):
     """CSDL graph of the forward solve and the moments: the totals dM/dalpha."""
     recorder = csdl.Recorder(inline=False)
     recorder.start()
-    alpha = csdl.Variable(name='alpha', value=np.array([BC['inlet']['alpha']]))
+    alpha = csdl.Variable(name='alpha', value=np.array([BC['alpha']]))
     alpha.set_as_design_variable()
     u_vec = wt.evaluate(alpha=alpha)
     out = wt.postprocessor.evaluate(u_vec, alpha=alpha)
@@ -297,7 +297,7 @@ def test_csdl_alpha_derivative_of_several_moments(kind, in_tmp_dir):
     names = [spec[0] for spec in MOMENTS]
     totals = alpha_totals(wt, names)
     # h = 1e-5: the pitching moment is small, and at 1e-6 the differences drown in the flow solver's tolerance
-    a0, h = BC['inlet']['alpha'], 1e-5
+    a0, h = BC['alpha'], 1e-5
     Mp = wt.solve_forward(a0 + h)[2]["moments"]
     Mm = wt.solve_forward(a0 - h)[2]["moments"]
     M0 = wt.solve_forward(a0)[2]["moments"]

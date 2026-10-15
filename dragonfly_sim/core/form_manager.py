@@ -106,7 +106,7 @@ class FormManager:
         from it belongs to this class.
 
         Unlike dx/dS this measure comes back UNrestricted, because every call
-        site applies its own tag: ds(WALL_TAG), ds(INLET_TAG), ...
+        site applies its own tag: ds(WALL_TAG), ds(FARFIELD_TAG), ...
         """
         if self.mesh_obj.meshtags is None:
             raise RuntimeError(

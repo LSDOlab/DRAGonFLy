@@ -125,8 +125,8 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
             self.force_scale = 1.0
             self.moment_scale = 1.0
 
-        rho_in = dolfinx.fem.Constant(self.mesh_obj.mesh, self.sim_model.boundary_conditions['inlet']['rho'])
-        u_ref = self.sim_model.boundary_conditions['inlet']['u_ref']
+        rho_in = dolfinx.fem.Constant(self.mesh_obj.mesh, self.sim_model.farfield_conditions['rho'])
+        u_ref = self.sim_model.farfield_conditions['u_ref']
 
         self._S_ref_const = dolfinx.fem.Constant(self.mesh_obj.mesh, self._compute_S_ref())
         self._chord_ref_const = dolfinx.fem.Constant(self.mesh_obj.mesh, self._compute_chord_ref(self._S_ref_const.value))
@@ -134,11 +134,11 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
         self.C_infty = 0.5*rho_in*(u_ref**2)*self._S_ref_const
 
         # Drag and lift vector directions
-        self.psi_drag = self.sim_model.boundary_conditions['outlet']['n']
+        self.psi_drag = self.sim_model.farfield_conditions['flow_dir']
         self.psi_lift = dolfinx.fem.Constant(
             self.mesh_obj.mesh, np.zeros((self.sim_model.dimensions,), dtype=np.double))
 
-        self.set_angle_of_attack(self.sim_model.boundary_conditions['inlet']['alpha'])
+        self.set_angle_of_attack(self.sim_model.farfield_conditions['alpha'])
 
     def _compute_S_ref(self):
         # Compute the reference area or chord length for force, moment coefficient calculation
@@ -179,7 +179,7 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
         # NOTE: The drag vector direction is handled differently, and is propagated automatically
         self.sim_model.set_angle_of_attack(alpha)
 
-        inflow_vec = self.sim_model.boundary_conditions['inlet']['inflow_angle']
+        inflow_vec = self.sim_model.farfield_conditions['inflow_angle']
         if self.sim_model.dimensions == 2:
             lift_unit_vec = np.array([-inflow_vec[1], inflow_vec[0]], dtype=np.double)
         elif self.sim_model.dimensions == 3:

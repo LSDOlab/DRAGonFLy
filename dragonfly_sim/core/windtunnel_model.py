@@ -32,20 +32,34 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
     ordered_callbacks = True
 
     def __init__(self, mesh, boundary_dict, shape_parameterization=None, moments=None,
-                 mesh_inner_bdry_function=None,
+                 mesh_inner_bdry_function=None, wall_tags=None, symmetry_tags=None,
                  poly_order=1, gamma=1.4,
                  filename_suffix="test",
                  asm_overlap=None, ilu_levels=None,
-                 model_class=CompressibleEulerModel, model_kwargs=None, farfield="split",
+                 model_class=CompressibleEulerModel, model_kwargs=None,
                  reduced_order_model=None):
         """
-        The shape of the object being optimized is defined either through `mesh_inner_bdry_function`
-        or through the shape parameterization's FFD block corners
-        (shape_parameterization.inner_boundary_function()), which bound the box
-        the inner boundary facets are contained in and can therefore supply the
-        same signal. At least one of the two is required; when both are given
-        the explicit function wins, since it can encode exclusions the FFD block
-        cannot.
+        boundary_dict: the free-stream state {'rho', 'p', 'M', 'alpha'} (density,
+        pressure, Mach number, angle of attack in rad). The whole outer boundary
+        is a characteristic far field built from it, so the angle of attack can
+        change by any amount during an optimization; there is no inflow/outflow
+        division to choose or to keep valid.
+
+        The shape of the object being optimized (the wall) is defined in one of
+        three ways, in this order of precedence:
+        1. `mesh_inner_bdry_function`, a function of the boundary facet midpoints
+           (shape (dim, n)) returning a boolean wall mask. It can encode
+           exclusions the FFD block cannot. If the mesh also carries boundary
+           facet tags (utils/mesh_io_utils.py:load_dolfinx_mesh stores them on
+           the mesh), a warning lists them: they could be used instead.
+        2. `wall_tags`: the mesh's boundary facet tags (values or names, one or
+           several) that are the wall, and `symmetry_tags` those that are
+           symmetry planes (slip walls). Every other boundary is far field.
+           In 3D without tags, the symmetry plane is y = 0.
+        3. The shape parameterization's FFD block corners
+           (shape_parameterization.inner_boundary_function()), which bound the
+           box the inner boundary facets are contained in.
+        At least one is required.
 
         shape_parameterization: the wall-shape parameterization, e.g. a
         shape_design.FFDShapeParameterization -- the FFD block and the layers
@@ -69,11 +83,6 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         (the default) or e.g. core.RANS_model.CompressibleRANSModel with
         model_kwargs={'Re': 6e6}. The body's wall is the model's
         define_wall_bc (slip for Euler, adiabatic no-slip for RANS).
-
-        farfield: "split" divides the outer boundary into a subsonic inflow
-        and outflow perpendicular to the free stream (the default); "riemann"
-        puts the characteristic far field (define_farfield_bc) on all of it,
-        which needs no split and so no guard on large alpha changes.
 
         reduced_order_model: a core.reduced_order_model.ReducedOrderModel to
         try before every flow solve (see _solve), or None for full-order
@@ -111,19 +120,17 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
                             "(e.g. shape_design.FFDShapeParameterization), got {!r}. The FFD "
                             "block arguments (ffd_shape, ffd_degree, ffd_block_corner_list, "
                             "cp_coord_opt_idxs) moved there.".format(shape_parameterization))
-        if mesh_inner_bdry_function is None and shape_parameterization is not None:
+        if mesh_inner_bdry_function is None and wall_tags is None and shape_parameterization is not None:
             mesh_inner_bdry_function = shape_parameterization.inner_boundary_function()
-        if mesh_inner_bdry_function is None:
-            raise ValueError("Provide either mesh_inner_bdry_function or a shape "
-                             "parameterization with FFD block corners to locate the inner "
-                             "boundary facets.")
+        if mesh_inner_bdry_function is None and wall_tags is None:
+            raise ValueError("Provide either mesh_inner_bdry_function, wall_tags (the mesh's own "
+                             "boundary tags) or a shape parameterization with FFD block corners "
+                             "to locate the inner boundary facets.")
 
         # Initial instantiation of mesh and simulation model
         self.mesh = Mesh(mesh, mesh_inner_bdry_function,
-                         node_match_tol=self.mesh_node_match_tol)
-        if farfield not in ("split", "riemann"):
-            raise ValueError("farfield must be 'split' or 'riemann'")
-        self.farfield = farfield
+                         node_match_tol=self.mesh_node_match_tol,
+                         wall_tags=wall_tags, symmetry_tags=symmetry_tags)
         if model_class is CompressibleEulerModel:
             _euler_kwargs = dict(poly_order=poly_order, gamma=gamma)
             self.sim_model = CompressibleEulerModel(self.mesh, **_euler_kwargs)
@@ -226,11 +233,9 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         self.moments = moments
 
         # Dolfinx mesh tags for the various boundaries
-        self.INLET_TAG = 3  # flow inlet
-        self.OUTLET_TAG = 4  # flow outlet
         self.WALL_TAG = 2  # walls (including wing/airfoil boundaries)
-        self.SYMMETRY_TAG = 5  # symmetry, only used in 3D thus far
-        self.FARFIELD_TAG = 6  # characteristic far field (farfield="riemann")
+        self.SYMMETRY_TAG = 5  # symmetry planes (3D: y = 0, or the mesh's symmetry_tags)
+        self.FARFIELD_TAG = 6  # characteristic far field: the whole outer boundary
 
         # global evaluation index of solve_residual_equations
         self.eval_idx = 0
@@ -240,46 +245,37 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         self.sim_model.residual_conv_limit = self.euler_residual_conv_limit
         self.sim_model.max_newton_iterations = self.max_newton_iterations
 
-        # use the boundary condition dictionary to define inlet and outlet BCs
-        self.sim_model.define_inlet_outlet_conditions(self.boundary_condition_dict)
+        # use the free-stream dictionary to define the far-field conditions
+        self.sim_model.define_farfield_conditions(self.boundary_condition_dict)
 
         # compute boundary facet boolean arrays
         inner_facets = self.mesh.inner_bdry_facet_mask
         
         # Find the symmetry face facets (only relevant in 3D at the moment)
         # NOTE: The symmetry plane is currently hardcoded at y=0
-        if self.sim_model.dimensions == 3:
+        has_symmetry = self.mesh.symmetry_facet_mask is not None or self.sim_model.dimensions == 3
+        if self.mesh.symmetry_facet_mask is not None:
+            symmetry_facets = self.mesh.symmetry_facet_mask  # from the mesh's boundary tags
+        elif self.sim_model.dimensions == 3:
             symmetry_facets = self.mesh.bdry_midpoints[:, 1] <= 1e-6
         else:
             symmetry_facets = np.array([False]*inner_facets.shape[0])
 
-        # Next we split the outer boundaries into inlet and outlet; 
-        # the dividing line is perpendicular to the inflow angle due to angle of attack.
-        # NOTE: This is fixed under angle of attack changes, 
-        # so could be a source of error for large angle of attack changes
-        mesh_x_max, mesh_x_min = self.mesh.mesh.comm.allreduce(self.mesh.mesh.geometry.x[:, 0].max(), MPI.MAX), self.mesh.mesh.comm.allreduce(self.mesh.mesh.geometry.x[:, 0].min(), MPI.MIN)
-
-        alpha_tagging = self.boundary_condition_dict['inlet']['alpha']
-        inlet_outlet_bdry = -np.tan(alpha_tagging)*self.mesh.bdry_midpoints[:, 2] + (mesh_x_max + mesh_x_min) / 2
-
-        inlet_facets = (self.mesh.bdry_midpoints[:, 0] <= inlet_outlet_bdry) & ~np.asarray(inner_facets, dtype=bool) & ~np.asarray(symmetry_facets, dtype=bool)
-        outlet_facets = (self.mesh.bdry_midpoints[:, 0] > inlet_outlet_bdry) & ~np.asarray(inner_facets, dtype=bool) & ~np.asarray(symmetry_facets, dtype=bool)
-        if self.farfield == "riemann":
-            farfield_facets = inlet_facets | outlet_facets
+        # Everything that is neither wall nor symmetry plane is far field. The
+        # characteristic far-field state decides facet by facet whether the flow
+        # enters or leaves, so no inflow/outflow division (and nothing to
+        # re-tag when the angle of attack changes) is needed.
+        farfield_facets = ~np.asarray(inner_facets, dtype=bool) & ~np.asarray(symmetry_facets, dtype=bool)
 
         # Print the local number of facets of each type for each MPI rank
         PETSc.Sys.syncPrint("Rank {}, number of wing boundary facets: {}".format(self.mesh.mesh.comm.Get_rank(), np.count_nonzero(inner_facets)))
         PETSc.Sys.syncPrint("Rank {}, number of symmetry facets: {}".format(self.mesh.mesh.comm.Get_rank(), np.count_nonzero(symmetry_facets)))
-        PETSc.Sys.syncPrint("Rank {}, number of inlet facets: {}".format(self.mesh.mesh.comm.Get_rank(), np.count_nonzero(inlet_facets)))
-        PETSc.Sys.syncPrint("Rank {}, number of outlet facets: {}".format(self.mesh.mesh.comm.Get_rank(), np.count_nonzero(outlet_facets)))
+        PETSc.Sys.syncPrint("Rank {}, number of far-field facets: {}".format(self.mesh.mesh.comm.Get_rank(), np.count_nonzero(farfield_facets)))
         PETSc.Sys.syncFlush()
 
         # Pair the boundary facet sets with the various mesh tags
-        if self.farfield == "riemann":
-            bdry_meshtags_and_ds_list = [(farfield_facets, self.FARFIELD_TAG), (inner_facets, self.WALL_TAG)]
-        else:
-            bdry_meshtags_and_ds_list = [(inlet_facets, self.INLET_TAG), (outlet_facets, self.OUTLET_TAG), (inner_facets, self.WALL_TAG)]
-        if self.sim_model.dimensions == 3:
+        bdry_meshtags_and_ds_list = [(farfield_facets, self.FARFIELD_TAG), (inner_facets, self.WALL_TAG)]
+        if has_symmetry:
             bdry_meshtags_and_ds_list += [(symmetry_facets, self.SYMMETRY_TAG)]
 
         # Build the boundary facet tags and define the corresponding quadrature measure
@@ -287,20 +283,13 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         self.mesh.form_manager.build_boundary_measure(
             measure_metadata={'quadrature_degree': 3*self.poly_order + 1})
 
-        # The inlet-outlet split above is now frozen in the meshtags; arm the guard in
-        # CompressibleEulerModel.set_angle_of_attack against it. The
-        # characteristic far field has no split to guard.
-        self.sim_model.alpha_tagging = alpha_tagging if self.farfield == "split" else None
-
         self.mesh.configure_output(self.filename_suffix,
                                    deformation=self.shape_parameterized and self.write_mesh_deformation)
 
         if self.shape_parameterized:
             # The JAX-based IDWarp implementation as mesh warper
-            anchors = ((self.FARFIELD_TAG,) if self.farfield == "riemann"
-                       else (self.INLET_TAG, self.OUTLET_TAG))
             self.mesh_warper = IDWarp_jax(self.mesh, wall_meshtag_val=self.WALL_TAG,
-                                          anchor_meshtag_vals=anchors)
+                                          anchor_meshtag_vals=(self.FARFIELD_TAG,))
 
             PETSc.Sys.Print("Initialized mesh warping object")
 
@@ -322,7 +311,7 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         # Define the required Dolfinx objects for the simulation, including the initial conditions
         self.sim_model.define_elements_functionspaces()
         self.sim_model.define_trial_testfunctions()
-        self.sim_model.compute_initial_conditions_from_inlet()
+        self.sim_model.compute_initial_conditions_from_farfield()
         self.sim_model.interpolate_solution_vector()
 
         # We output the facet mesh tags to an xdmf file, so we can inspect the BCs in paraview
@@ -334,13 +323,9 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
             xdmf.write_meshtags(self.mesh.meshtags, self.mesh.mesh.geometry)
 
         # Define the boundary condition terms of the Euler weak form
-        if self.farfield == "riemann":
-            self.sim_model.define_farfield_bc(self.FARFIELD_TAG)
-        else:
-            self.sim_model.define_subsonic_inflow_bc(self.INLET_TAG)
-            self.sim_model.define_subsonic_outflow_bc(self.OUTLET_TAG)
+        self.sim_model.define_farfield_bc(self.FARFIELD_TAG)
         self.sim_model.define_wall_bc(self.WALL_TAG)
-        if self.sim_model.dimensions == 3:
+        if has_symmetry:
             self.sim_model.define_slipwall_bc(self.SYMMETRY_TAG)
 
         # Construct the Euler weak form for forward evaluation
@@ -450,7 +435,7 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
             self.postprocessor.set_angle_of_attack(alpha)
         self.sim_model.compute_weakform()
         solution, converged = self._solve(
-            self._parameter_vector(None, self.sim_model.boundary_conditions['inlet']['alpha']))
+            self._parameter_vector(None, self.sim_model.farfield_conditions['alpha']))
         self.sim_model.last_solve_converged = converged
         if np.isfinite(np.linalg.norm(solution)):
             self.previous_solution = solution

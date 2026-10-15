@@ -92,7 +92,6 @@ def parse_args():
     p.add_argument("--Re", type=float, default=3e6, help="Reynolds number based on the chord")
     p.add_argument("--T-inf", type=float, default=271.0,
                    help="static free-stream temperature [K] (Sutherland); DPW8 test case 1a: 271 K")
-    p.add_argument("--farfield", choices=("split", "riemann"), default="split")
     p.add_argument("--mesh-dir", default=MESH_DIR)
     # steady solver
     p.add_argument("--cfl0", type=float, default=5.0)
@@ -332,11 +331,10 @@ def first_order_state(msh, args, alpha, kind):
     can be filled cell by cell. The model is freed before returning.
     """
     if kind == "euler":
-        mesh_obj, model, _ = build_model(msh, model="euler", mach=args.mach, alpha_deg=alpha,
-                                         farfield=args.farfield)
+        mesh_obj, model, _ = build_model(msh, model="euler", mach=args.mach, alpha_deg=alpha)
     else:
         mesh_obj, model, _ = build_model(msh, model="sa", mach=args.mach, alpha_deg=alpha, Re=args.Re,
-                                         T_inf=args.T_inf, farfield=args.farfield, muscl=False)
+                                         T_inf=args.T_inf, muscl=False)
     model.report_positivity_limiter = args.report_limiter
     model.krylov_rtol = args.krylov_rtol
     model.use_ptc = True
@@ -393,7 +391,7 @@ def solve_case(msh, args, alpha, n_wall_edges):
                             "from its last state anyway")
     limiter, limiter_eps = resolve_limiter(args)
     mesh_obj, model, _ = build_model(msh, model=args.model, mach=args.mach, alpha_deg=alpha, Re=args.Re,
-                                     T_inf=args.T_inf, farfield=args.farfield, limiter=limiter,
+                                     T_inf=args.T_inf, limiter=limiter,
                                      limiter_eps=limiter_eps, euler_muscl=euler_muscl(args))
     PETSc.Sys.Print("model {}{}: MUSCL limiter {} (eps {})".format(
         args.model, " with MUSCL" if args.model == "euler" and euler_muscl(args) else "",
@@ -455,8 +453,8 @@ def main():
     run_dir = comm.bcast(run_dir, root=0)
     csv_path = os.path.join(run_dir, "results.csv")
     PETSc.Sys.Print("=" * 72)
-    PETSc.Sys.Print("OAT15A: {} grids {}, alpha {} deg, M={}, Re={:g}, T={} K, far field {}, {} ranks".format(
-        args.mesh_family, args.grids, args.alphas, args.mach, args.Re, args.T_inf, args.farfield, comm.size))
+    PETSc.Sys.Print("OAT15A: {} grids {}, alpha {} deg, M={}, Re={:g}, T={} K, {} ranks".format(
+        args.mesh_family, args.grids, args.alphas, args.mach, args.Re, args.T_inf, comm.size))
     PETSc.Sys.Print("Output: {}".format(run_dir))
     PETSc.Sys.Print("=" * 72)
 
@@ -481,7 +479,7 @@ def main():
             save_checkpoint(os.path.join(run_dir, "solution_grid{}_a{}.npz".format(g, alpha)), [model.u_vec],
                             {"mesh_family": args.mesh_family, "grid": g, "mesh": os.path.abspath(mesh_path),
                              "alpha": alpha, "mach": args.mach, "Re": args.Re, "T_inf": args.T_inf,
-                             "farfield": args.farfield, "chord_file_units": info["chord"],
+                             "chord_file_units": info["chord"],
                              "converged": bool(rec["converged"])})
             if args.write_fields:
                 field_writer(model, run_dir, prefix="grid{}_a{}_".format(g, alpha))()
