@@ -17,7 +17,7 @@ Navier-Stokes (RANS) equations, steady or unsteady. It is distributed as `dragon
   finite-volume scheme. Euler uses HLL, HLLC or local Lax-Friedrichs fluxes. RANS adds a Green-Gauss gradient
   reconstruction, MUSCL inviscid fluxes and adiabatic no-slip walls. Turbulence closures are plug-ins
   (`TurbulenceModel`).
-- **Boundary conditions**: subsonic inflow/outflow, a characteristic (Riemann) far field, and in 2D an unsteady
+- **Boundary conditions**: a characteristic (Riemann) far field set by the free-stream state alone, and in 2D an unsteady
   far field with transverse terms that reduces reflections; slip and no-slip walls; symmetry planes.
 - **Solvers**: Newton's method (PETSc SNES) with a positivity-preserving step limiter, and GMRES/FGMRES with
   additive-Schwarz/ILU preconditioning (or MUMPS). Steady solves can use pseudo-transient continuation with an

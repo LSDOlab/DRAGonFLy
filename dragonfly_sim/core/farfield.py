@@ -91,15 +91,15 @@ class TransverseFarfield:
         self.gamma = gamma = model.gamma
         self.n = mesh_obj.n
         self.farfield_tag = farfield_tag
-        inlet_bc = model.boundary_conditions['inlet']
+        ff_bc = model.farfield_conditions
         V_s = model.functionspaces["V_scalar"]
         self.delta_n = dolfinx.fem.Function(V_s, name="ff_delta_n")
         self.delta_nm1 = dolfinx.fem.Function(V_s, name="ff_delta_nm1")
         self.delta_next = dolfinx.fem.Function(V_s, name="ff_delta_next")
         self.functions = [self.delta_n, self.delta_nm1]
         if K is None:
-            K = relax_sigma * (gamma * inlet_bc['p'] / inlet_bc['rho']) ** 0.5 \
-                * (1.0 - inlet_bc['M'] ** 2) / relax_length
+            K = relax_sigma * (gamma * ff_bc['p'] / ff_bc['rho']) ** 0.5 \
+                * (1.0 - ff_bc['M'] ** 2) / relax_length
         self.beta, self.K = float(beta), float(K)
         # this boundary equation's own copies of the step size and BDF
         # coefficients, set in prepare()
@@ -121,8 +121,8 @@ class TransverseFarfield:
             self.G_nm1 = dolfinx.fem.Function(V_G, name="ff_grad_nm1")
             self.functions += [self.G_n, self.G_nm1]
 
-        c_inf = (gamma * inlet_bc['p'] / inlet_bc['rho']) ** 0.5
-        self.R_in = ufl.dot(inlet_bc['u'], self.n) - 2.0 * c_inf / (gamma - 1.0) \
+        c_inf = (gamma * ff_bc['p'] / ff_bc['rho']) ** 0.5
+        self.R_in = ufl.dot(ff_bc['u'], self.n) - 2.0 * c_inf / (gamma - 1.0) \
             + self.delta_next
         self._exprs = None
         self._setup_projection(mesh_obj, V_s)

@@ -9,8 +9,15 @@
   centres and the wall distance.
 - One time-integration module for steady pseudo-transient continuation, unsteady BDF1/BDF2 and dual time
   (`core/time_integration.py`); opt-in for the Euler model, PTC by default for RANS.
-- Characteristic far field (`define_farfield_bc`, `DG_windtunnel_model(farfield="riemann")`) and its unsteady
-  transverse refinement (`TransverseFarfield`, 2D).
+- Characteristic far field (`define_farfield_bc`) and its unsteady transverse refinement (`TransverseFarfield`, 2D).
+  It is the only far field of `DG_windtunnel_model` and the default of `examples/flow_analysis.py`. The inflow/outflow
+  split is removed, and with it the 1 degree limit on changes of the angle of attack. Breaking changes: the
+  boundary dictionary is the flat free-stream state `{'rho', 'p', 'M', 'alpha'}` (the `'inlet'`/`'outlet'` form
+  raises); `DG_windtunnel_model(farfield=...)`, `define_subsonic_inflow_bc`, `define_subsonic_outflow_bc`,
+  `subsonic_inflow_state`, `subsonic_outflow_state`, `INLET_TAG`/`OUTLET_TAG` and `alpha_tagging` are gone;
+  `define_inlet_outlet_conditions`, `boundary_conditions['inlet'|'outlet']` and
+  `compute_initial_conditions_from_inlet` became `define_farfield_conditions`, `farfield_conditions` (flat) and
+  `compute_initial_conditions_from_farfield`. The far field is subsonic: `M >= 1` raises.
 - Shape design variables as modular layers (`core/shape_design.py`): `DG_windtunnel_model` takes an
   `FFDShapeParameterization` (FFD block + layers) instead of `ffd_shape`, `ffd_degree`, `ffd_block_corner_list`
   and `cp_coord_opt_idxs`, and no longer depends on which variables exist; `model.deform_mesh()` gives the

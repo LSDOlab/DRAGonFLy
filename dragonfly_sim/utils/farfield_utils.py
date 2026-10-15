@@ -3,8 +3,8 @@ Characteristic (Riemann-invariant) far-field state.
 
 Used by CompressibleEulerModel.define_farfield_bc. It returns the inflow
 switch along with the state, so the caller can upwind any further
-transported scalars (turbulence variables) with it. Unlike the fixed
-inflow/outflow states, it lets outgoing acoustic waves leave the domain:
+transported scalars (turbulence variables) with it. Unlike a fixed
+free-stream state, it lets outgoing acoustic waves leave the domain:
 exact at normal incidence, partly reflecting at oblique incidence (see
 core/farfield.py for the transverse correction).
 """

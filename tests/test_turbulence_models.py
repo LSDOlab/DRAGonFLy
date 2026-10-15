@@ -92,7 +92,7 @@ def test_closures_plug_in(closure):
     its sources vanish."""
     model = rans_square_model(closure, n=4, jitter=0.0)
     assert model.n_state == 4 + closure.n_vars
-    model.compute_initial_conditions_from_inlet()
+    model.compute_initial_conditions_from_farfield()
     model.interpolate_solution_vector()
     model.define_farfield_bc(1)
     model.compute_weakform()

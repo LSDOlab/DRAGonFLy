@@ -12,10 +12,9 @@ from mpi4py import MPI
 from dragonfly_sim.core.mesh_manager import Mesh
 from dragonfly_sim.core.Euler_model import CompressibleEulerModel
 
-INLET_TAG, OUTLET_TAG, WALL_TAG, FARFIELD_TAG = 3, 4, 2, 6
+WALL_TAG, FARFIELD_TAG = 2, 6
 
-FREESTREAM = {'inlet': {'rho': 1.0, 'p': 1.0, 'M': 0.5, 'alpha': np.radians(2.0)},
-              'outlet': {'p': 1.0}}
+FREESTREAM = {'rho': 1.0, 'p': 1.0, 'M': 0.5, 'alpha': np.radians(2.0)}
 
 
 def jittered_square(n=8, comm=None, jitter=0.01, seed=3):
@@ -34,24 +33,22 @@ def jittered_square(n=8, comm=None, jitter=0.01, seed=3):
 
 
 def channel_tags(mesh_obj):
-    """Left side inlet, right side outlet, top and bottom slip walls."""
+    """Left and right sides far field, top and bottom slip walls."""
     mid = mesh_obj.bdry_midpoints
-    inlet = mid[:, 0] < 1e-8
-    outlet = mid[:, 0] > 1 - 1e-8
-    wall = ~(inlet | outlet)
-    return inlet, outlet, wall
+    farfield = (mid[:, 0] < 1e-8) | (mid[:, 0] > 1 - 1e-8)
+    return farfield, ~farfield
 
 
 def euler_channel_model(n=8, comm=None, quadrature_degree=1, bc_dict=FREESTREAM, build_weakform=True):
     """
-    The release Euler model on a jittered unit-square channel: subsonic
-    inflow on the left, subsonic outflow on the right, slip walls top and
+    The release Euler model on a jittered unit-square channel: the
+    characteristic far field on the left and right, slip walls top and
     bottom. Mirrors DG_windtunnel_model.set_up_sim's order of calls.
     """
     msh = jittered_square(n, comm)
     mesh_obj = Mesh(msh, lambda pts: np.zeros(pts.shape[1], dtype=bool))
-    inlet, outlet, wall = channel_tags(mesh_obj)
-    mesh_obj.tag_boundary_facets([(inlet, INLET_TAG), (outlet, OUTLET_TAG), (wall, WALL_TAG)])
+    farfield, wall = channel_tags(mesh_obj)
+    mesh_obj.tag_boundary_facets([(farfield, FARFIELD_TAG), (wall, WALL_TAG)])
     meta = {'quadrature_degree': quadrature_degree}
     mesh_obj.form_manager.build_boundary_measure(measure_metadata=meta)
     mesh_obj.form_manager.build_cell_and_interior_facet_measures(measure_metadata=meta)
@@ -59,13 +56,12 @@ def euler_channel_model(n=8, comm=None, quadrature_degree=1, bc_dict=FREESTREAM,
     model = CompressibleEulerModel(mesh_obj, poly_order=0)
     model.residual_conv_limit = 1e-9
     model.max_newton_iterations = 100
-    model.define_inlet_outlet_conditions(bc_dict)
+    model.define_farfield_conditions(bc_dict)
     model.define_elements_functionspaces()
     model.define_trial_testfunctions()
-    model.compute_initial_conditions_from_inlet()
+    model.compute_initial_conditions_from_farfield()
     model.interpolate_solution_vector()
-    model.define_subsonic_inflow_bc(INLET_TAG)
-    model.define_subsonic_outflow_bc(OUTLET_TAG)
+    model.define_farfield_bc(FARFIELD_TAG)
     model.define_slipwall_bc(WALL_TAG)
     if build_weakform:
         model.compute_weakform()
@@ -140,8 +136,8 @@ def rans_square_model(turbulence_model, n=6, comm=None, jitter=0.01, Re=50.0, qu
     mesh_obj.form_manager.build_boundary_measure(measure_metadata=meta)
     mesh_obj.form_manager.build_cell_and_interior_facet_measures(measure_metadata=meta)
     model = CompressibleRANSModel(mesh_obj, Re=Re, turbulence_model=turbulence_model, **rans_kwargs)
-    model.define_inlet_outlet_conditions(
-        {'inlet': {'rho': 1.0, 'M': 0.5, 'p': 1.0, 'alpha': 0.0}, 'outlet': {'p': 1.0}})
+    model.define_farfield_conditions(
+        {'rho': 1.0, 'M': 0.5, 'p': 1.0, 'alpha': 0.0})
     model.define_elements_functionspaces()
     model.define_trial_testfunctions()
     return model

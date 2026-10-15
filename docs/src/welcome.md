@@ -17,7 +17,7 @@ The Python package is distributed as `dragonfly-sim` and imported as `dragonfly_
   [RANS, time integration and far fields](src/flow_models.md)).
 - Steady solves with Newton's method and a positivity-preserving step limiter, optionally with pseudo-transient
   continuation; unsteady BDF1/BDF2 time stepping, with optional dual time stepping; checkpoint and restart.
-- Subsonic inflow/outflow and characteristic far fields; slip and adiabatic no-slip walls.
+- A characteristic far field set by the free-stream state; slip and adiabatic no-slip walls.
 - GMRES with additive-Schwarz/ILU preconditioning and parallel execution with MPI.
 - Free-form deformation (FFD) shape parameterization built from layers: control-point motions, sectional
   variables (camber, thickness, twist, ...) and wing planform variables (sweep, aspect ratio, root chord, taper

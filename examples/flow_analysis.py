@@ -58,7 +58,7 @@ RESTART_KEYS = ("mesh", "mach", "alpha", "Re", "model", "farfield")
 # does it, without the mesh warper, the FFD block and CSDL: a forward
 # analysis on a fixed mesh.
 # ----------------------------------------------------------------------
-WALL_TAG, INLET_TAG, OUTLET_TAG, SYMMETRY_TAG, FARFIELD_TAG = 2, 3, 4, 5, 6
+WALL_TAG, SYMMETRY_TAG, FARFIELD_TAG = 2, 5, 6
 
 GEOMETRIES = {
     # mesh_name: the XDMF grid name; aero_centre: moment reference point
@@ -77,16 +77,16 @@ def install_euler_muscl(flow, limiter=None, limiter_eps=1e-2):
     flow.problem.configure_snes(flow.solver.snes, "compact_pc") (the RANS model
     does this itself).
     """
-    inlet = flow.boundary_conditions['inlet']
-    speed = inlet['M'] * inlet['c']
-    scales = ([inlet['rho']] + [inlet['rho'] * speed] * flow.dimensions
-              + [inlet['p'] / (flow.gamma - 1.0) + 0.5 * inlet['rho'] * speed ** 2])
+    ff = flow.farfield_conditions
+    speed = ff['M'] * ff['c']
+    scales = ([ff['rho']] + [ff['rho'] * speed] * flow.dimensions
+              + [ff['p'] / (flow.gamma - 1.0) + 0.5 * ff['rho'] * speed ** 2])
     GreenGaussReconstruction(flow, muscl=True, limiter=limiter, limiter_eps=limiter_eps,
                              limiter_scales=lambda: scales).install()
 
 
 def build_model(dolfinx_mesh, model="sa", mach=0.5, alpha_deg=0.0, Re=6e6, geometry="airfoil",
-                farfield="split", gamma=1.4, T_inf=300.0, quadrature_degree=1,
+                farfield="riemann", gamma=1.4, T_inf=300.0, quadrature_degree=1,
                 asm_overlap=None, ilu_levels=None, direct=False, muscl=True, limiter=None,
                 limiter_eps=1e-2, jacobian_mode="compact_pc", ff_beta=0.5, ff_relax_length=50.0,
                 inner_bdry_function=None, euler_muscl=False):
@@ -97,9 +97,8 @@ def build_model(dolfinx_mesh, model="sa", mach=0.5, alpha_deg=0.0, Re=6e6, geome
               The Euler model is first-order (HLL); euler_muscl=True adds MUSCL
               reconstruction (see install_euler_muscl). The viscous models
               take muscl=True/False.
-    farfield  "split"    subsonic inflow/outflow split perpendicular to the
-                         free stream (DG_windtunnel_model's default)
-              "riemann"  characteristic far field on the whole outer boundary
+    farfield  "riemann"  characteristic far field on the whole outer boundary
+                         (DG_windtunnel_model's far field)
               "riemann2" riemann with the transverse correction (2D,
                          unsteady only; see core/farfield.py)
 
@@ -109,8 +108,8 @@ def build_model(dolfinx_mesh, model="sa", mach=0.5, alpha_deg=0.0, Re=6e6, geome
     TransverseFarfield for "riemann2" (attach it to the time integrator),
     else None.
     """
-    if farfield not in ("split", "riemann", "riemann2"):
-        raise ValueError("farfield must be split, riemann or riemann2")
+    if farfield not in ("riemann", "riemann2"):
+        raise ValueError("farfield must be riemann or riemann2")
     inner = inner_bdry_function or GEOMETRIES[geometry]["inner"]
     mesh_obj = Mesh(dolfinx_mesh, inner)
     if model == "euler":
@@ -128,10 +127,8 @@ def build_model(dolfinx_mesh, model="sa", mach=0.5, alpha_deg=0.0, Re=6e6, geome
     if ilu_levels is not None:
         flow.ilu_levels = ilu_levels
     alpha = np.radians(alpha_deg)
-    flow.define_inlet_outlet_conditions({'inlet': {'rho': 1.0, 'M': mach, 'p': 1.0, 'alpha': alpha},
-                                         'outlet': {'p': 1.0}})
+    flow.define_farfield_conditions({'rho': 1.0, 'M': mach, 'p': 1.0, 'alpha': alpha})
 
-    comm = dolfinx_mesh.comm
     inner_mask = np.asarray(mesh_obj.inner_bdry_facet_mask, dtype=bool)
     sym_tags = []
     outer = ~inner_mask
@@ -139,16 +136,7 @@ def build_model(dolfinx_mesh, model="sa", mach=0.5, alpha_deg=0.0, Re=6e6, geome
         sym = (mesh_obj.bdry_midpoints[:, 1] <= 1e-6) & ~inner_mask
         sym_tags = [(sym, SYMMETRY_TAG)]
         outer = outer & ~sym
-    if farfield == "split":
-        x = dolfinx_mesh.geometry.x
-        x_mid = 0.5 * (comm.allreduce(x[:, 0].max(), MPI.MAX) + comm.allreduce(x[:, 0].min(), MPI.MIN))
-        split = -np.tan(alpha) * mesh_obj.bdry_midpoints[:, 2] + x_mid
-        mesh_obj.tag_boundary_facets([((mesh_obj.bdry_midpoints[:, 0] <= split) & outer, INLET_TAG),
-                                      ((mesh_obj.bdry_midpoints[:, 0] > split) & outer, OUTLET_TAG),
-                                      (inner_mask, WALL_TAG)] + sym_tags)
-        flow.alpha_tagging = alpha
-    else:
-        mesh_obj.tag_boundary_facets([(outer, FARFIELD_TAG), (inner_mask, WALL_TAG)] + sym_tags)
+    mesh_obj.tag_boundary_facets([(outer, FARFIELD_TAG), (inner_mask, WALL_TAG)] + sym_tags)
     qd = {'quadrature_degree': quadrature_degree}
     mesh_obj.form_manager.build_boundary_measure(measure_metadata=qd)
     mesh_obj.form_manager.build_cell_and_interior_facet_measures(measure_metadata=qd)
@@ -157,17 +145,13 @@ def build_model(dolfinx_mesh, model="sa", mach=0.5, alpha_deg=0.0, Re=6e6, geome
     if model == "euler" and euler_muscl:
         install_euler_muscl(flow, limiter, limiter_eps)
     flow.define_trial_testfunctions()
-    flow.compute_initial_conditions_from_inlet()
+    flow.compute_initial_conditions_from_farfield()
     flow.interpolate_solution_vector()
     transverse = None
-    if farfield == "split":
-        flow.define_subsonic_inflow_bc(INLET_TAG)
-        flow.define_subsonic_outflow_bc(OUTLET_TAG)
-    else:
-        if farfield == "riemann2":
-            transverse = TransverseFarfield(flow, FARFIELD_TAG, beta=ff_beta,
-                                            relax_length=ff_relax_length)
-        flow.define_farfield_bc(FARFIELD_TAG, transverse=transverse)
+    if farfield == "riemann2":
+        transverse = TransverseFarfield(flow, FARFIELD_TAG, beta=ff_beta,
+                                        relax_length=ff_relax_length)
+    flow.define_farfield_bc(FARFIELD_TAG, transverse=transverse)
     flow.define_wall_bc(WALL_TAG)
     if sym_tags:
         flow.define_slipwall_bc(SYMMETRY_TAG)
@@ -189,8 +173,8 @@ class ForceCoefficients:
         self.model, self.comm = model, comm
         dim = msh.topology.dim
         gamma = model.gamma
-        inlet = model.boundary_conditions['inlet']
-        q_inf = 0.5 * inlet['rho'] * (inlet['M'] * inlet['c']) ** 2
+        ff = model.farfield_conditions
+        q_inf = 0.5 * ff['rho'] * (ff['M'] * ff['c']) ** 2
         n = mesh_obj.n
         ds = mesh_obj.form_manager.ds(wall_tag)
         drag_vec = model._inflow_direction_numpy(np.radians(alpha_deg))
@@ -233,7 +217,7 @@ def parse_args():
     p.add_argument("--alpha", type=float, default=2.0, help="angle of attack [deg]")
     p.add_argument("--Re", type=float, default=6e6)
     p.add_argument("--T-inf", type=float, default=300.0, help="free-stream temperature [K] (Sutherland)")
-    p.add_argument("--farfield", choices=("split", "riemann", "riemann2"), default="split")
+    p.add_argument("--farfield", choices=("riemann", "riemann2"), default="riemann")
     p.add_argument("--ff-beta", type=float, default=0.5, help="riemann2 transverse weight")
     p.add_argument("--ff-relax-length", type=float, default=50.0, help="riemann2 relaxation length")
     # numerics
@@ -279,13 +263,13 @@ def wall_writer(model, mesh_obj):
     if msh.topology.dim != 2:
         return lambda path: None
     fdim = 1
-    inlet = model.boundary_conditions['inlet']
-    q_inf = 0.5 * inlet['rho'] * (inlet['M'] * inlet['c']) ** 2
+    ff = model.farfield_conditions
+    q_inf = 0.5 * ff['rho'] * (ff['M'] * ff['c']) ** 2
     u, n = model.u_vec, mesh_obj.n
-    cp = (pressure(model.mean_flow(u), model.gamma) - inlet['p']) / q_inf
+    cp = (pressure(model.mean_flow(u), model.gamma) - ff['p']) / q_inf
     fields = [ufl.SpatialCoordinate(msh)[0], ufl.SpatialCoordinate(msh)[1], cp]
     if hasattr(model, "skin_friction_vector"):
-        drag_dir = ufl.as_vector(list(model._inflow_direction_numpy(inlet['alpha'])))
+        drag_dir = ufl.as_vector(list(model._inflow_direction_numpy(ff['alpha'])))
         fields.append(ufl.dot(model.skin_friction_vector(u, n, q_inf), drag_dir))
     facets = mesh_obj.meshtags.find(WALL_TAG)
     facets = facets[facets < msh.topology.index_map(fdim).size_local]

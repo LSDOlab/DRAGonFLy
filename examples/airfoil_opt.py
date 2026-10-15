@@ -38,14 +38,9 @@ if __name__ == '__main__':
     p_0 = 1.0
     attack = np.radians(2)
 
-    # inflow_angle is derived from alpha inside define_inlet_outlet_conditions,
+    # inflow_angle is derived from alpha inside define_farfield_conditions,
     # so alpha is the single source of truth for the freestream direction.
-    boundary_dict = {'inlet': {'rho': rho_0,
-                               'M': M_0,
-                               'p': p_0,
-                               'alpha': attack},
-                     'outlet': {'p': p_0}
-                     }
+    boundary_dict = {'rho': rho_0, 'M': M_0, 'p': p_0, 'alpha': attack}
 
     ffd_bspline_deg = [2, 2]
     ffd_shape = [5, 3]

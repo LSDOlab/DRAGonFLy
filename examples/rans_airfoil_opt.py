@@ -38,8 +38,7 @@ if __name__ == '__main__':
         mesh_from_file = xdmf.read_mesh()
 
     M_0, attack, Re = 0.7, np.radians(2.0), 6e6
-    boundary_dict = {'inlet': {'rho': 1.0, 'M': M_0, 'p': 1.0, 'alpha': attack},
-                     'outlet': {'p': 1.0}}
+    boundary_dict = {'rho': 1.0, 'M': M_0, 'p': 1.0, 'alpha': attack}
 
     ffd_bspline_deg = [2, 2]
     ffd_shape = [5, 3]

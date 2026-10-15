@@ -23,7 +23,7 @@ from dragonfly_sim.core.pod import PODBasis
 
 from cases import jittered_square
 
-BC = {'inlet': {'rho': 1.0, 'p': 1.0, 'M': 0.5, 'alpha': np.radians(2.0)}, 'outlet': {'p': 1.0}}
+BC = {'rho': 1.0, 'p': 1.0, 'M': 0.5, 'alpha': np.radians(2.0)}
 
 
 _WINDTUNNELS = []
@@ -81,7 +81,7 @@ def global_array(comm, local):
 def test_state_scales(in_tmp_dir):
     wt = make_windtunnel("euler")
     m = wt.sim_model
-    inlet = m.boundary_conditions['inlet']
+    inlet = m.farfield_conditions
     U = inlet['M'] * inlet['c']
     assert m.state_scales() == pytest.approx([1.0, U, U, 1.0 / 0.4 + 0.5 * U**2], rel=1e-14)
 
@@ -274,7 +274,7 @@ def test_lspg_recovers_a_solution_in_the_basis(in_tmp_dir, kind):
 # ----------------------------------------------------------------------
 # DG_windtunnel_model
 # ----------------------------------------------------------------------
-# alpha within the 1 degree of the inlet/outlet tagging angle (2 degrees). The
+# alpha close to the first snapshot's (2 degrees). The
 # ROM interpolating between two snapshots reaches eta ~3e-7 (Euler) and is
 # rejected; with three it reaches 1e-10 (Euler) / 5e-9 (RANS at Re 200)
 ALPHAS = (2.0, 2.6, 2.3, 2.1, 2.45)

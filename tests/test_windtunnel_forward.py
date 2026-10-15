@@ -4,7 +4,7 @@ a forward flow analysis on a fixed mesh, with and without a CSDL graph, and
 the adjoint derivative with respect to alpha against finite differences.
 
 The domain is a jittered unit square whose bottom side is the "body" wall;
-the rest of the boundary is the far field, split into inflow and outflow.
+the rest of the boundary is the characteristic far field.
 """
 import os
 
@@ -18,7 +18,7 @@ from dragonfly_sim.core.windtunnel_model import DG_windtunnel_model
 
 from cases import jittered_square
 
-BC = {'inlet': {'rho': 1.0, 'p': 1.0, 'M': 0.5, 'alpha': np.radians(2.0)}, 'outlet': {'p': 1.0}}
+BC = {'rho': 1.0, 'p': 1.0, 'M': 0.5, 'alpha': np.radians(2.0)}
 
 
 def bottom_wall(x):
@@ -65,7 +65,7 @@ def test_forward_csdl_graph_alpha_derivative(in_tmp_dir):
     recorder = csdl.Recorder(inline=False)
     recorder.start()
     wt = make_windtunnel()
-    alpha = csdl.Variable(name='alpha', value=np.array([BC['inlet']['alpha']]))
+    alpha = csdl.Variable(name='alpha', value=np.array([BC['alpha']]))
     alpha.set_as_design_variable()
     u_vec = wt.evaluate(alpha=alpha)
     out = wt.postprocessor.evaluate(u_vec, alpha=alpha)
@@ -79,7 +79,7 @@ def test_forward_csdl_graph_alpha_derivative(in_tmp_dir):
 
     # finite differences of plain forward solves
     h = 1e-6
-    a0 = BC['inlet']['alpha']
+    a0 = BC['alpha']
     Dp = wt.solve_forward(a0 + h)[2]["D"]
     Dm = wt.solve_forward(a0 - h)[2]["D"]
     fd = (Dp - Dm) / (2 * h)
@@ -102,7 +102,7 @@ def rans_alpha_derivative(release, alphas):
     wt.release_solver_memory = release
     wt.set_up_sim()
     wt.postprocessor.log_cm_alpha = False
-    alpha = csdl.Variable(name='alpha', value=np.array([BC['inlet']['alpha']]))
+    alpha = csdl.Variable(name='alpha', value=np.array([BC['alpha']]))
     alpha.set_as_design_variable()
     u_vec = wt.evaluate(alpha=alpha)
     out = wt.postprocessor.evaluate(u_vec, alpha=alpha)
@@ -168,7 +168,7 @@ def test_solution_file_fields_and_write_once_per_design(once, in_tmp_dir, monkey
     monkeypatch.setattr(writer, "interpolate_and_write",
                         lambda values, write_counter=None, time=None: labels.append(
                             (write_counter, {k: v.x.array.copy() for k, v in values.items()})))
-    alpha = csdl.Variable(name='alpha', value=np.array([BC['inlet']['alpha']]))
+    alpha = csdl.Variable(name='alpha', value=np.array([BC['alpha']]))
     alpha.set_as_design_variable()
     u_vec = wt.evaluate(alpha=alpha)
     out = wt.postprocessor.evaluate(u_vec, alpha=alpha)
@@ -177,7 +177,7 @@ def test_solution_file_fields_and_write_once_per_design(once, in_tmp_dir, monkey
     sim = csdl.experimental.JaxSimulator(recorder, gpu=False)
     sim.run()
     sim.compute_totals()            # evaluates the same design again
-    sim[alpha] = np.array([BC['inlet']['alpha'] + 0.01])
+    sim[alpha] = np.array([BC['alpha'] + 0.01])
     sim.run()
     assert [k for k, _ in labels] == ([0, 2] if once else [0, 1, 2])
 
@@ -212,7 +212,7 @@ def test_muscl_euler_alpha_derivative(in_tmp_dir):
     wt.set_up_sim()
     wt.postprocessor.log_cm_alpha = False
     assert wt.sim_model.has_condensed_jacobian and wt.sim_model.face_traces is not None
-    alpha = csdl.Variable(name='alpha', value=np.array([BC['inlet']['alpha']]))
+    alpha = csdl.Variable(name='alpha', value=np.array([BC['alpha']]))
     alpha.set_as_design_variable()
     u_vec = wt.evaluate(alpha=alpha)
     out = wt.postprocessor.evaluate(u_vec, alpha=alpha)
@@ -224,7 +224,7 @@ def test_muscl_euler_alpha_derivative(in_tmp_dir):
     D0 = float(sim[out.D][0])
     dD = float(np.asarray(sim.compute_totals()[out.D, alpha]).ravel()[0])
     h = 1e-6
-    a0 = BC['inlet']['alpha']
+    a0 = BC['alpha']
     fd = (wt.solve_forward(a0 + h)[2]["D"] - wt.solve_forward(a0 - h)[2]["D"]) / (2 * h)
     assert abs(fd - dD) < 1e-5 * max(abs(fd), 1e-12), (fd, dD)
     assert abs(wt.solve_forward(a0)[2]["D"] - D0) < 1e-10

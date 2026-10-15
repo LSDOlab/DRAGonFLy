@@ -32,7 +32,7 @@ conditions are not read (VTK skips them), so the solver finds the boundaries geo
 Requirements:
 - **Orientation**: the freestream flows in $+x$. In 2D, y is vertical; in 3D, y is spanwise and z vertical.
 - **3D**: model a half-wing whose root lies on the symmetry plane $y = 0$.
-- **Far field**: the outer boundary should be far from the body; it is split automatically into inflow and outflow.
+- **Far field**: the outer boundary should be far from the body. All of it that is neither wall nor symmetry plane gets the characteristic far-field condition.
 - **Wall**: identified by a function `mesh_inner_bdry_function(x)` that takes facet midpoints of shape
   `(dim, n)` and returns a boolean mask. `dragonfly_sim.utils.mesh_manager_utils` provides
   `airfoil_inner_bdry_function` and `wing_inner_bdry_function` for the meshes used in the examples. Alternatively,
@@ -40,12 +40,14 @@ Requirements:
 
 ## 2. Flow conditions
 ```python
-boundary_dict = {'inlet':  {'rho': 1.0, 'M': 0.8, 'p': 1.0, 'alpha': np.radians(2)},
-                 'outlet': {'p': 1.0}}
+boundary_dict = {'rho': 1.0, 'M': 0.8, 'p': 1.0, 'alpha': np.radians(2)}
 ```
-Only subsonic inflow and outflow are supported. The inflow/outflow split of the far field is frozen at the initial
-`alpha`; changing the angle of attack by more than 1 degree from it raises an error, so keep the design variable
-bounds within that range.
+This free-stream state is all that is specified: density, pressure, Mach number and angle of attack (radians). The
+whole outer boundary is a characteristic (Riemann-invariant) far field built from it, which takes each facet's
+inflow or outflow character from the flow itself, so the angle of attack can be changed by any amount, for example
+in an optimization over a wide range of angles. The far field is subsonic: $M < 1$.
+
+The former form `{'inlet': {...}, 'outlet': {...}}` is no longer accepted; pass the contents of `'inlet'` and drop `'outlet'`.
 
 ## 3. Flow model
 ```python
@@ -75,12 +77,11 @@ Solver settings are attributes; change them before `set_up_sim()`:
 | `linear_solver_max_it` | `1000` | iteration limit of those solves |
 | `log_cm_alpha` | `True` | print $dc_m/d\alpha$ after each solve (one extra linear solve) |
 
-Constructor options select the flow model and the far field:
+Constructor options select the flow model:
 
 | Argument | Default | Meaning |
 |---|---|---|
 | `model_class`, `model_kwargs` | `CompressibleEulerModel`, `{}` | e.g. `CompressibleRANSModel`, `{'Re': 6e6}` for SA-neg RANS (see [RANS, time integration and far fields](flow_models.md)); the body becomes an adiabatic no-slip wall |
-| `farfield` | `"split"` | `"riemann"`: characteristic far field on the whole outer boundary instead of the inflow/outflow split |
 | `reduced_order_model` | `None` | a `ReducedOrderModel` to try before every flow solve (see [Reduced-order modeling](reduced_order_modeling.md)) |
 
 RANS solves use pseudo-transient continuation, so `max_newton_iterations` counts pseudo steps (~60 from the free
@@ -178,7 +179,7 @@ Written to the working directory, named with `filename_suffix`:
   deformation on the baseline mesh (apply it with *Warp By Vector*); frame $k$ of each file belongs to the same
   evaluation. `write_mesh_deformation = False` leaves out the mesh deformation file, and
   `write_once_per_design = True` writes one frame per design when the optimizer evaluates a design twice;
-- `output_meshtags.xdmf`: the boundary tags, to check the inflow/outflow/wall/symmetry split;
+- `output_meshtags.xdmf`: the boundary tags, to check the far-field/wall/symmetry tags;
 - `memory_logs/`: peak memory per MPI rank.
 
 `model.data_store` collects per-evaluation results (with a reduced-order model also its wall times, $\eta$,

@@ -21,7 +21,7 @@ experimental data and other solvers will be added later.
 | Static free-stream temperature | 271 K (Sutherland's law), as in DPW8 test case 1a |
 | Angles of attack | $\alpha$ = 1.36°, 1.50°, 2.50°, 3.00°, 3.10° |
 | Model | SA-neg RANS, cell-centred finite volume ($p = 0$), MUSCL inviscid fluxes |
-| Boundary conditions | adiabatic no-slip wall; subsonic inflow/outflow far field |
+| Boundary conditions | adiabatic no-slip wall; subsonic inflow/outflow far field (the inflow/outflow split, since replaced by the characteristic far field; these results predate the change) |
 | Solver | pseudo-transient continuation (CFL$_0$ = 5) to a residual of $10^{-9}$, started from the converged first-order RANS solution |
 | Moment reference | quarter chord, positive nose-up |
 

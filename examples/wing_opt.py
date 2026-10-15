@@ -49,16 +49,11 @@ if __name__ == '__main__':
     p_0 = 1.0
     attack = np.radians(2)
 
-    # inflow_angle is derived from alpha inside define_inlet_outlet_conditions
+    # inflow_angle is derived from alpha inside define_farfield_conditions
     # now, so that alpha is the single source of truth for the freestream
     # direction -- it has to be, since alpha is a design variable and the
     # direction has to follow it on every evaluation.
-    boundary_dict = {'inlet': {'rho': rho_0,
-                               'M': M_0,
-                               'p': p_0,
-                               'alpha': attack},
-                     'outlet': {'p': p_0}
-                     }
+    boundary_dict = {'rho': rho_0, 'M': M_0, 'p': p_0, 'alpha': attack}
 
     # Angle-of-attack design-variable bounds.
     attack_lower = np.radians(1.5)
