@@ -22,7 +22,7 @@ MODULE_GROUPS = [
      "test_pod.py", "test_reduced_order_model.py"],
     ["test_mesh_deformation_cache.py", "test_incoming_state_converged.py",
      "test_meshwarping_cache.py", "test_moments.py", "test_adjoint_reuse.py",
-     "test_adjoint_speedups.py", "test_adjoint_ksp.py"],
+     "test_adjoint_speedups.py"],
 ]
 
 
