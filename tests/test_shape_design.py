@@ -49,6 +49,7 @@ def set_values(shape, values):
 
 # ---- WingShape geometry ------------------------------------------------------
 
+@pytest.mark.verification
 def test_wing_baseline_fit_recovers_the_trapezoid():
     X, tris = swept_wing()
     _, wing = wing_shape(X, tris)
@@ -62,6 +63,7 @@ def test_wing_baseline_fit_recovers_the_trapezoid():
     np.testing.assert_allclose(b['area'], (c_r + c_t) * s, rtol=1e-12)
 
 
+@pytest.mark.verification
 def test_wing_baseline_variables_are_the_identity():
     X, tris = swept_wing()
     shape, _ = wing_shape(X, tris, sections={'thickness': 0.1, 'camber': 0.01})
@@ -82,6 +84,7 @@ def affine_planform_map(X, wing, sweep, aspect_ratio, root_chord, thickness=0.):
                      z_c + r * (1. + thickness) * (X[:, 2] - z_c)], axis=1)
 
 
+@pytest.mark.verification
 def test_planform_map_is_exact_with_fixed_taper():
     X, tris = swept_wing()
     shape, wing = wing_shape(X, tris, sections={'thickness': 0.1})
@@ -104,6 +107,7 @@ def test_planform_map_is_exact_with_fixed_taper():
 
 @pytest.mark.parametrize("derived, size", [("root_chord", "aspect_ratio"),
                                            ("aspect_ratio", "root_chord")])
+@pytest.mark.verification
 def test_span_variable_is_exact_with_fixed_taper(derived, size):
     """span plus aspect ratio (or root chord) as variables: the third size
     follows, and the map is the same affine one."""
@@ -131,6 +135,7 @@ def test_span_variable_is_exact_with_fixed_taper(derived, size):
     np.testing.assert_allclose(out['aspect_ratio'].value, aspect_ratio, rtol=1e-14)
 
 
+@pytest.mark.verification
 def test_taper_change_is_exact_at_the_root_and_close_elsewhere():
     X, tris = swept_wing()
     shape, wing = wing_shape(X, tris)
@@ -149,6 +154,7 @@ def test_taper_change_is_exact_at_the_root_and_close_elsewhere():
     np.testing.assert_allclose(s_new, wing.baseline['aspect_ratio'] * 4.7 * 1.4 / 4., rtol=1e-14)
 
 
+@pytest.mark.verification
 def test_thickness_and_camber_on_a_rectangular_wing():
     """On a rectangular, unswept wing every section is the same, so the
     sectional modes are exact: the thickness scales by 1 + tau and the camber
@@ -168,6 +174,7 @@ def test_thickness_and_camber_on_a_rectangular_wing():
     np.testing.assert_allclose(dz, 0.15 * X[:, 2] + camber, rtol=0, atol=1e-12)
 
 
+@pytest.mark.verification
 def test_chordwise_modes_on_a_rectangular_wing():
     """Several thickness and camber modes per station: on a rectangular wing
     with a quartic Bezier chordwise basis they are exact,
@@ -192,6 +199,7 @@ def test_chordwise_modes_on_a_rectangular_wing():
     np.testing.assert_allclose(dz, thickness * X[:, 2] + camber, rtol=0, atol=1e-12)
 
 
+@pytest.mark.verification
 def test_one_mode_matches_equal_mode_values():
     """Equal values in every mode are the one-mode (uniform thickness,
     parabolic camber) shape."""
@@ -207,6 +215,7 @@ def test_one_mode_matches_equal_mode_values():
                                rtol=0, atol=1e-12)
 
 
+@pytest.mark.unit_test
 def test_section_mode_bounds_broadcast():
     X, tris = swept_wing(n_span=6)
     root_pinned = (np.array([0., -0.1, -0.1]), np.array([0., 0.1, 0.1]))
@@ -217,6 +226,7 @@ def test_section_mode_bounds_broadcast():
     np.testing.assert_array_equal(dv.upper, np.repeat(root_pinned[1], 4))
 
 
+@pytest.mark.verification
 def test_wing_derivatives_match_central_differences():
     X, tris = swept_wing(n_span=8)
     shape, wing = wing_shape(X, tris, sections={'thickness': 0.2, 'camber': 0.05})
@@ -249,6 +259,7 @@ def test_wing_derivatives_match_central_differences():
             np.testing.assert_allclose(an_col, fd, rtol=1e-6, atol=1e-8)
 
 
+@pytest.mark.verification
 def test_wing_span_and_mode_derivatives_match_central_differences():
     X, tris = swept_wing(n_span=8)
     planform = {'sweep': PLANFORM_BOUNDS['sweep'], 'aspect_ratio': PLANFORM_BOUNDS['aspect_ratio'],
@@ -283,6 +294,7 @@ def test_wing_span_and_mode_derivatives_match_central_differences():
             np.testing.assert_allclose(an_col, fd, rtol=1e-6, atol=1e-8)
 
 
+@pytest.mark.unit_test
 def test_wing_under_a_non_inline_recorder():
     """The drivers record with inline=False and change the design variables
     later. lsdo_geo freezes values when the graph is built; nothing of the
@@ -319,6 +331,7 @@ def test_wing_under_a_non_inline_recorder():
 
 # ---- the generic layers -------------------------------------------------------
 
+@pytest.mark.verification
 def test_layers_reproduce_the_manual_composition():
     X, segments = ellipse()
     rng = np.random.default_rng(4)
@@ -342,6 +355,7 @@ def test_layers_reproduce_the_manual_composition():
     np.testing.assert_array_equal(shape.wall_displacement().value, ffd.wall_displacement(C).value)
 
 
+@pytest.mark.unit_test
 def test_specification_checks():
     X, tris = swept_wing(n_span=6)
     with pytest.raises(ValueError, match="unknown planform"):
@@ -372,6 +386,7 @@ def test_specification_checks():
         shape.coefficients()
 
 
+@pytest.mark.unit_test
 def test_straight_edges_are_required():
     X, tris = swept_wing()
     bent = X.copy()
@@ -380,6 +395,7 @@ def test_straight_edges_are_required():
         wing_shape(bent, tris)
 
 
+@pytest.mark.unit_test
 def test_build_planform_dv_scaler():
     from dragonfly_sim.utils.ffd_dv_utils import build_planform_dv
     dv = build_planform_dv(8.6, (7.5, 10.))

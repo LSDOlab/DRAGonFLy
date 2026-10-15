@@ -53,6 +53,7 @@ def make_windtunnel():
     return wt
 
 
+@pytest.mark.unit_test
 def test_forward_analysis_without_csdl(in_tmp_dir):
     wt = make_windtunnel()
     assert wt.ffd is None and wt.mesh_warper is None
@@ -67,6 +68,7 @@ def test_forward_analysis_without_csdl(in_tmp_dir):
         wt.wall_geometry()
 
 
+@pytest.mark.verification
 def test_forward_csdl_graph_alpha_derivative(in_tmp_dir):
     recorder = csdl.Recorder(inline=False)
     recorder.start()
@@ -128,6 +130,7 @@ def rans_alpha_derivative(release, alphas):
     return wt, results
 
 
+@pytest.mark.verification
 def test_release_solver_memory_gives_the_same_rans_derivatives(in_tmp_dir):
     """release_solver_memory frees the flow solver after every forward solve and
     the condensed dR/dU after every adjoint; both are rebuilt when next needed,
@@ -149,6 +152,7 @@ def test_release_solver_memory_gives_the_same_rans_derivatives(in_tmp_dir):
 
 
 @pytest.mark.parametrize("once", [False, True])
+@pytest.mark.unit_test
 def test_solution_file_fields_and_write_once_per_design(once, in_tmp_dir, monkeypatch):
     """The solution file holds the state as separate fields plus velocity and
     pressure; with write_once_per_design, re-evaluating a design (CSDL re-runs
@@ -198,6 +202,7 @@ def test_solution_file_fields_and_write_once_per_design(once, in_tmp_dir, monkey
             w.writer.close()
 
 
+@pytest.mark.verification
 def test_muscl_euler_alpha_derivative(in_tmp_dir):
     """MUSCLEulerModel: the Euler model with the Green-Gauss MUSCL
     reconstruction converges by PTC, takes the condensed path, and its

@@ -48,6 +48,7 @@ STATES = [(state(1.0, 0.6, 0.1, 1.0), state(0.9, 0.5, -0.05, 0.85)),      # subs
 
 
 @pytest.mark.parametrize("UL, UR", STATES)
+@pytest.mark.verification
 def test_extended_hll_reduces_to_hll(UL, UR):
     n = const([0.6, 0.8])
     a, b = const(UL), const(UR)
@@ -62,6 +63,7 @@ def test_extended_hll_reduces_to_hll(UL, UR):
         assert abs(F5[4] - 0.3 * un_L) < 1e-12
 
 
+@pytest.mark.verification
 def test_extended_fluxes_without_extras_are_euler_fluxes():
     U, Ue, n = const(STATES[0][0]), const(STATES[0][1]), const([0.0, 1.0])
     np.testing.assert_allclose(evaluate(extended_flux(U, GAMMA, 4)), evaluate(flux(U, GAMMA)), rtol=1e-15)
@@ -88,6 +90,7 @@ def np_riemann_state(U, n, rho_inf, u_inf, p_inf, g):
     return np.array([rb, rb * ub[0], rb * ub[1], pb / (g - 1) + 0.5 * rb * ub @ ub]), un < 0
 
 
+@pytest.mark.verification
 def test_riemann_state_matches_numpy_and_preserves_freestream():
     rng = np.random.default_rng(2)
     M, alpha = 0.6, np.radians(3.0)
@@ -106,6 +109,7 @@ def test_riemann_state_matches_numpy_and_preserves_freestream():
             np.testing.assert_allclose(evaluate(Ub), ref, rtol=1e-12)
 
 
+@pytest.mark.unit_test
 def test_positivity_limiter_ignores_extra_components():
     rng = np.random.default_rng(0)
     nb = 50

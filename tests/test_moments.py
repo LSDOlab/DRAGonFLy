@@ -84,6 +84,7 @@ def global_sum(post, form):
     return post.mesh_obj.mesh.comm.allreduce(dolfinx.fem.assemble_scalar(dolfinx.fem.form(form)), MPI.SUM)
 
 
+@pytest.mark.verification
 def test_pitch_preset_is_the_nose_up_moment(in_tmp_dir):
     wt = make_windtunnel()
     u, converged, _ = wt.solve_forward()
@@ -101,6 +102,7 @@ def test_pitch_preset_is_the_nose_up_moment(in_tmp_dir):
     assert abs(c_m - M / q) < 1e-12 * abs(c_m)
 
 
+@pytest.mark.verification
 def test_direction_is_normalised_and_signed(in_tmp_dir):
     wt = make_windtunnel([("a", (0.3, 0.1), (0., 0., 1.)), ("b", (0.3, 0.1), (0., 0., 7.)),
                           ("c", (0.3, 0.1), (0., 0., -1.)), ("d", (0.3, 0.1), -1.)])
@@ -111,6 +113,7 @@ def test_direction_is_normalised_and_signed(in_tmp_dir):
     assert Md == Mc                           # the scalar shorthand of the out-of-plane axis
 
 
+@pytest.mark.verification
 def test_reference_length_only_scales_the_coefficient(in_tmp_dir):
     wt = make_windtunnel()
     u, _, forces = wt.solve_forward()
@@ -122,6 +125,7 @@ def test_reference_length_only_scales_the_coefficient(in_tmp_dir):
     assert abs(c_b / M_b) == pytest.approx(abs(c_a / M_a) / 0.5, rel=1e-12)
 
 
+@pytest.mark.verification
 def test_moment_about_a_moved_point(in_tmp_dir):
     """M(x1) = M(x0) - F_tot . (d x (x1 - x0)): the same force, another lever arm."""
     wt = make_windtunnel([("m0", (0.25, 0.), (0., 0., 1.)), ("m1", (0.8, -0.35), (0., 0., 1.))])
@@ -137,6 +141,7 @@ def test_moment_about_a_moved_point(in_tmp_dir):
 
 
 @pytest.mark.parametrize("direction", [(1., 0., 0.), (0., 1., 0.), (0., 0., 1.), (0.3, -1.2, 0.8)])
+@pytest.mark.verification
 def test_moment_about_in_3D(direction):
     """moment_about is d . (r x F) for any direction, on constants over the unit cube."""
     comm = MPI.COMM_WORLD
@@ -176,6 +181,7 @@ def check_state_and_mesh_derivatives(wt, u):
         assert abs((Mp - Mm) / (2*eps) - an) < 1e-6 * abs(an), (spec.name, (Mp - Mm) / (2*eps), an)
 
 
+@pytest.mark.verification
 def test_state_and_mesh_derivatives_match_finite_differences(in_tmp_dir):
     wt = make_windtunnel()
     u, _, _ = wt.solve_forward()
@@ -209,6 +215,7 @@ def make_windtunnel_3d(moments=MOMENTS_3D, n=4, **kw):
     return wt
 
 
+@pytest.mark.verification
 def test_moments_in_3D(in_tmp_dir):
     wt = make_windtunnel_3d()
     u, converged, _ = wt.solve_forward()
@@ -234,12 +241,14 @@ def test_moments_in_3D(in_tmp_dir):
     assert post.compute_moment(u, spec_of(post, "oblique"))[0] == pytest.approx(ref, rel=1e-10)
 
 
+@pytest.mark.verification
 def test_3D_state_and_mesh_derivatives_match_finite_differences(in_tmp_dir):
     wt = make_windtunnel_3d()
     u, _, _ = wt.solve_forward()
     check_state_and_mesh_derivatives(wt, u)
 
 
+@pytest.mark.verification
 def test_3D_csdl_alpha_derivative(in_tmp_dir):
     wt = make_windtunnel_3d()
     names = [spec[0] for spec in MOMENTS_3D]
@@ -274,6 +283,7 @@ def alpha_totals(wt, names):
 
 
 @pytest.mark.parametrize("kind", ["euler", "rans"])
+@pytest.mark.verification
 def test_csdl_alpha_derivative_of_several_moments(kind, in_tmp_dir):
     """The adjoint dM_k/dalpha of every moment, also through the RANS derived fields,
     against central differences of forward solves."""
@@ -313,6 +323,7 @@ INVALID_MOMENTS = [
 ]
 
 
+@pytest.mark.unit_test
 def test_invalid_moments_are_rejected(in_tmp_dir):
     wt = make_windtunnel(moments=None)
     for moments, message in INVALID_MOMENTS:
@@ -320,6 +331,7 @@ def test_invalid_moments_are_rejected(in_tmp_dir):
             DG_postprocessor(wt.mesh, wt.sim_model, wt.WALL_TAG, moments=moments)
 
 
+@pytest.mark.unit_test
 def test_no_moments_is_allowed(in_tmp_dir):
     wt = make_windtunnel(moments=None)
     _, converged, forces = wt.solve_forward()

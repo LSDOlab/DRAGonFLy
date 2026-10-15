@@ -17,6 +17,9 @@ from cases import jittered_square
 from test_windtunnel_forward import BC, bottom_wall, in_tmp_dir  # noqa: F401
 
 
+pytestmark = [pytest.mark.unit_test]
+
+
 @pytest.fixture
 def warper(in_tmp_dir):  # noqa: F811
     recorder = csdl.Recorder(inline=False)

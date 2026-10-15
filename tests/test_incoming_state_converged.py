@@ -3,7 +3,11 @@ incoming_state_converged: a state that already meets residual_conv_limit is
 recognised from the residual form alone, so the caller can skip building the
 solver (DG_windtunnel_model._run_fom_solve does).
 """
+import pytest
 from cases import euler_channel_model, seed_mean_flow
+
+
+pytestmark = [pytest.mark.unit_test]
 
 
 def test_converged_state_needs_no_solver():

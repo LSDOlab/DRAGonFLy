@@ -78,6 +78,7 @@ def global_array(comm, local):
 # ----------------------------------------------------------------------
 # Model interface
 # ----------------------------------------------------------------------
+@pytest.mark.unit_test
 def test_state_scales(in_tmp_dir):
     wt = make_windtunnel("euler")
     m = wt.sim_model
@@ -86,6 +87,7 @@ def test_state_scales(in_tmp_dir):
     assert m.state_scales() == pytest.approx([1.0, U, U, 1.0 / 0.4 + 0.5 * U**2], rel=1e-14)
 
 
+@pytest.mark.unit_test
 def test_rans_state_scales_match_the_limiter_scales(in_tmp_dir):
     wt = make_windtunnel("rans", Re=6e6)
     m = wt.sim_model
@@ -99,6 +101,7 @@ def test_rans_state_scales_match_the_limiter_scales(in_tmp_dir):
     assert [float(s) for s in lim[:4]] == pytest.approx(scales[:4], rel=1e-14)
 
 
+@pytest.mark.unit_test
 def test_steady_residual_switches_the_pseudo_time_term_off(in_tmp_dir):
     wt = make_windtunnel("rans")
     m = wt.sim_model
@@ -129,6 +132,7 @@ def test_steady_residual_switches_the_pseudo_time_term_off(in_tmp_dir):
         v.destroy()
 
 
+@pytest.mark.unit_test
 def test_positivity_step_length_caps_and_limits(in_tmp_dir):
     m = make_windtunnel("euler").sim_model
     x = m.u_vec.x.petsc_vec
@@ -146,6 +150,7 @@ def test_positivity_step_length_caps_and_limits(in_tmp_dir):
 # ----------------------------------------------------------------------
 # Inner product and basis
 # ----------------------------------------------------------------------
+@pytest.mark.unit_test
 def test_default_W_is_the_state_scaled_euclidean_product(in_tmp_dir):
     rom = ReducedOrderModel(rb_size=4)
     assert (rom.inner_product, rom.state_scaling) == ("euclidean", "freestream")
@@ -155,6 +160,7 @@ def test_default_W_is_the_state_scaled_euclidean_product(in_tmp_dir):
     assert w == pytest.approx(np.tile(1.0 / rom.scales**2, (w.shape[0], 1)), rel=1e-14)
 
 
+@pytest.mark.unit_test
 def test_W_is_the_scaled_L2_inner_product(in_tmp_dir):
     rom = ReducedOrderModel(rb_size=4, inner_product="l2")
     wt = make_windtunnel("rans", rom=rom, Re=6e6)
@@ -172,6 +178,7 @@ def test_W_is_the_scaled_L2_inner_product(in_tmp_dir):
 
 
 @pytest.mark.parametrize("inner_product, scaling", [("l2", "freestream"), ("l2", None), ("euclidean", None)])
+@pytest.mark.unit_test
 def test_restriction_inverts_expansion(in_tmp_dir, inner_product, scaling):
     rom = ReducedOrderModel(rb_size=3, inner_product=inner_product, state_scaling=scaling)
     wt = make_windtunnel("euler", rom=rom)
@@ -190,6 +197,7 @@ def test_restriction_inverts_expansion(in_tmp_dir, inner_product, scaling):
     assert (rom.W is None) == (inner_product == "euclidean" and scaling is None)
 
 
+@pytest.mark.unit_test
 def test_scaled_L2_keeps_the_turbulence_variable_under_truncation(in_tmp_dir):
     """
     At Re 6e6 rho*nu_tilde is ~1e-4 against rho*E ~ 2. Four snapshots: three
@@ -237,6 +245,7 @@ def test_scaled_L2_keeps_the_turbulence_variable_under_truncation(in_tmp_dir):
 # LSPG solve, Euler and RANS through one interface
 # ----------------------------------------------------------------------
 @pytest.mark.parametrize("kind", ["euler", "rans"])
+@pytest.mark.verification
 def test_lspg_recovers_a_solution_in_the_basis(in_tmp_dir, kind):
     """With the converged FOM state u* in the snapshot set, the ROM started
     from another state converges back to u* and to FOM-level eta, for each
@@ -281,6 +290,7 @@ ALPHAS = (2.0, 2.6, 2.3, 2.1, 2.45)
 
 
 @pytest.mark.parametrize("kind, eta_threshold, run_fom", [("euler", 1e-9, False), ("rans", 1e-7, True)])
+@pytest.mark.unit_test
 def test_windtunnel_accepts_the_rom_between_snapshots(in_tmp_dir, kind, eta_threshold, run_fom):
     """Two FOM snapshots, a rejected ROM (third snapshot), then two accepted
     ROM solutions. Without run_fom_every_evaluation (Euler) the accepted ROM
@@ -309,6 +319,7 @@ def test_windtunnel_accepts_the_rom_between_snapshots(in_tmp_dir, kind, eta_thre
 
 
 @pytest.mark.parametrize("kind, eta_threshold", [("euler", 1e-9), ("rans", 1e-7)])
+@pytest.mark.verification
 def test_windtunnel_rom_adjoint(in_tmp_dir, kind, eta_threshold):
     """
     dD/dalpha through CSDL with a ROM. At 2.3 degrees the ROM (two snapshots)
@@ -359,6 +370,7 @@ def test_windtunnel_rom_adjoint(in_tmp_dir, kind, eta_threshold):
     assert abs(fd - dD) < 1e-6 * abs(fd), (fd, dD)
 
 
+@pytest.mark.unit_test
 def test_windtunnel_falls_back_to_the_fom(in_tmp_dir):
     """eta_threshold 0 never accepts the ROM: every evaluation is the FOM
     from the same warm start, identical to a windtunnel without a ROM (to the
@@ -456,6 +468,7 @@ def _linear_rom(model, k=4, state_scaling=None, **kw):
     return rom
 
 
+@pytest.mark.verification
 def test_lspg_solves_the_least_squares_normal_equations():
     """The ROM solution satisfies (K V)^T (K V a - f) = 0 (LSPG), not the
     Galerkin V^T (K V a - f) = 0, which differs for a non-symmetric K."""
@@ -485,6 +498,7 @@ def _matvec(K, v_global, model):
     return out
 
 
+@pytest.mark.unit_test
 def test_outer_passes_and_absolute_g_limit():
     """newton_max_it 1 and g_conv_limit 0: max_outer_iterations passes of one
     iteration, never converged (benchmark_pod.py's budget structure)."""
@@ -498,6 +512,7 @@ def test_outer_passes_and_absolute_g_limit():
 # ----------------------------------------------------------------------
 # The reduced (LSPG) adjoint
 # ----------------------------------------------------------------------
+@pytest.mark.verification
 def test_tsqr_matches_numpy_qr():
     """Thin QR of a 7 x 4 matrix split by rows: on 3 ranks every block has
     fewer rows than columns."""
@@ -512,6 +527,7 @@ def test_tsqr_matches_numpy_qr():
     np.testing.assert_allclose(np.abs(R), np.abs(np.linalg.qr(X)[1]), rtol=1e-12, atol=1e-13)
 
 
+@pytest.mark.verification
 def test_reduced_adjoint_is_the_lspg_adjoint():
     """
     The adjoint of an accepted LSPG solution of R(u) = K u - f, with a state

@@ -18,6 +18,9 @@ from test_moments import in_tmp_dir, make_windtunnel, BC  # noqa: F401 (fixture)
 MOMENTS = [("pitch", (0.25, 0.), "pitch")]
 
 
+pytestmark = [pytest.mark.verification]
+
+
 def graph(wt):
     recorder = csdl.Recorder(inline=False)
     recorder.start()
