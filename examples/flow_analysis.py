@@ -39,6 +39,7 @@ import dolfinx
 from dragonfly_sim.core.mesh_manager import Mesh
 from dragonfly_sim.core.Euler_model import CompressibleEulerModel
 from dragonfly_sim.core.RANS_model import CompressibleRANSModel
+from dragonfly_sim.core.reconstruction import GreenGaussReconstruction
 from dragonfly_sim.core.turbulence_models import Laminar, SpalartAllmarasNeg
 from dragonfly_sim.core.farfield import TransverseFarfield
 from dragonfly_sim.utils.mesh_manager_utils import airfoil_inner_bdry_function, wing_inner_bdry_function
@@ -66,15 +67,36 @@ GEOMETRIES = {
 }
 
 
+def install_euler_muscl(flow, limiter=None, limiter_eps=1e-2):
+    """
+    MUSCL for a CompressibleEulerModel: the Green-Gauss reconstruction the RANS
+    model installs on its host (core/reconstruction.py), plugged into the
+    Euler model's own face-trace hook. Call after define_elements_functionspaces
+    and before the boundary conditions. After set_up_solver, switch the Newton
+    Jacobian to its compact preconditioner form with
+    flow.problem.configure_snes(flow.solver.snes, "compact_pc") (the RANS model
+    does this itself).
+    """
+    inlet = flow.boundary_conditions['inlet']
+    speed = inlet['M'] * inlet['c']
+    scales = ([inlet['rho']] + [inlet['rho'] * speed] * flow.dimensions
+              + [inlet['p'] / (flow.gamma - 1.0) + 0.5 * inlet['rho'] * speed ** 2])
+    GreenGaussReconstruction(flow, muscl=True, limiter=limiter, limiter_eps=limiter_eps,
+                             limiter_scales=lambda: scales).install()
+
+
 def build_model(dolfinx_mesh, model="sa", mach=0.5, alpha_deg=0.0, Re=6e6, geometry="airfoil",
                 farfield="split", gamma=1.4, T_inf=300.0, quadrature_degree=1,
                 asm_overlap=None, ilu_levels=None, direct=False, muscl=True, limiter=None,
                 limiter_eps=1e-2, jacobian_mode="compact_pc", ff_beta=0.5, ff_relax_length=50.0,
-                inner_bdry_function=None):
+                inner_bdry_function=None, euler_muscl=False):
     """
     Build a ready-to-solve model on `dolfinx_mesh`.
 
-    model     "euler", "laminar" (Navier-Stokes) or "sa" (RANS, SA-neg)
+    model     "euler", "laminar" (Navier-Stokes) or "sa" (RANS, SA-neg).
+              The Euler model is first-order (HLL); euler_muscl=True adds MUSCL
+              reconstruction (see install_euler_muscl). The viscous models
+              take muscl=True/False.
     farfield  "split"    subsonic inflow/outflow split perpendicular to the
                          free stream (DG_windtunnel_model's default)
               "riemann"  characteristic far field on the whole outer boundary
@@ -132,6 +154,8 @@ def build_model(dolfinx_mesh, model="sa", mach=0.5, alpha_deg=0.0, Re=6e6, geome
     mesh_obj.form_manager.build_cell_and_interior_facet_measures(measure_metadata=qd)
 
     flow.define_elements_functionspaces()
+    if model == "euler" and euler_muscl:
+        install_euler_muscl(flow, limiter, limiter_eps)
     flow.define_trial_testfunctions()
     flow.compute_initial_conditions_from_inlet()
     flow.interpolate_solution_vector()
