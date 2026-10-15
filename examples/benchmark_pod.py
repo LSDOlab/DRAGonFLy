@@ -61,6 +61,7 @@ matplotlib.use("Agg")  # headless under mpirun: figures are saved, never shown
 from matplotlib import pyplot as plt
 
 from dragonfly_sim.core.windtunnel_model import DG_windtunnel_model
+from dragonfly_sim.core.MUSCL_Euler_model import MUSCLEulerModel
 from dragonfly_sim.core.RANS_model import CompressibleRANSModel
 from dragonfly_sim.core.reduced_order_model import ReducedOrderModel
 from dragonfly_sim.core.shape_design import FFDShapeParameterization, ControlPointMotions, WingShape
@@ -93,7 +94,7 @@ def parse_args(argv=None):
     g.add_argument("--mach-upper", type=float, default=0.9)
     g.add_argument("--alpha-lower", type=float, default=1.75, help="degrees")
     g.add_argument("--alpha-upper", type=float, default=2.25,
-                   help="degrees; the inlet/outlet split is tagged at 2 deg and allows +/-1 deg")
+                   help="degrees; the far-field boundary takes any angle of attack")
     g.add_argument("--shape-sample-scale", "--cp-motion-sample-scale", type=float, default=1.0,
                    help="scale of the sampled shape range relative to the design-variable bounds, "
                         "about each variable's baseline value")
@@ -105,7 +106,14 @@ def parse_args(argv=None):
 
     g = p.add_argument_group("full-order solves")
     g.add_argument("--residual-conv-limit", type=float, default=1e-9)
-    g.add_argument("--euler-max-newton", type=int, default=100, help="total Newton steps per Euler solve")
+    g.add_argument("--euler-scheme", choices=("first-order", "muscl"), default="first-order",
+                   help="inviscid flux discretization of the Euler model: the first-order p = 0 scheme "
+                        "(HLL on the cell averages; CompressibleEulerModel) or MUSCL (Green-Gauss "
+                        "reconstruction, second order, pseudo-transient continuation; MUSCLEulerModel). "
+                        "The RANS model is always MUSCL")
+    g.add_argument("--euler-max-newton", type=int, default=None,
+                   help="total Newton steps per Euler solve; default 100 (first-order) or 400 "
+                        "(muscl, pseudo-time steps)")
     g.add_argument("--rans-max-newton", type=int, default=400, help="pseudo-time steps per RANS solve")
     g.add_argument("--fom-newton-inner-max-it", type=int, default=1,
                    help="Euler Newton steps per residual check (RANS PTC always takes one)")
@@ -179,9 +187,10 @@ def parse_args(argv=None):
     if args.warm_start and args.mach_continuation:
         p.error("--warm-start and Mach continuation are two initial-condition policies; "
                 "pass --no-mach-continuation with --warm-start")
-    if args.alpha_lower > args.alpha_upper or max(abs(args.alpha_lower - 2.0),
-                                                  abs(args.alpha_upper - 2.0)) > 1.0:
-        p.error("alpha must stay within 1 deg of the 2 deg the inlet/outlet split is tagged at")
+    if args.alpha_lower > args.alpha_upper:
+        p.error("--alpha-lower must not exceed --alpha-upper")
+    if args.euler_max_newton is None:
+        args.euler_max_newton = 400 if args.euler_scheme == "muscl" else 100
     args.release = (args.release_solver_memory == "on"
                     or (args.release_solver_memory == "auto" and args.dimension == "3D"))
     args.run_tag = "benchmark_pod_{}_rb{}_{}{}{}{}".format(
@@ -189,6 +198,8 @@ def parse_args(argv=None):
         "" if args.state_scaling == "freestream" else "_unscaled",
         "" if args.cubic_cutoff is None else "_c{:g}".format(args.cubic_cutoff),
         "" if args.parameter_distance == "normalized" else "_rawdist")
+    if args.euler_scheme == "muscl" and "euler" in args.models:
+        args.run_tag += "_muscl"
     return args
 
 
@@ -311,13 +322,15 @@ class Problem:
         mesh, _ = load_dolfinx_mesh(self.mesh_path, comm, tdim=definition["tdim"])
         PETSc.Sys.Print("[{}] mesh {}".format(kind, self.mesh_path))
 
-        boundary_dict = {'inlet': {'rho': 1.0, 'M': definition["mach_0"], 'p': 1.0,
-                                   'alpha': np.radians(2.0)},
-                         'outlet': {'p': 1.0}}
+        # free-stream state of the characteristic far field (alpha is set per sample
+        # through the postprocessor, see set_flow_condition)
+        boundary_dict = {'rho': 1.0, 'M': definition["mach_0"], 'p': 1.0, 'alpha': np.radians(2.0)}
         self.shape = FFDShapeParameterization(definition["ffd_shape"], definition["ffd_degree"],
                                               definition["ffd_block_corners"],
                                               layers=definition["make_layers"]())
         kwargs = dict(asm_overlap=1, ilu_levels=1)
+        if kind == "euler" and args.euler_scheme == "muscl":
+            kwargs = dict(asm_overlap=1, ilu_levels=2, model_class=MUSCLEulerModel)
         if kind == "rans":
             self.reynolds = args.reynolds if args.reynolds is not None else definition["reynolds"]
             kwargs = dict(asm_overlap=1, ilu_levels=2, model_class=CompressibleRANSModel,
@@ -325,19 +338,19 @@ class Problem:
 
         recorder = csdl.Recorder(inline=False)
         recorder.start()
-        wt = DG_windtunnel_model(mesh, boundary_dict, self.shape, definition["aero_center"],
+        # the one moment of the benchmark: pitching moment about the aerodynamic center
+        moments = [("pitch", definition["aero_center"], "pitch")]
+        wt = DG_windtunnel_model(mesh, boundary_dict, self.shape, moments=moments,
                                  mesh_inner_bdry_function=definition["inner_bdry_function"],
                                  poly_order=0, filename_suffix="{}_{}".format(args.run_tag, kind),
                                  **kwargs)
         wt.euler_residual_conv_limit = args.residual_conv_limit
         wt.max_newton_iterations = args.rans_max_newton if kind == "rans" else args.euler_max_newton
-        wt.log_cm_alpha = False
         wt.release_solver_memory = args.release
         wt.write_mesh_deformation = False
         if kind == "euler":
             wt.sim_model.fom_newton_inner_max_it = args.fom_newton_inner_max_it
         wt.set_up_sim()
-        wt.postprocessor.log_cm_alpha = False
 
         shape_vector = self.shape.declare_design_variables()
         self.alpha_var = csdl.Variable(name='alpha', value=np.array([np.radians(2.0)]))
@@ -407,7 +420,9 @@ class Problem:
         motion -> flow solve -> output). Returns (solution_local, mesh_motions,
         solve_walltime, evaluation_walltime), or (None, None, ...) for an
         invalid mesh or (without --keep-nonconverged) a failed solve.
-        The mesh is at its baseline on return.
+        The mesh is left deformed for the sample (it is no longer reset after
+        the evaluation); the callers re-apply the returned mesh motions and
+        reset the mesh themselves.
 
         solve_walltime is the FLOW SOLVE alone, as the windtunnel times it:
         the initial state, the solver set-up, the Newton / pseudo-time solve
@@ -452,7 +467,7 @@ class Problem:
         pp = self.wt.postprocessor
         L, cl = pp.compute_cl(solution_local)
         D, cd = pp.compute_cd(solution_local)
-        M, cm = pp.compute_cm(solution_local)
+        M, cm = pp.compute_moment(solution_local, pp.moment_specs[0])
         return dict(L=L, D=D, M=M, cl=cl, cd=cd, cm=cm)
 
 
