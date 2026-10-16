@@ -27,6 +27,11 @@
   wing's root bending moment and pitching moment in one simulation. **Breaking:** `aero_center` and the outputs
   `M`, `c_m` and `c_m_alpha` (with `log_cm_alpha`) are removed; the old pitching moment is
   `("pitch", aero_center, "pitch")`. The FOM/ROM coefficient histories hold one $c_m$ per moment.
+- Moment points that follow the design: a `MovingPoint(initial)` in `moments` takes its point from a CSDL variable
+  (`evaluate(..., moment_points={name: variable})`) and the moment is differentiated through it. `WingShape` now
+  outputs the mean aerodynamic chord and the wing's aerodynamic center (25% of it), which follow the planform
+  variables, for a pitching moment about the mean aerodynamic center (`examples/wing_opt_rans.py`,
+  `pitch_about_mean_aerodynamic_center`).
 - Partition-independent checkpoints; `examples/flow_analysis.py`, `examples/airfoil_analysis.py` and
   `examples/rans_airfoil_opt.py`.
 - Mesh input from structured multi-block CGNS grids one cell thick (`utils/mesh_io_utils.py`:

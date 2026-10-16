@@ -260,6 +260,69 @@ def test_wing_derivatives_match_central_differences():
 
 
 @pytest.mark.verification
+def test_mean_aerodynamic_center_follows_the_planform():
+    """The mean aerodynamic chord (2/S) int c^2 dy and its station (2/S) int c y dy by quadrature of the
+    straight-tapered planform, and the aerodynamic center at 25% of that chord on the swept
+    planform, at the baseline and at a changed planform."""
+    X, tris = swept_wing(n_span=8)
+    shape, wing = wing_shape(X, tris)
+    b = wing.baseline
+    sim = csdl.experimental.PySimulator(csdl.get_current_recorder())
+    out = shape.outputs()['wing']
+
+    def reference(sweep, c_root, taper, semi_span):
+        y = np.linspace(0., semi_span, 20001)
+        c = c_root * (1. - (1. - taper) * y / semi_span)
+        area = np.trapezoid(c, y)
+        mac = np.trapezoid(c * c, y) / area
+        y_mac = np.trapezoid(c * y, y) / area
+        x_le = b['x_ref_root'] + y_mac * np.tan(sweep) - wing.f * c_root * (1. - (1. - taper) * y_mac / semi_span)
+        return mac, y_mac, np.array([x_le + 0.25 * mac, y_mac, np.polyval(b['z_chord_plane'], y_mac)])
+
+    sim.run()
+    mac, y_mac, ac = reference(b['sweep'], b['root_chord'], b['taper_ratio'], b['semi_span'])
+    np.testing.assert_allclose(out['mean_aerodynamic_chord'].value, mac, rtol=1e-8)
+    np.testing.assert_allclose(out['y_mac'].value, y_mac, rtol=1e-8)
+    np.testing.assert_allclose(out['aerodynamic_center'].value, ac, rtol=1e-8, atol=1e-12)
+    np.testing.assert_allclose(b['aerodynamic_center'], ac, rtol=1e-8, atol=1e-12)
+    np.testing.assert_allclose(b['mean_aerodynamic_chord'], mac, rtol=1e-8)
+
+    point = dict(sweep=np.radians(31.), aspect_ratio=9.1, root_chord=4.3, taper_ratio=0.4)
+    set_values(shape, point)
+    sim.run()
+    semi_span = point['aspect_ratio'] * point['root_chord'] * (1. + point['taper_ratio']) / 4.
+    mac, y_mac, ac = reference(point['sweep'], point['root_chord'], point['taper_ratio'], semi_span)
+    np.testing.assert_allclose(out['mean_aerodynamic_chord'].value, mac, rtol=1e-8)
+    np.testing.assert_allclose(out['aerodynamic_center'].value, ac, rtol=1e-8, atol=1e-12)
+    assert np.abs(out['aerodynamic_center'].value - b['aerodynamic_center']).max() > 0.1
+
+
+@pytest.mark.verification
+def test_mean_aerodynamic_center_derivatives_match_central_differences():
+    X, tris = swept_wing(n_span=8)
+    shape, wing = wing_shape(X, tris)
+    point = dict(sweep=np.radians(29.), aspect_ratio=9.6, root_chord=4.9, taper_ratio=0.33)
+    set_values(shape, point)
+    out = shape.outputs()['wing']
+    ofs = [out['aerodynamic_center'], out['mean_aerodynamic_chord']]
+    wrts = [shape[name] for name in point]
+    sim = csdl.experimental.PySimulator(csdl.get_current_recorder())
+    an = sim.compute_totals(ofs, wrts)
+    h = 1e-6
+    for wrt in wrts:
+        base = wrt.value.copy()
+        vals = []
+        for sign in (1., -1.):
+            sim[wrt] = base + sign * h
+            sim.run()
+            vals.append(np.concatenate([np.asarray(o.value).ravel() for o in ofs]))
+        sim[wrt] = base
+        fd = (vals[0] - vals[1]) / (2 * h)
+        col = np.concatenate([np.asarray(an[o, wrt]).reshape(o.value.size, -1)[:, 0] for o in ofs])
+        np.testing.assert_allclose(col, fd, rtol=1e-6, atol=1e-8)
+
+
+@pytest.mark.verification
 def test_wing_span_and_mode_derivatives_match_central_differences():
     X, tris = swept_wing(n_span=8)
     planform = {'sweep': PLANFORM_BOUNDS['sweep'], 'aspect_ratio': PLANFORM_BOUNDS['aspect_ratio'],
@@ -312,21 +375,26 @@ def test_wing_under_a_non_inline_recorder():
         shape, _ = wing_shape(X, tris, sections=sections)
         set_values(shape, values)
         disp = shape.wall_displacement().value
+        center = shape.outputs()['wing']['aerodynamic_center'].value
         rec.stop()
-        return disp
+        return disp, center
 
     rec = csdl.Recorder(inline=False)
     rec.start()
     shape, _ = wing_shape(X, tris, sections=sections)
     set_values(shape, build_at)
     disp = shape.wall_displacement()
+    center = shape.outputs()['wing']['aerodynamic_center']
     rec.stop()
     sim = csdl.experimental.JaxSimulator(rec, additional_inputs=[shape[n] for n in run_at],
-                                         additional_outputs=[disp], gpu=False)
+                                         additional_outputs=[disp, center], gpu=False)
     for name, value in run_at.items():
         sim[shape[name]] = np.atleast_1d(value)
     sim.run()
-    np.testing.assert_allclose(np.array(sim[disp]), inline_displacement(run_at), rtol=0, atol=1e-12)
+    disp_ref, center_ref = inline_displacement(run_at)
+    np.testing.assert_allclose(np.array(sim[disp]), disp_ref, rtol=0, atol=1e-12)
+    # the aerodynamic center, for a moment point, follows the later values too
+    np.testing.assert_allclose(np.array(sim[center]), center_ref, rtol=0, atol=1e-12)
 
 
 # ---- the generic layers -------------------------------------------------------

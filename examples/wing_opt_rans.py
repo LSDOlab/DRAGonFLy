@@ -30,7 +30,7 @@ from dragonfly_sim.utils.mesh_manager_utils import wing_inner_bdry_function
 from dragonfly_sim.utils.mesh_io_utils import load_dolfinx_mesh
 from dragonfly_sim.core.windtunnel_model import DG_windtunnel_model
 from dragonfly_sim.core.RANS_model import CompressibleRANSModel
-from dragonfly_sim.core.postprocessor import DG_postprocessor
+from dragonfly_sim.core.postprocessor import DG_postprocessor, MovingPoint
 
 from dragonfly_sim.utils.ffd_dv_utils import spanwise_linear_bounds
 from dragonfly_sim.core.shape_design import (FFDShapeParameterization, WingShape,
@@ -196,12 +196,20 @@ if __name__ == '__main__':
     #   pitch:        about the y direction (spanwise axis) through the quarter chord of the
     #                 root section, from the fitted baseline planform (x of the root
     #                 quarter chord, z of the chord plane at the root).
-    # The points are fixed in space, also when a design variable moves the root.
+    # The points are fixed in space, also when a design variable moves the root, unless the
+    # pitching moment is taken about the mean aerodynamic center: then its point is the wing's
+    # aerodynamic_center (25% of the mean aerodynamic chord), which follows the planform variables,
+    # and the constraint holds the moment about it (the baseline limit is about the baseline center).
+    pitch_about_mean_aerodynamic_center = False
     root_quarter_chord = (wing.baseline['x_ref_root'], 0., wing.baseline['z_chord_plane'][1])
+    pitch_point = MovingPoint(wing.baseline['aerodynamic_center']) if pitch_about_mean_aerodynamic_center \
+        else root_quarter_chord
     moments = [("root_bending", (0., 0., 0.), (1., 0., 0.)),
-               ("pitch", root_quarter_chord, (0., 1., 0.))]
-    PETSc.Sys.Print("Moment points: root bending about (0, 0, 0), pitch about the root quarter chord {}"
-                    .format(np.round(root_quarter_chord, 6)))
+               ("pitch", pitch_point, (0., 1., 0.))]
+    PETSc.Sys.Print("Moment points: root bending about (0, 0, 0), pitch about the {} {}".format(
+        "baseline mean aerodynamic center, following the planform," if pitch_about_mean_aerodynamic_center
+        else "root quarter chord", np.round(wing.baseline['aerodynamic_center'] if pitch_about_mean_aerodynamic_center
+                                            else root_quarter_chord, 6)))
 
     # D includes the wall friction (D_friction is its viscous part)
     csdl_coeff_model = DG_postprocessor(csdl_flow_model.mesh, csdl_flow_model.sim_model, csdl_flow_model.WALL_TAG, moments=moments, p_inf_dim=101325.)
@@ -235,7 +243,10 @@ if __name__ == '__main__':
 
     u_vec = csdl_flow_model.evaluate(mesh_nodes_deformation, shape_param_vector, alpha)
 
-    outputs = csdl_coeff_model.evaluate(u_vec, mesh_nodes_deformation, alpha, shape_param_vector)
+    moment_points = {"pitch": shape.outputs()['wing']['aerodynamic_center']} \
+        if pitch_about_mean_aerodynamic_center else None
+    outputs = csdl_coeff_model.evaluate(u_vec, mesh_nodes_deformation, alpha, shape_param_vector,
+                                        moment_points=moment_points)
 
     # c_l/c_d/c_m_<name> are MONITORED ONLY -- no gradient is supplied for them (see
     # DG_postprocessor.evaluate), so they must not become a constraint or

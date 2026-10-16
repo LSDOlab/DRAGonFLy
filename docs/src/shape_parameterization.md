@@ -120,8 +120,15 @@ B-spline. Changing the taper ratio from 0.3 to 0.4 on the 5-section test block m
 from the trapezoid; with 3 sections, up to 0.9% for taper ratios 0.2 to 0.5.
 
 `shape.outputs()['wing']` holds the planform as CSDL variables, for use as constraints: `sweep`, `aspect_ratio`,
-`root_chord`, `taper_ratio`, `tip_chord`, `semi_span`, `span`, `area` (full wing), and `section_chords`.
-`wing.baseline` holds the measured baseline values as numbers, for constraint bounds.
+`root_chord`, `taper_ratio`, `tip_chord`, `semi_span`, `span`, `area` (full wing), and `section_chords`, and the
+mean aerodynamic chord `mean_aerodynamic_chord` $= \tfrac{2}{3}c_r\,(1+\lambda+\lambda^2)/(1+\lambda)$ with its
+spanwise station `y_mac` $= s\,(1+2\lambda)/(3(1+\lambda))$ ($s$ the semi-span, $\lambda$ the taper ratio) and the
+`aerodynamic_center`: the $(x, y, z)$ point at 25% of the mean aerodynamic chord, on the swept planform (the
+reference line at `sweep_chord_fraction` of the local chord) and the baseline chord plane. It moves with the
+planform variables; give it to the postprocessor as a moment point (a `MovingPoint`, see the user guide). The
+$y$ entry does not change a moment about the $y$ axis.
+`wing.baseline` holds the measured baseline values as numbers, for constraint bounds (including
+`aerodynamic_center`).
 
 ## Design-variable set
 `ShapeDVSet` (`shape.dvs`) collects all shape variables in declaration order. `shape.parameter_vector()` is the

@@ -39,6 +39,7 @@ setup(
         'matplotlib',
         'jax',
         'pyvista',
+        'h5py',      # boundary patches of unstructured CGNS grids (utils/mesh_io_utils.read_cgns_patches)
         'networkx',
         # LSDOlab packages, installed from the `main` branch of their public repositories
         'csdl_alpha @ git+https://github.com/LSDOlab/CSDL_alpha.git@main',

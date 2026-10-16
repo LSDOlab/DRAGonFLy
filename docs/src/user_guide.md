@@ -139,8 +139,20 @@ The outputs are `M_<name>` (differentiated with respect to the state, the mesh m
 `c_m_<name>` (monitoring only). The coefficient divides by $\tfrac{1}{2}\rho_\infty|\mathbf{u}_\infty|^2
 S_{ref}\,L_k$, where $L_k$ is the reference chord unless the fourth tuple entry gives another length, e.g. the
 semi-span for a bending coefficient. The reference area and chord change with the 3D geometry, so constrain
-`M_<name>`, not `c_m_<name>`. The directions are fixed in the geometry axes and the points fixed in space, also
-while a shape variable moves the wall: a variable that moves the root station does not move the point. The names
+`M_<name>`, not `c_m_<name>`. The directions are fixed in the geometry axes. A point is fixed in space, also
+while a shape variable moves the wall (a variable that moves the root station does not move it), unless it is given
+as `MovingPoint(initial)`: then `post.evaluate` takes it as a CSDL variable in `moment_points`, and $M$ is
+differentiated with respect to it too ($\partial M/\partial\mathbf{x}_0 = \mathbf{d}\times\mathbf{F}_{total}$).
+The wing's mean aerodynamic center, which follows the planform variables, is such a point
+(see [Shape parameterization](shape_parameterization.md)):
+```python
+from dragonfly_sim.core.postprocessor import MovingPoint
+moments = [("pitch", MovingPoint(wing.baseline['aerodynamic_center']), "pitch")]
+...
+out = post.evaluate(u, mesh_motion, alpha, params,
+                    moment_points={"pitch": shape.outputs()['wing']['aerodynamic_center']})
+```
+`forces_and_coefficients(..., moment_points={name: point})` sets the moving points of a forward analysis. The names
 must be unique identifiers. Each moment costs one assembly of its value and of each derivative.
 
 ## 6. Running

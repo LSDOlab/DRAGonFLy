@@ -10,14 +10,27 @@ from dragonfly_sim.utils.postprocessor_utils import moment_about
 from dragonfly_sim.utils.Euler_utils import pressure
 
 
+class MovingPoint:
+    """A moment point that depends on the design: give it as the point of a moment
+    in place of fixed coordinates, with the value it has before any design is
+    evaluated (e.g. wing.baseline['aerodynamic_center']). DG_postprocessor.evaluate
+    then takes the point as a csdl variable (moment_points={name: variable}), such
+    as WingShape's aerodynamic_center, and differentiates the moment through it."""
+
+    def __init__(self, initial):
+        self.initial = np.asarray(initial, dtype=np.double)
+
+
 class MomentSpec:
     """One moment of the wall force: about `point`, along unit `direction`
     (a 3-vector in 2D too, where only the z entry is read), normalised in the
     coefficient by q*S_ref*ref_length. The values are dolfinx Constants, so the
-    forms built on them stay valid when they change."""
+    forms built on them stay valid when they change. moving: the point is a
+    csdl input of the postprocessor (MovingPoint), set at every evaluation."""
 
-    def __init__(self, mesh, name, point, direction, ref_length=None):
+    def __init__(self, mesh, name, point, direction, ref_length=None, moving=False):
         self.name = name
+        self.moving = moving
         self.point = dolfinx.fem.Constant(mesh, point)
         self.direction = dolfinx.fem.Constant(mesh, direction)
         # None: the postprocessor's reference chord
@@ -40,8 +53,12 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
     pitching moment, (0, 1, 0) in 3D (y spanwise) and (0, 0, -1) in 2D. In 2D
     only the out-of-plane direction (0, 0, +-1) exists. c_m_<name> is
     M / (q S_ref ref_length), the reference chord by default. The directions
-    are fixed in the geometry axes and the points fixed in space, also while
-    a shape design variable moves the wall. Only M_<name> is differentiated:
+    are fixed in the geometry axes. A point is fixed in space, also while a
+    shape design variable moves the wall, unless it is given as MovingPoint(
+    initial): then evaluate takes it as a csdl variable in moment_points (e.g.
+    the wing's mean aerodynamic center, WingShape's aerodynamic_center output,
+    which follows the planform variables) and M_<name> is differentiated with
+    respect to it too, dM/dx0 = d x F_total. Only M_<name> is differentiated:
     S_ref and the reference chord change with the 3D geometry, so constrain
     M_<name>, not c_m_<name>. For a half-wing on a symmetry plane y = 0, the
     root bending moment is ("root_bending", (x0, 0, 0), (1, 0, 0)).
@@ -91,7 +108,8 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
                 raise ValueError("moment name {!r} is not a valid identifier".format(name))
             if name in [spec.name for spec in specs]:
                 raise ValueError("duplicate moment name {!r}".format(name))
-            point = np.asarray(point, dtype=np.double)
+            moving = isinstance(point, MovingPoint)
+            point = np.asarray(point.initial if moving else point, dtype=np.double)
             if point.shape != (dim,):
                 raise ValueError("moment {!r}: point needs {} entries, got {}".format(name, dim, point.shape))
             if isinstance(direction, str):
@@ -111,7 +129,7 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
                 raise ValueError("moment {!r}: in 2D only the out-of-plane direction (0, 0, +-1) exists".format(name))
             if ref_length is not None and not float(ref_length) > 0.0:
                 raise ValueError("moment {!r}: ref_length must be positive".format(name))
-            specs.append(MomentSpec(self.mesh_obj.mesh, name, point, direction, ref_length))
+            specs.append(MomentSpec(self.mesh_obj.mesh, name, point, direction, ref_length, moving))
         return specs
 
     def compute_initial_and_constant_quantities(self):
@@ -297,6 +315,35 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
         ref_length = self._chord_ref_const if spec.ref_length is None else spec.ref_length
         return self.C_infty * ref_length
 
+    def set_moment_points(self, points):
+        """Set the points of moving moments: points maps moment names to arrays of
+        dimension entries; names of fixed moments are rejected."""
+        for name, value in points.items():
+            spec = next((sp for sp in self.moment_specs if sp.name == name), None)
+            if spec is None or not spec.moving:
+                raise ValueError("{!r} is not a moment with a MovingPoint".format(name))
+            value = np.asarray(value, dtype=np.double).reshape(-1)
+            if value.shape != (self.sim_model.dimensions,):
+                raise ValueError("moment {!r}: point needs {} entries, got {}".format(
+                    name, self.sim_model.dimensions, value.shape))
+            spec.point.value = value
+            spec.point_array = value.copy()
+
+    def total_force(self, u_dof_vec):
+        """The integrated wall force vector (3 entries, zero z in 2D)."""
+        force_density = self._pressure_force_vector(u_dof_vec)
+        ds = self.mesh_obj.form_manager.ds(self.wall_meshtag_val)
+        total = np.zeros(3)
+        for i in range(self.sim_model.dimensions):
+            total[i] = self.mesh_obj.mesh.comm.allreduce(
+                dolfinx.fem.assemble_scalar(dolfinx.fem.form(force_density[i] * ds)), MPI.SUM)
+        return total
+
+    def compute_moment_pointderiv(self, u_dof_vec, spec):
+        """dM/d(point) of one moment: M = d . ((X - x0) x F) gives d x F_total (the
+        entries of the dimensions)."""
+        return np.cross(spec.direction_array, self.total_force(u_dof_vec))[:self.sim_model.dimensions]
+
     def compute_moment_form(self, u_dof_vec, spec):
         """The moment M = d . (r x F) of the wall force about spec.point along
         spec.direction, as a scalar form."""
@@ -323,7 +370,7 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
         # so only the derived fields carry any
         return self._assemble_alpha_derivative(self.compute_moment_form(u_dof_vec, spec))
 
-    def forces_and_coefficients(self, u_dof_vec=None, alpha=None):
+    def forces_and_coefficients(self, u_dof_vec=None, alpha=None, moment_points=None):
         """
         Lift and drag and their coefficients of a flow state, and the moments
         and their coefficients, outside any CSDL graph: no FFD block, mesh
@@ -332,9 +379,12 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
         u_dof_vec: the owned state entries (default: the model's current
         u_vec); alpha: angle of attack in radians (default: the model's). For a
         viscous model, D_friction / c_d_friction is the part of the drag from
-        the viscous wall traction. Collective. Returns a dict; "moments" maps
-        each moment name to dict(M=..., c_m=...).
+        the viscous wall traction. moment_points: {name: point} for the moments
+        with a MovingPoint (they keep their last value otherwise). Collective.
+        Returns a dict; "moments" maps each moment name to dict(M=..., c_m=...).
         """
+        if moment_points:
+            self.set_moment_points(moment_points)
         if u_dof_vec is None:
             u_dof_vec = self.sim_model.u_vec.x.petsc_vec.getArray().copy()
         if alpha is not None:
@@ -356,12 +406,19 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
             out["D_friction"], out["c_d_friction"] = self._assemble_value_and_coefficient(form, self.C_infty)
         return out
 
-    def evaluate(self, u_vec, mesh_deformation=None, alpha=None, shape_param_inputs=None):
+    def evaluate(self, u_vec, mesh_deformation=None, alpha=None, shape_param_inputs=None, moment_points=None):
         """Forces and coefficients of the state u_vec. mesh_deformation is the
         volume mesh motion of a shape optimization; leave it out (None) for a
-        forward analysis on the fixed mesh. alpha is required."""
+        forward analysis on the fixed mesh. alpha is required. moment_points maps
+        the name of every moment given with a MovingPoint to a csdl variable of
+        the point (dimension entries), e.g. WingShape's aerodynamic_center."""
         if alpha is None:
             raise ValueError("evaluate needs alpha")
+        moving = [spec.name for spec in self.moment_specs if spec.moving]
+        moment_points = dict(moment_points or {})
+        if sorted(moment_points) != sorted(moving):
+            raise ValueError("moment_points must give a variable for exactly the moments with a MovingPoint {}, "
+                             "got {}".format(moving, sorted(moment_points)))
         # declare input quantities
         self.declare_input('u_vec', u_vec)
         if mesh_deformation is not None:
@@ -369,6 +426,8 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
         self.declare_input('alpha', alpha)
         if shape_param_inputs is not None:
             self.declare_input('shape_param_inputs', shape_param_inputs)
+        for name in moving:
+            self.declare_input('point_' + name, moment_points[name])
 
         # declare output variables
         c_l = self.create_output('c_l', (1,))
@@ -390,6 +449,12 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
                 self.declare_derivative_parameters(of=_output_name, wrt='shape_param_inputs',
                                                    dependent=False)
 
+        # a moving point enters its own moment only
+        for name in moving:
+            for _output_name in coefficient_names + ('L', 'D') + tuple(
+                    'M_' + spec.name for spec in self.moment_specs if spec.name != name):
+                self.declare_derivative_parameters(of=_output_name, wrt='point_' + name, dependent=False)
+
         # construct output of the model
         output = csdl.VariableGroup()
         output.c_l = c_l
@@ -409,6 +474,8 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
         alpha = input_vals['alpha'][0]
         deform_array = input_vals['mesh_deformation'] if 'mesh_deformation' in input_vals else None
         shape_parameters = input_vals['shape_param_inputs'] if 'shape_param_inputs' in input_vals else None
+        self.set_moment_points({spec.name: input_vals['point_' + spec.name]
+                                for spec in self.moment_specs if spec.moving})
 
         # Update the angle of attack and downstream quantities
         self.set_angle_of_attack(alpha)
@@ -460,6 +527,8 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
         alpha = input_vals['alpha'][0]
         deform_array = input_vals['mesh_deformation'] if 'mesh_deformation' in input_vals else None
         shape_parameters = input_vals['shape_param_inputs'] if 'shape_param_inputs' in input_vals else None
+        self.set_moment_points({spec.name: input_vals['point_' + spec.name]
+                                for spec in self.moment_specs if spec.moving})
 
         # Update the angle of attack and downstream quantities
         self.set_angle_of_attack(alpha)
@@ -493,3 +562,5 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
         for spec in self.moment_specs:
             derivatives['M_' + spec.name, 'alpha'] = np.array(
                 [[self.compute_moment_alphaderiv(u_vec, spec)]], dtype=np.float64)
+            if spec.moving:
+                derivatives['M_' + spec.name, 'point_' + spec.name] = self.compute_moment_pointderiv(u_vec, spec)[None, :]

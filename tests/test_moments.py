@@ -17,7 +17,7 @@ from mpi4py import MPI
 
 import csdl_alpha as csdl
 
-from dragonfly_sim.core.postprocessor import DG_postprocessor
+from dragonfly_sim.core.postprocessor import DG_postprocessor, MovingPoint
 from dragonfly_sim.core.windtunnel_model import DG_windtunnel_model
 from dragonfly_sim.utils.postprocessor_utils import moment_about
 
@@ -336,3 +336,106 @@ def test_no_moments_is_allowed(in_tmp_dir):
     wt = make_windtunnel(moments=None)
     _, converged, forces = wt.solve_forward()
     assert converged and forces["moments"] == {}
+
+
+MOVING = {2: [("moving", MovingPoint((0.4, 0.1)), (0., 0., -1.)), ("fixed", (0.25, 0.), "pitch")],
+          3: [("moving", MovingPoint((0.4, 0.1, 0.3)), (0.3, -1.2, 0.8)), ("fixed", (0.25, 0., 0.), "pitch")]}
+
+
+@pytest.mark.parametrize("dim", [2, 3])
+@pytest.mark.verification
+def test_moment_derivative_with_respect_to_a_moving_point(dim, in_tmp_dir):
+    """dM/d(point) = d x F_total, against central differences of the moment with the point
+    moved; a MovingPoint starts at its initial value."""
+    wt = make_windtunnel(moments=MOVING[dim]) if dim == 2 else make_windtunnel_3d(moments=MOVING[dim])
+    post = wt.postprocessor
+    u, converged, _ = wt.solve_forward()
+    assert converged
+    spec = spec_of(post, "moving")
+    assert spec.moving and not spec_of(post, "fixed").moving
+    x0 = np.array(MOVING[dim][0][1].initial)
+    np.testing.assert_array_equal(spec.point_array, x0)
+    analytic = post.compute_moment_pointderiv(u, spec)
+    assert analytic.shape == (dim,) and np.abs(analytic).max() > 1e-4
+    h = 1e-6
+    for i in range(dim):
+        values = []
+        for sign in (1., -1.):
+            x = x0.copy()
+            x[i] += sign * h
+            post.set_moment_points({"moving": x})
+            values.append(post.compute_moment(u, spec)[0])
+        assert (values[0] - values[1]) / (2 * h) == pytest.approx(analytic[i], rel=1e-6, abs=1e-9)
+    post.set_moment_points({"moving": x0})
+    # the same moment as a fixed point at that place
+    fixed = ("same", tuple(x0), MOVING[dim][0][2])
+    other = DG_postprocessor(wt.mesh, wt.sim_model, wt.WALL_TAG, moments=[fixed])
+    assert post.compute_moment(u, spec)[0] == pytest.approx(other.compute_moment(u, other.moment_specs[0])[0], rel=1e-12)
+
+
+@pytest.mark.parametrize("dim", [2, 3])
+@pytest.mark.verification
+def test_csdl_totals_of_a_moment_with_a_design_dependent_point(dim, in_tmp_dir):
+    """The point is a function of a design variable p in the CSDL graph: dM/dp through the
+    chain rule, and the other moment (fixed point) and the forces do not depend on it."""
+    wt = make_windtunnel(moments=MOVING[dim]) if dim == 2 else make_windtunnel_3d(moments=MOVING[dim])
+    p0 = np.array(MOVING[dim][0][1].initial) * 0.5
+    recorder = csdl.Recorder(inline=False)
+    recorder.start()
+    alpha = csdl.Variable(name='alpha', value=np.array([BC['inlet']['alpha']]))
+    alpha.set_as_design_variable()
+    p = csdl.Variable(name='p', value=p0)
+    p.set_as_design_variable()
+    u_vec = wt.evaluate(alpha=alpha)
+    out = wt.postprocessor.evaluate(u_vec, alpha=alpha, moment_points={"moving": 2. * p})
+    out.M_moving.add_name("M_moving")
+    out.M_moving.set_as_objective()
+    out.M_fixed.add_name("M_fixed")
+    out.M_fixed.set_as_constraint(lower=-1e6)
+    out.L.add_name("L")
+    out.L.set_as_constraint(lower=-1e6)
+    recorder.stop()
+    sim = csdl.experimental.JaxSimulator(recorder, gpu=False)
+    sim.run()
+    totals = sim.compute_totals()
+    dM = np.asarray(totals[out.M_moving, p]).ravel()
+    assert dM.shape == (dim,)
+    assert np.abs(np.asarray(totals[out.M_fixed, p])).max() == 0.0
+    assert np.abs(np.asarray(totals[out.L, p])).max() == 0.0
+    post = wt.postprocessor
+    u = wt.sim_model.u_vec.x.petsc_vec.getArray().copy()
+    h = 1e-6
+    for i in range(dim):
+        values = []
+        for sign in (1., -1.):
+            x = p0.copy()
+            x[i] += sign * h
+            values.append(post.forces_and_coefficients(u, moment_points={"moving": 2. * x})["moments"]["moving"]["M"])
+        assert (values[0] - values[1]) / (2 * h) == pytest.approx(dM[i], rel=1e-6, abs=1e-9), i
+    assert float(sim[out.M_moving][0]) == pytest.approx(
+        post.forces_and_coefficients(u, moment_points={"moving": 2. * p0})["moments"]["moving"]["M"], rel=1e-12)
+
+
+@pytest.mark.unit_test
+def test_moving_points_must_be_given_to_evaluate_and_have_the_right_size(in_tmp_dir):
+    wt = make_windtunnel(moments=MOVING[2])
+    post = wt.postprocessor
+    recorder = csdl.Recorder(inline=False)
+    recorder.start()
+    alpha = csdl.Variable(name='alpha', value=np.array([BC['inlet']['alpha']]))
+    u_vec = wt.evaluate(alpha=alpha)
+    # an operation can be evaluated once: one postprocessor per attempt
+    def fresh():
+        return DG_postprocessor(wt.mesh, wt.sim_model, wt.WALL_TAG, moments=MOVING[2])
+    with pytest.raises(ValueError, match="MovingPoint"):
+        fresh().evaluate(u_vec, alpha=alpha)
+    with pytest.raises(ValueError, match="MovingPoint"):
+        fresh().evaluate(u_vec, alpha=alpha, moment_points={"moving": csdl.Variable(value=np.zeros(2)),
+                                                            "fixed": csdl.Variable(value=np.zeros(2))})
+    recorder.stop()
+    with pytest.raises(ValueError, match="not a moment with a MovingPoint"):
+        post.set_moment_points({"fixed": np.zeros(2)})
+    with pytest.raises(ValueError, match="needs 2 entries"):
+        post.set_moment_points({"moving": np.zeros(3)})
+    with pytest.raises(ValueError, match="point needs 2"):
+        DG_postprocessor(wt.mesh, wt.sim_model, wt.WALL_TAG, moments=[("a", MovingPoint((0., 0., 0.)), "pitch")])

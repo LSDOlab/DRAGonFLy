@@ -510,6 +510,9 @@ class WingShape(ShapeLayer):
         c_tip = c_root + chord_slope * s0
         x_ref_root = le_fit[1] + self.f * c_root
         ref_slope = le_fit[0] + self.f * chord_slope
+        lam = c_tip / c_root
+        mac, y_mac = self.mean_aerodynamic_chord(c_root, lam, s0)
+        x_ac = x_ref_root + ref_slope * y_mac + (0.25 - self.f) * mac
         return {'sweep': float(np.arctan(ref_slope)),
                 'aspect_ratio': float(4. * s0 / (c_root + c_tip)),
                 'root_chord': float(c_root),
@@ -520,7 +523,20 @@ class WingShape(ShapeLayer):
                 'x_ref_root': float(x_ref_root),
                 'ref_slope': float(ref_slope),
                 'x_le': le_fit, 'z_chord_plane': z_fit,
+                'mean_aerodynamic_chord': float(mac), 'y_mac': float(y_mac),
+                'aerodynamic_center': np.array([x_ac, y_mac, np.polyval(z_fit, y_mac)], dtype=float),
                 'fit_residual': float(residual)}
+
+    @staticmethod
+    def mean_aerodynamic_chord(root_chord, taper_ratio, semi_span):
+        """(c_mac, y_mac) of a straight-tapered half-wing: the mean aerodynamic chord
+        (2/3) c_r (1 + lam + lam^2) / (1 + lam), which is the local chord at the
+        spanwise station y_mac = s (1 + 2 lam) / (3 (1 + lam)). Plain arithmetic, so
+        it takes numbers and csdl variables alike."""
+        lam = taper_ratio
+        mac = (2. / 3.) * root_chord * (1. + lam + lam * lam) / (1. + lam)
+        y_mac = semi_span * (1. + 2. * lam) / (3. * (1. + lam))
+        return mac, y_mac
 
     def _setup_sections(self, ffd):
         C = ffd.baseline_coefficients
@@ -658,17 +674,29 @@ class WingShape(ShapeLayer):
                                    self.mode_weights[key][m])
 
         tip_chord = root_chord * taper_ratio
+        # the mean aerodynamic chord and the aerodynamic center, at 25% of it, on the
+        # swept reference line (at the fraction self.f of the local chord) of the new planform
+        mac, y_mac = self.mean_aerodynamic_chord(root_chord, taper_ratio, semi_span)
+        x_ac = self.baseline['x_ref_root'] + y_mac * csdl.tan(sweep) + (0.25 - self.f) * mac
+        z_ac = self.baseline['z_chord_plane'][0] * y_mac + self.baseline['z_chord_plane'][1]
+        aerodynamic_center = csdl.concatenate([x_ac, y_mac, z_ac], axis=0)
         self._outputs = {'sweep': sweep, 'aspect_ratio': aspect_ratio,
                          'root_chord': root_chord, 'taper_ratio': taper_ratio,
                          'tip_chord': tip_chord, 'semi_span': semi_span,
                          'span': 2. * semi_span,
                          'area': (root_chord + tip_chord) * semi_span,
-                         'section_chords': chord}
+                         'section_chords': chord,
+                         'mean_aerodynamic_chord': mac, 'y_mac': y_mac,
+                         'aerodynamic_center': aerodynamic_center}
 
     def outputs(self):
         """Planform quantities as csdl variables: sweep, aspect_ratio,
-        root_chord, taper_ratio, tip_chord, semi_span, span, area (full wing)
-        and section_chords (at the FFD sections)."""
+        root_chord, taper_ratio, tip_chord, semi_span, span, area (full wing),
+        section_chords (at the FFD sections), the mean aerodynamic chord
+        (mean_aerodynamic_chord) with its spanwise station y_mac, and the
+        aerodynamic center, the (x, y, z) point at 25% of the mean aerodynamic chord
+        (aerodynamic_center, a vector of 3), which moves with the planform
+        variables. The baseline values are in wing.baseline."""
         return getattr(self, '_outputs', {})
 
     def describe(self):
