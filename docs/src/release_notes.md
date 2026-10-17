@@ -27,6 +27,12 @@
 - Mesh input from structured multi-block CGNS grids one cell thick (`utils/mesh_io_utils.py`:
   `load_dolfinx_mesh`, `cgns_to_dolfinx_mesh`), reduced to a 2D quadrilateral mesh in memory;
   `examples/flow_analysis.py --mesh` accepts them.
+- `TimeIntegrator.advance(..., newton_criterion="incremental")` judges the Newton convergence of an unsteady step by
+  its update instead of the volume-weighted residual (the default, unchanged), whose rounding error exceeds any
+  useful tolerance on grids with a distant far field.
+- `examples/ONERA-OAT15A/oat15a_urans.py`: forward unsteady RANS of the OAT15A airfoil on a Rizzi grid, started
+  from a pseudo-transient steady state, with memory monitoring and restart; `examples/memory_guard.py` kills a
+  command that exceeds a memory limit.
 - ONERA OAT15A validation case (`examples/ONERA-OAT15A/`): SA-neg RANS mesh-sensitivity study on the Rizzi grids
   at $M = 0.73$, $Re = 3\times10^6$ (preliminary results on grids 1-4).
 - `FileWriter` gathers piecewise-constant and continuous fields to rank 0, so VTX output shows no seams at the

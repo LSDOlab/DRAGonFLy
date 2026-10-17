@@ -22,3 +22,12 @@ for N = 1 to 6. Only the `.cgns` files are used; the `.ugrid`, `.mapbc` and `.pw
 The case can also run on ONERA's structured Rizzi grids (`--mesh-family rizzi`), available at
 <https://dpw.larc.nasa.gov/DPW8/ONERA_OAT15A/ONERA-Rizzi_Grids.REV00/>. It expects them at
 `meshes/ONERA-ONERA-OAT15A-Rizzi/gridN/OAT15A_Rizzi_N.cgns`, for N = 1 to 7.
+
+## DLR-F25 aircraft
+`examples/DLR-F25/prepare_geometry.py` reads DLR's CATIA geometry of the DLR-F25 aircraft,
+`DLR-F25_V6_Academia.stp` (the academic release, a surface model in mm), from this directory. It writes its
+results to `meshes/DLR-F25/`:
+
+- `DLR-F25_no_engine.stp`: the aircraft without its engine
+- `DLR-F25_fluid.brep`: the fluid domain
+- `DLR-F25_half.xao`: the gmsh geometry with physical groups

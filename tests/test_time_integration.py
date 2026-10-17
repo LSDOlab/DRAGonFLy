@@ -116,7 +116,7 @@ def _farfield_square(n=6, transverse=False, beta=0.0):
     return model, tf
 
 
-def _run_steps(model, tf, steps, dt=0.05):
+def _run_steps(model, tf, steps, dt=0.05, **advance_kwargs):
     integrator = model.enable_time_stepping()
     model.set_up_solver()
     if tf is not None:
@@ -125,7 +125,7 @@ def _run_steps(model, tf, steps, dt=0.05):
     integrator.start()
     ctrl = StepSizeController(dt=dt)
     for _ in range(steps):
-        rec = integrator.advance(ctrl)
+        rec = integrator.advance(ctrl, **advance_kwargs)
         assert rec.accepted
     return integrator
 
@@ -146,6 +146,19 @@ def _perturb(model):
     a[:, 0] *= 1 + bump
     a[:, 3] *= 1 + bump
     model.u_vec.x.scatter_forward()
+
+
+def test_incremental_newton_criterion_matches_residual_criterion():
+    """Judging Newton by the update instead of |R*| (advance's newton_criterion,
+    for meshes whose volume-weighted residual is dominated by rounding error)
+    gives the same BDF2 steps to the tolerance."""
+    states = []
+    for kwargs in ({}, {"newton_criterion": "incremental", "newton_rtol": 1e-10, "newton_atol": 1e-13}):
+        model, _ = _farfield_square()
+        _perturb(model)
+        _run_steps(model, None, 4, **kwargs)
+        states.append(model.u_vec.x.array.copy())
+    np.testing.assert_allclose(states[1], states[0], rtol=0, atol=1e-8)
 
 
 def test_transverse_farfield_with_beta_zero_is_riemann():

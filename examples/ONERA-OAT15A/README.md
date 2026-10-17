@@ -16,3 +16,9 @@ python oat15a_analysis.py --plot <run folder>/results.csv --figure-dir figures
 
 `figures/rizzi/` holds the figures of the Rizzi-grid sweep shown on the documentation page, and
 `data/rizzi_results.csv` its results (grids 1-7, all five angles of attack).
+
+`oat15a_urans.py` runs a forward unsteady RANS simulation on one Rizzi grid (default grid 8) at $\alpha = 10°$.
+It is memory hungry on the finer grids: run it under `../memory_guard.py`, for example
+```
+python ../memory_guard.py --max-gib 10 -- mpirun -n 8 python oat15a_urans.py --out-dir <output folder>
+```

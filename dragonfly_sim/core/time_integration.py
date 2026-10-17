@@ -329,12 +329,22 @@ class TimeIntegrator:
             self._copy(self.term.U_nm1, self.model.u_vec)
 
     def advance(self, step_control, order=2, newton_rtol=1e-8, newton_atol=1e-10,
-                newton_max_it=20, dual_time=None):
+                newton_max_it=20, dual_time=None, newton_criterion="residual"):
         """
         One physical time step from U^n. The step size comes from
         step_control (StepSizeController); a failed Newton solve restores
         U^n and halves dt, up to step_control.max_retries times.
         `dual_time` (a CFLController) switches the inner solve to PTC on R*.
+
+        newton_criterion is the solver's convergence test: "residual" judges
+        |R*| against max(newton_atol, newton_rtol |R*_0|), "incremental" judges
+        the Newton update (at least two steps; |dx_k| < newton_atol or
+        |dx_k| < newton_rtol |dx_1|). R* is volume weighted and its mass term
+        is evaluated with rounding error of about eps |a_i|/dt |M U|; where
+        some cells are huge (a far field hundreds of chords away: |M U| ~ 1e9
+        on the OAT15A grids) that floor lies above any absolute tolerance
+        worth setting, and it grows as dt is halved, so a restarted step only
+        fails again. The update, in state units, has no such floor.
         Returns a StepRecord; record.accepted is False if every retry failed.
         """
         m, term = self.model, self.term
@@ -349,7 +359,7 @@ class TimeIntegrator:
                 b.prepare(k, ratio, dt)
             if dual_time is None:
                 term.set_cfl(None)
-                ok, rec = self._newton_solve(newton_rtol, newton_atol, newton_max_it)
+                ok, rec = self._newton_solve(newton_rtol, newton_atol, newton_max_it, newton_criterion)
             else:
                 ok, rec = self._dual_time_solve(dual_time, newton_rtol, newton_atol, newton_max_it)
             if ok:
@@ -370,11 +380,11 @@ class TimeIntegrator:
         self._copy(term.U_n, m.u_vec)
         return rec
 
-    def _newton_solve(self, rtol, atol, max_it):
+    def _newton_solve(self, rtol, atol, max_it, criterion="residual"):
         m = self.model
         solver = m.solver
         crit = (solver.convergence_criterion, solver.rtol, solver.atol, solver.max_it)
-        solver.convergence_criterion, solver.rtol, solver.atol, solver.max_it = "residual", rtol, atol, max_it
+        solver.convergence_criterion, solver.rtol, solver.atol, solver.max_it = criterion, rtol, atol, max_it
         snes = solver.snes
         snes.setConvergenceHistory(reset=True)
         try:

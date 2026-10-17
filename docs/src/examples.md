@@ -37,6 +37,24 @@ Euler, laminar or SA-neg RANS from any XDMF mesh or structured CGNS grid (`--mes
 `--dual-time`), with the split, `riemann` or `riemann2` far field. Writes `result.csv` or `history.csv`, wall
 $C_p$/$c_f$ files, optional VTX fields, and a checkpoint for `--restart`. See `--help`.
 
+## `ONERA-OAT15A/oat15a_urans.py`: unsteady RANS of the OAT15A airfoil
+Forward unsteady SA-neg RANS on one Rizzi grid (default grid 8, 667,648 cells) at $M_\infty = 0.73$,
+$Re = 3\times10^6$ and $\alpha = 10^\circ$ (`--alpha`). A pseudo-transient continuation first brings the flow
+from the free stream to a steady state (`--init-steps`; with `--init-steps 0` the start is impulsive and very
+stiff), then BDF2 time stepping with the settings of `flow_analysis.py --unsteady`. Times are in convective units
+$t^* = tU_\infty/c$. It writes `history.csv` (coefficients and memory per step), wall $C_p$/$c_f$ files, optional
+VTX fields, and checkpoints for `--restart`, including one of the initial state (`checkpoint_init.npz`).
+
+The run checks its memory after every time step and every 10 pseudo-transient steps. If the ranks together use
+more than `--max-mem-gib` (default: 60 % of the machine's memory) or less than `--min-available-gib` is left, it
+checkpoints and exits with status 3. `examples/memory_guard.py` is the backstop for a spike inside a step: it
+launches the whole command, watches the memory of all its processes and of the machine from outside, and kills
+it above a limit:
+```sh
+$ python examples/memory_guard.py --max-gib 10 -- \
+      mpirun -n 8 python examples/ONERA-OAT15A/oat15a_urans.py --out-dir <output folder>
+```
+
 ## `wing_opt.py`: 3D wing
 | | |
 |---|---|
@@ -45,6 +63,18 @@ $C_p$/$c_f$ files, optional VTX fields, and a checkpoint for `--restart`. See `-
 | Design variables | `WingShape` on a 3 x 5 x 2 swept, tapered FFD block: quarter-chord sweep $\in [20^\circ, 30^\circ]$, aspect ratio $\in [7.5, 10]$, root chord $\in [4.5, 5.5]$, taper ratio $\in [0.2, 0.4]$; thickness ($\pm 10\%$) and camber ($\pm 0.01$ chord) at the 5 spanwise sections; $\alpha \in [1.5^\circ, 2.5^\circ]$ |
 | Objective, constraint | minimize drag $D$ subject to lift $L \ge 10$ |
 | Optional (commented out) | raw control-point motions; planform-area, volume and thickness constraints |
+
+## `DLR-F25/prepare_geometry.py`: DLR-F25 aircraft geometry
+Prepares the geometry, not the mesh, for a half-model volume mesh around the DLR-F25 aircraft without its
+wing-mounted engine, from DLR's CATIA STEP file (`meshes/DLR-F25_V6_Academia.stp`, not in the repository):
+1. It removes the nacelle, pylon and strake, and closes the pylon cut-out in the wing by re-trimming the wing's
+   own CATIA surfaces, so the wing sections there are its original airfoils.
+2. It caps the aircraft at the symmetry plane $y = 0$, merges the sub-millimetre edges of the CATIA geometry, and
+   cuts the aircraft out of a far-field box.
+3. It writes the domain, in metres, as a gmsh XAO file. The file has the physical groups `fluid` (1), `wall` (2),
+   `symmetry` (5) and `farfield` (6), numbered as the boundary tags of `DG_windtunnel_model`.
+
+It needs `python-gmsh` and `pythonocc-core` (in `environment.yml`). See `examples/DLR-F25/README.md`.
 
 ## Validation
 Validation cases compare DRAGonFLy with experiments and other solvers, and test how the results depend on the

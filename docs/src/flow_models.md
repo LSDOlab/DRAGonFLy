@@ -98,8 +98,14 @@ differentiates. A model that uses neither builds neither, and the plain Newton s
 | Mode | How to select | What it does |
 |---|---|---|
 | Steady PTC | `model.use_ptc = True` before `set_up_solver()` | Physical term off. One Newton step per pseudo step; the CFL law adapts the step from the steady residual. `solve_system()` runs it. |
-| Unsteady BDF | `integrator = model.enable_time_stepping()` | BDF1 start, then variable-step BDF2. Newton per step to the residual criterion; a time-step ramp and halving on failure (`StepSizeController`). |
+| Unsteady BDF | `integrator = model.enable_time_stepping()` | BDF1 start, then variable-step BDF2. Newton per step to the residual criterion (or, with `advance(..., newton_criterion="incremental")`, to the size of the update); a time-step ramp and halving on failure (`StepSizeController`). |
 | Dual time | `model.enable_time_stepping(dual_time=True)` | As unsteady, with PTC on $R^*$ inside every physical step. |
+
+The residual criterion is the default. $R^*$ is weighted by the cell volumes, and its mass term is evaluated with a
+rounding error of about $\varepsilon\,|a_i|\,\|MU\|/\Delta t$ ($M$ the cell volumes). On a grid with a far field
+hundreds of chords away, $\|MU\|$ is of order $10^9$ and this floor lies above any useful absolute tolerance, and
+rises when a failed step is retried with a smaller $\Delta t$ (on the OAT15A Rizzi grids, every step after a
+steady start failed). Use `newton_criterion="incremental"` there, which tests the Newton update in state units.
 
 The CFL law (`CFLController`) is switched evolution relaxation with these safeguards:
 

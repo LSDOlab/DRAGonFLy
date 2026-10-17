@@ -1,5 +1,6 @@
 # Conda environment for DRAGonFLy:  conda env create -f environment.yml
-# fenics-dolfinx and mpich are only distributed through conda-forge; everything else
+# fenics-dolfinx and mpich are only distributed through conda-forge, and gmsh and pythonocc-core (used to prepare
+# CAD geometry, examples/DLR-F25) are taken from there so that they share one OpenCASCADE build; everything else
 # (including the LSDOlab packages on their `main` branches) is installed by pip from setup.py.
 name: dragonfly
 channels:
@@ -10,6 +11,8 @@ dependencies:
   - mpich
   - pyvista
   - networkx
+  - python-gmsh
+  - pythonocc-core
   - pip
   - pip:
       - -e .[test,docs]
