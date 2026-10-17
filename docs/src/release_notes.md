@@ -1,6 +1,10 @@
 # Release notes
 
 ## 0.2.0 (unreleased)
+- Output-sensitivity weights on the `local_weighted` POD snapshot distance: `utils/dv_sensitivity.py` reads the
+  total derivatives of the objective and constraints from the optimizer (`attach_total_derivative_probe`) and
+  `ReducedOrderModel(distance_weighting=...)` weights the distance with them. Unweighted unless a probe supplies
+  them.
 - Compressible RANS at p = 0 (`CompressibleRANSModel`): Spalart-Allmaras (SA-neg) or laminar Navier-Stokes,
   Green-Gauss gradient reconstruction eliminated exactly from Newton, MUSCL inviscid flux, adiabatic no-slip
   walls. The turbulence closure is a plug-in (`TurbulenceModel`).
