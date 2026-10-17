@@ -62,6 +62,35 @@ still counts in the singular values and in the weights of `local_weighted`. `POD
   directions), and a smaller $c$ lets more snapshots contribute to it. Only snapshots with a basis column count
   towards `rb_size`, not repeated parameter vectors. `parameter_scales` weights the parameters in the distance.
 
+### Output-sensitivity weights in an optimization
+
+Shape variables and the angle of attack differ in units and in how strongly the outputs respond to them, so the
+plain Euclidean distance is dominated by whichever parameter has the largest range. Inside an optimization the
+adjoint already gives the total derivatives of the objective and constraints, $\mathrm{d}F/\mathrm{d}p_j$.
+`utils/dv_sensitivity.py` reads them without extra solves and `ReducedOrderModel.set_distance_sensitivities`
+turns them into one weight per parameter,
+
+$$
+s_j = \lVert [\partial F_1/\partial p_j, \dots, \partial F_m/\partial p_j] \rVert_2,
+$$
+
+normalized to mean 1 and multiplied into the distance (and with `parameter_scales`). `distance_weighting` selects
+`'total_derivative'` (default; each output divided by its own magnitude), `'total_derivative_raw'` or `None`.
+The weights come from the design variables of the CSDL problem, which must be the snapshot parameters (the shape
+variables, then alpha).
+
+```python
+from dragonfly_sim.utils.dv_sensitivity import attach_total_derivative_probe
+
+sim = csdl.experimental.JaxSimulator(recorder, gpu=False)
+attach_total_derivative_probe(sim, printer=PETSc.Sys.Print,
+                              on_norms=model.reduced_order_model.set_distance_sensitivities)
+```
+
+Without the probe there is no information and the distance is left unweighted, also for
+`basis_mode="local_weighted"`. The same holds before the first gradient evaluation, and when the weights do not fit
+the parameter vector. The weights come from the previous design point, so they lag the basis by one evaluation.
+
 ## Inner product
 
 By default (`inner_product="euclidean"`, `state_scaling="freestream"`), snapshots and basis use the

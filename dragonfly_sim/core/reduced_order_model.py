@@ -412,7 +412,15 @@ class ReducedOrderModel:
                          cubic_cutoff = c sets the cubic support radius to
                          c min_dist + (1 - c) max_dist, widened if needed so
                          that the rb_size nearest snapshots keep a weight
-      parameter_scales   per-parameter factors on the snapshot distance
+      parameter_scales   fixed per-parameter factors on the snapshot distance
+      distance_weighting output-sensitivity weights on the snapshot distance, from the
+                         total derivatives of the objective and constraints
+                         (utils/dv_sensitivity.py): None (off), 'total_derivative'
+                         (default; outputs divided by their own magnitude) or
+                         'total_derivative_raw'. They are multiplied with
+                         parameter_scales. Without a derivative probe feeding
+                         set_distance_sensitivities there is no information, and the
+                         distance stays unweighted
 
     Inner product (default: Euclidean with free-stream state scaling)::
 
@@ -441,7 +449,8 @@ class ReducedOrderModel:
 
     def __init__(self, rb_size=20, basis_mode='global', max_rank=None, qr_rank_tol=1e-10,
                  weightfunction='Cubic', n_nonzero_weights=None, cubic_cutoff=None,
-                 parameter_scales=None, inner_product='euclidean', state_scaling='freestream',
+                 parameter_scales=None, distance_weighting='total_derivative',
+                 inner_product='euclidean', state_scaling='freestream',
                  newton_max_it=15, newton_rtol=1e-10, newton_atol=1e-12, stall_window=3,
                  stall_rtol=1e-10, max_outer_iterations=3, g_conv_limit=1e-12, line_search=True,
                  eta_threshold=1e-10, min_snapshots=2, run_fom_every_evaluation=False):
@@ -458,6 +467,15 @@ class ReducedOrderModel:
         self.n_nonzero_weights = n_nonzero_weights
         self.cubic_cutoff = cubic_cutoff
         self.parameter_scales = parameter_scales
+        if distance_weighting not in (None, 'total_derivative', 'total_derivative_raw'):
+            raise ValueError("distance_weighting must be None, 'total_derivative' or "
+                             "'total_derivative_raw', got {!r}".format(distance_weighting))
+        self.distance_weighting = distance_weighting
+        # Latest mean-normalized weights, written by set_distance_sensitivities;
+        # None until a gradient evaluation has been probed. They lag the basis
+        # they weight by one design point.
+        self.distance_sensitivities = None
+        self._warned_weight_size = False
         self.inner_product = inner_product
         self.state_scaling = state_scaling
         self.newton_max_it = newton_max_it
@@ -511,6 +529,54 @@ class ReducedOrderModel:
                             self.basis_mode, self.rb_size, self.max_rank, layout.getSize(),
                             self.inner_product,
                             "" if self.scales is None else ", state scales {}".format(self.scales)))
+
+    def set_distance_sensitivities(self, norms):
+        """Take the weights of the snapshot distance from the total-derivative
+        norms of dv_sensitivity (the `norms` dict its probe passes to
+        `on_norms`): ||dF/dp_j|| over the objective and constraints, normalized
+        to mean 1. Unusable norms (non-finite, or all zero) keep the previous
+        weights."""
+        if self.distance_weighting is None:
+            return
+        weights = norms['column_norms_relative'] if self.distance_weighting == 'total_derivative' \
+            else norms['column_norms']
+        if weights is None:
+            # no output values in the derivative result
+            PETSc.Sys.Print("ROM distance weighting: output values unavailable, using the raw "
+                            "total-derivative norms for this evaluation")
+            weights = norms['column_norms']
+        weights = np.asarray(weights, dtype=float).ravel()
+        if not np.all(np.isfinite(weights)) or not np.any(weights > 0.):
+            PETSc.Sys.Print("ROM distance weighting: the total-derivative norms are all zero or "
+                            "not finite; keeping the previous weights")
+            return
+        self.distance_sensitivities = weights / weights.mean()
+        inert = "" if self.basis_mode == 'local_weighted' else \
+            " -- NOT IN USE, basis_mode is '{}'".format(self.basis_mode)
+        PETSc.Sys.Print("ROM distance weights ({}, {} parameters, mean-normalized): min {:.4e}, "
+                        "median {:.4e}, max {:.4e}{}".format(
+                            self.distance_weighting, weights.shape[0],
+                            self.distance_sensitivities.min(), np.median(self.distance_sensitivities),
+                            self.distance_sensitivities.max(), inert))
+
+    def _distance_weights(self, n_parameters):
+        """The per-parameter factors on the snapshot distance: parameter_scales
+        times the output-sensitivity weights. None where there is neither, and
+        the sensitivity part is dropped when it does not fit the parameter
+        vector (e.g. alpha is not a design variable)."""
+        scales = None if self.parameter_scales is None else np.asarray(self.parameter_scales, dtype=float)
+        weights = self.distance_sensitivities
+        if self.distance_weighting is None or weights is None:
+            return scales
+        if weights.shape[0] != n_parameters:
+            if not self._warned_weight_size:
+                PETSc.Sys.Print("ROM distance weighting: {} weights do not fit the {}-entry parameter "
+                                "vector; using the distance without them. They come from the design "
+                                "variables of the CSDL problem, which must be the snapshot "
+                                "parameters.".format(weights.shape[0], n_parameters))
+                self._warned_weight_size = True
+            return scales
+        return weights if scales is None else scales * weights
 
     def _diagonal(self, model, mass_power, scale_power):
         """diag(M^mass_power D^scale_power) as a Vec in the state layout, on
@@ -573,7 +639,7 @@ class ReducedOrderModel:
         comm = model.mesh_obj.mesh.comm
         self.pod.construct_basis(rb_size=self.rb_size,
                                  local_parametervector=np.asarray(parameter_vector, dtype=float),
-                                 parameter_weights=self.parameter_scales,
+                                 parameter_weights=self._distance_weights(len(parameter_vector)),
                                  weightfunction=self.weightfunction,
                                  n_nonzero_weights=self.n_nonzero_weights,
                                  cubic_cutoff=self.cubic_cutoff,
