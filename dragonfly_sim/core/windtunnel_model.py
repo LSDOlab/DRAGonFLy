@@ -421,7 +421,7 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
 
         return u_vec
 
-    def solve_forward(self, alpha=None):
+    def solve_forward(self, alpha=None, snapshot=True):
         """
         One flow solve on the current (undeformed) mesh, without CSDL: set
         alpha (radians; default: the boundary dictionary's), solve, print the
@@ -429,13 +429,21 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         first. Returns (u_vec array, converged, forces), forces being
         DG_postprocessor.forces_and_coefficients (L, D, c_l, c_d, the moments, and
         the friction drag for a viscous model).
+
+        The ROM (if any) stores the solve as a snapshot at the parameter vector
+        (alpha). With shape parameters that vector is longer, so a solve for a
+        baseline that is not a design of the optimization passes snapshot=False.
         """
         if alpha is not None:
             self.sim_model.set_angle_of_attack(alpha)
             self.postprocessor.set_angle_of_attack(alpha)
         self.sim_model.compute_weakform()
-        solution, converged = self._solve(
-            self._parameter_vector(None, self.sim_model.farfield_conditions['alpha']))
+        rom, self.reduced_order_model = self.reduced_order_model, (self.reduced_order_model if snapshot else None)
+        try:
+            solution, converged = self._solve(
+                self._parameter_vector(None, self.sim_model.farfield_conditions['alpha']))
+        finally:
+            self.reduced_order_model = rom
         self.sim_model.last_solve_converged = converged
         if np.isfinite(np.linalg.norm(solution)):
             self.previous_solution = solution

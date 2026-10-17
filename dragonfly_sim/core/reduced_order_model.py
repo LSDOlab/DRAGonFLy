@@ -608,9 +608,19 @@ class ReducedOrderModel:
     # ------------------------------------------------------------------
     # Snapshots and solve
     # ------------------------------------------------------------------
+    def _check_parameter_size(self, parameter_vector):
+        stored = self.pod.snapshot_matrix.snapshot_list_parameters
+        if len(stored) and np.size(stored[0]) != np.size(parameter_vector):
+            raise ValueError(
+                "the snapshots hold {} parameters, but this design has {}: every solve must use the "
+                "same parameter vector (shape parameters, then alpha). A solve_forward() without "
+                "shape parameters mixed into a shape optimization does this; pass snapshot=False to "
+                "it.".format(np.size(stored[0]), np.size(parameter_vector)))
+
     def add_snapshot(self, model, parameter_vector):
         """Add the model's current u_vec as the snapshot at parameter_vector.
         Returns whether it added a basis direction. Collective."""
+        self._check_parameter_size(parameter_vector)
         added = self.pod.snapshot_matrix.process_and_append_to_snapshot_lists(
             model.u_vec.x.petsc_vec, np.asarray(parameter_vector, dtype=float))
         self.pod.snapshot_matrix.print_info()
@@ -631,6 +641,7 @@ class ReducedOrderModel:
         any earlier one is discarded first. Collective.
         """
         self.discard_adjoint()
+        self._check_parameter_size(parameter_vector)
         if self.n_snapshots < self.min_snapshots:
             PETSc.Sys.Print("ROM: {} snapshot(s) stored, {} needed; skipping the ROM solve".format(
                 self.n_snapshots, self.min_snapshots))

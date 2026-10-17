@@ -570,3 +570,19 @@ def test_reduced_adjoint_is_the_lspg_adjoint():
     model.problem.f.array[:] += df[model.rs:model.re]
     u1 = global_array(comm, rom.solve(model, np.array([0.5])).solution)
     assert g @ (u1 - u0) == pytest.approx(psi @ df, rel=1e-9)
+
+
+@pytest.mark.unit_test
+def test_solve_forward_without_snapshot_and_parameter_size_guard(in_tmp_dir):
+    """A baseline solve with snapshot=False stores nothing; snapshots of a
+    different parameter count are refused with a clear error (not a scipy
+    cdist failure)."""
+    rom = ReducedOrderModel(rb_size=2)
+    wt = make_windtunnel("euler", rom=rom)
+    wt.solve_forward(np.radians(2.0), snapshot=False)
+    assert rom.n_snapshots == 0
+    assert wt.reduced_order_model is rom
+    wt.solve_forward(np.radians(2.0))
+    assert rom.n_snapshots == 1
+    with pytest.raises(ValueError, match="same parameter vector"):
+        rom.add_snapshot(wt.sim_model, np.zeros(26))
