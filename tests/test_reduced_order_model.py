@@ -298,7 +298,10 @@ def test_windtunnel_accepts_the_rom_between_snapshots(in_tmp_dir, kind, eta_thre
     the FOM runs too and the coefficient errors are recorded."""
     rom = ReducedOrderModel(rb_size=5, eta_threshold=eta_threshold, run_fom_every_evaluation=run_fom)
     wt = make_windtunnel(kind, rom=rom)
-    out = [wt.solve_forward(np.radians(a)) for a in ALPHAS]
+    out = []
+    for a in ALPHAS:
+        out.append(wt.solve_forward(np.radians(a)))
+        wt.eval_idx += 1                 # as solve_residual_equations does: records match by eval_idx
     assert all(c for _, c, _ in out)
     assert rom.n_snapshots == 3          # the two first evaluations and the rejected third
     if MPI.COMM_WORLD.rank == 0:
@@ -309,6 +312,19 @@ def test_windtunnel_accepts_the_rom_between_snapshots(in_tmp_dir, kind, eta_thre
         assert len(ds.rom_coefficient_errors) == (3 if run_fom else 1)
         for _, dcd, dcl, dcm in ds.rom_coefficient_errors[1:]:
             assert max(abs(dcd), abs(dcl), abs(dcm)) < 1e-6
+        # every postprocessor output is stored by name for the ROM (and the FOM if it ran)
+        names = {"L", "D", "c_l", "c_d", "M_pitch", "c_m_pitch"}
+        assert set(ds.output_names) == names
+        assert all(len(ds.ROM_outputs[n]) == 3 for n in names)
+        for n in names:
+            idx, err = ds.output_errors(n, relative=False)
+            # an output has an error wherever the FOM ran after the ROM: the same evaluations as rom_coefficient_errors
+            assert list(idx) == [e[0] for e in ds.rom_coefficient_errors]
+            ref = {"c_d": 1, "c_l": 2, "c_m_pitch": 3}
+            if n in ref:
+                assert err == pytest.approx([e[ref[n]] for e in ds.rom_coefficient_errors], abs=1e-14)
+            if run_fom:
+                assert np.all(np.abs(ds.output_errors(n)[1][1:]) < 1e-3)
     u = out[-1][0]
     assert np.array_equal(wt.previous_solution, u)
     if not run_fom:

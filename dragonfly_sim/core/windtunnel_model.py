@@ -596,10 +596,10 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
 
     def _log_rom_solve(self, result):
         # coefficients of the ROM solution, logged like the FOM's
-        _, cl = self.postprocessor.compute_cl(result.solution)
-        _, cd = self.postprocessor.compute_cd(result.solution)
-        cms = self._moment_coefficients(result.solution)
+        outputs, (cd, cl, *cms) = self._evaluate_outputs(result.solution)
+        cms = tuple(cms)
         if self.mesh.mesh.comm.Get_rank() == 0:
+            self.data_store.record_outputs("ROM", self.eval_idx, outputs)
             self.data_store.ROM_walltime += [(self.eval_idx, result.walltime)]
             self.data_store.rom_relative_residuals += [(self.eval_idx, result.eta)]
             self.data_store.ROM_force_coefficients += [(self.eval_idx, cd, cl) + cms]
@@ -616,10 +616,20 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
                         + "".join(", c_m_{}: {:.3e}".format(spec.name, e)
                                   for spec, e in zip(self.postprocessor.moment_specs, errors[2:])))
 
-    def _moment_coefficients(self, solution):
-        # the coefficient of every moment of the postprocessor, in order
-        return tuple(self.postprocessor.compute_moment(solution, spec)[1]
-                     for spec in self.postprocessor.moment_specs)
+    def _evaluate_outputs(self, solution):
+        """Every output of the postprocessor for a flow state: ({name: value},
+        (c_d, c_l, c_m_1, ...)). The names are DG_postprocessor.evaluate's (L, D,
+        c_l, c_d, M_<name>, c_m_<name>); the tuple is the layout of the
+        *_force_coefficients records, one moment per moment spec, in order."""
+        L, c_l = self.postprocessor.compute_cl(solution)
+        D, c_d = self.postprocessor.compute_cd(solution)
+        outputs = {"L": L, "D": D, "c_l": c_l, "c_d": c_d}
+        cms = []
+        for spec in self.postprocessor.moment_specs:
+            M, c_m = self.postprocessor.compute_moment(solution, spec)
+            outputs["M_" + spec.name], outputs["c_m_" + spec.name] = M, c_m
+            cms.append(c_m)
+        return outputs, (c_d, c_l, *cms)
 
     def _moment_log_string(self, coefficients):
         return "".join(", c_m_{}: {}".format(spec.name, c)
@@ -655,12 +665,12 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         fom_post_time = perf_counter()
         PETSc.Sys.Print("FOM wall time: {}".format(fom_post_time - fom_pre_time))
 
-        L_fom, cl_fom = self.postprocessor.compute_cl(solution_fom)
-        D_fom, cd_fom = self.postprocessor.compute_cd(solution_fom)
-        cms_fom = self._moment_coefficients(solution_fom)
+        outputs_fom, (cd_fom, cl_fom, *cms_fom) = self._evaluate_outputs(solution_fom)
+        cms_fom = tuple(cms_fom)
         self._last_fom_coefficients = (cd_fom, cl_fom) + cms_fom
 
         if self.mesh.mesh.comm.Get_rank() == 0:
+            self.data_store.record_outputs("FOM", self.eval_idx, outputs_fom)
             self.data_store.FOM_walltime += [(self.eval_idx, fom_post_time - fom_pre_time)]
             self.data_store.fom_relative_residuals += [(self.eval_idx, eta)]
             self.data_store.FOM_force_coefficients += [(self.eval_idx, cd_fom, cl_fom) + cms_fom]

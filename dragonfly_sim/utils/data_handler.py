@@ -58,10 +58,39 @@ class DataStore():
         # of an accepted ROM solution, 'fom' the full-order adjoint.
         self.adjoint_solves = []
 
+        # Every output quantity of the postprocessor by name ("L", "D", "c_l",
+        # "c_d", "M_<name>", "c_m_<name>"): {name: [(eval_idx, value), ...]}
+        # for the full-order and the reduced-order solution of an evaluation.
+        # ROM - FOM errors follow from output_errors().
+        self.FOM_outputs = {}
+        self.ROM_outputs = {}
+
         # Number of DoFs in simulation
         self.fe_dofs = 0
         # Number of design parameters in optimization
         self.num_var = 0
+
+    def record_outputs(self, kind, eval_idx, values):
+        """Append the named output values of one evaluation; kind is 'FOM' or 'ROM'."""
+        store = {"FOM": self.FOM_outputs, "ROM": self.ROM_outputs}[kind]
+        for name, value in values.items():
+            store.setdefault(name, []).append((eval_idx, float(value)))
+
+    @property
+    def output_names(self):
+        return list(self.ROM_outputs) if self.ROM_outputs else list(self.FOM_outputs)
+
+    def output_errors(self, name, relative=True):
+        """(eval_idx, error) arrays of ROM - FOM (divided by |FOM| if relative)
+        of the output `name`, for the evaluations that have both. A repeated
+        eval_idx in the FOM record (the baseline solve) keeps its last entry."""
+        fom = {int(i): v for i, v in self.FOM_outputs.get(name, [])}
+        pairs = [(int(i), v, fom[int(i)]) for i, v in self.ROM_outputs.get(name, []) if int(i) in fom]
+        if not pairs:
+            return np.zeros(0, dtype=int), np.zeros(0)
+        idx, rom, fom_vals = (np.array(c) for c in zip(*pairs))
+        err = rom - fom_vals
+        return idx.astype(int), (err / np.abs(fom_vals) if relative else err)
 
     def compile_store_in_dict(self):
         data_dict = {}
