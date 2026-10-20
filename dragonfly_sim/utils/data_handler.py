@@ -44,12 +44,14 @@ class DataStore():
         # POD reduced-order model (core/reduced_order_model.py), per ROM solve:
         # wall time, eta, (eval_idx, c_d, c_l, c_m_1, ...) like
         # FOM_force_coefficients, whether eta met the acceptance threshold,
+        # whether the LSPG solver itself is considered converged (ROM_lspg_converged),
         # and (eval_idx, dc_d, dc_l, dc_m_1, ...) ROM - FOM when the FOM also ran;
         # the snapshot singular values after every snapshot added
         self.ROM_walltime = []
         self.rom_relative_residuals = []
         self.ROM_force_coefficients = []
         self.ROM_meets_threshold = []
+        self.ROM_lspg_converged = []
         self.rom_coefficient_errors = []
         self.global_snapshot_sing_vals_per_iteration = []
 

@@ -307,6 +307,8 @@ def test_windtunnel_accepts_the_rom_between_snapshots(in_tmp_dir, kind, eta_thre
     if MPI.COMM_WORLD.rank == 0:
         ds = wt.data_store
         assert [acc for _, acc in ds.ROM_meets_threshold] == [False, True, True]
+        assert len(ds.ROM_lspg_converged) == 3
+        assert all(isinstance(c, (bool, np.bool_)) for _, c in ds.ROM_lspg_converged)
         assert len(ds.global_snapshot_sing_vals_per_iteration) == 3
         assert len(ds.FOM_walltime) == (len(ALPHAS) if run_fom else 3)
         assert len(ds.rom_coefficient_errors) == (3 if run_fom else 1)

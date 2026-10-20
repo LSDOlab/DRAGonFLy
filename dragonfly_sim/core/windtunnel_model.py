@@ -616,6 +616,7 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
             self.data_store.rom_relative_residuals += [(self.eval_idx, result.eta)]
             self.data_store.ROM_force_coefficients += [(self.eval_idx, cd, cl) + cms]
             self.data_store.ROM_meets_threshold += [(self.eval_idx, result.accepted)]
+            self.data_store.ROM_lspg_converged += [(self.eval_idx, result.converged)]
         PETSc.Sys.Print("ROM coefficients: c_d: {}, c_l: {}".format(cd, cl) + self._moment_log_string(cms))
         return (cd, cl) + cms
 
