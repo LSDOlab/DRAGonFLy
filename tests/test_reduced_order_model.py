@@ -298,7 +298,10 @@ def test_windtunnel_accepts_the_rom_between_snapshots(in_tmp_dir, kind, eta_thre
     the FOM runs too and the coefficient errors are recorded."""
     rom = ReducedOrderModel(rb_size=5, eta_threshold=eta_threshold, run_fom_every_evaluation=run_fom)
     wt = make_windtunnel(kind, rom=rom)
-    out = [wt.solve_forward(np.radians(a)) for a in ALPHAS]
+    out = []
+    for a in ALPHAS:
+        out.append(wt.solve_forward(np.radians(a)))
+        wt.eval_idx += 1                 # as solve_residual_equations does: records match by eval_idx
     assert all(c for _, c, _ in out)
     assert rom.n_snapshots == 3          # the two first evaluations and the rejected third
     if MPI.COMM_WORLD.rank == 0:
@@ -307,8 +310,27 @@ def test_windtunnel_accepts_the_rom_between_snapshots(in_tmp_dir, kind, eta_thre
         assert len(ds.global_snapshot_sing_vals_per_iteration) == 3
         assert len(ds.FOM_walltime) == (len(ALPHAS) if run_fom else 3)
         assert len(ds.rom_coefficient_errors) == (3 if run_fom else 1)
+        # L2 state errors, over the domain and the wall, wherever the FOM ran after the ROM
+        for errors in (ds.absolute_l2_errors_per_iteration, ds.relative_l2_errors_per_iteration,
+                       ds.absolute_l2_bdry_errors_per_iteration, ds.relative_l2_bdry_errors_per_iteration):
+            assert [e[0] for e in errors] == [e[0] for e in ds.rom_coefficient_errors]
+        for _, rel in ds.relative_l2_errors_per_iteration[1:] + ds.relative_l2_bdry_errors_per_iteration[1:]:
+            assert 0.0 <= rel < 1e-3
         for _, dcd, dcl, dcm in ds.rom_coefficient_errors[1:]:
             assert max(abs(dcd), abs(dcl), abs(dcm)) < 1e-6
+        # every postprocessor output is stored by name for the ROM (and the FOM if it ran)
+        names = {"L", "D", "c_l", "c_d", "M_pitch", "c_m_pitch"}
+        assert set(ds.output_names) == names
+        assert all(len(ds.ROM_outputs[n]) == 3 for n in names)
+        for n in names:
+            idx, err = ds.output_errors(n, relative=False)
+            # an output has an error wherever the FOM ran after the ROM: the same evaluations as rom_coefficient_errors
+            assert list(idx) == [e[0] for e in ds.rom_coefficient_errors]
+            ref = {"c_d": 1, "c_l": 2, "c_m_pitch": 3}
+            if n in ref:
+                assert err == pytest.approx([e[ref[n]] for e in ds.rom_coefficient_errors], abs=1e-14)
+            if run_fom:
+                assert np.all(np.abs(ds.output_errors(n)[1][1:]) < 1e-3)
     u = out[-1][0]
     assert np.array_equal(wt.previous_solution, u)
     if not run_fom:
@@ -368,6 +390,56 @@ def test_windtunnel_rom_adjoint(in_tmp_dir, kind, eta_threshold):
         assert [acc for _, acc in ds.ROM_meets_threshold] == [False] + [True] * 4
         assert set(k for _, k, _ in ds.adjoint_solves[len(fom_kinds):]) == {"rom"}
     assert abs(fd - dD) < 1e-6 * abs(fd), (fd, dD)
+
+
+@pytest.mark.parametrize("kind, eta_threshold", [("euler", 1e-9), ("rans", 1e-7)])
+@pytest.mark.verification
+def test_windtunnel_adjoint_errors(in_tmp_dir, kind, eta_threshold):
+    """
+    compute_all_adjoint_errors records the ROM adjoint's error against the
+    full-order adjoint at the same state, and leaves the derivative handed to
+    the optimizer, and the record of adjoint solves, as they are without it.
+    """
+    import csdl_alpha as csdl
+    recorder = csdl.Recorder(inline=False)
+    recorder.start()
+    rom = ReducedOrderModel(rb_size=5, eta_threshold=eta_threshold)
+    wt = make_windtunnel(kind, rom=rom, suffix="adjoint_errors")
+    assert wt.compute_all_adjoint_errors is False
+    alpha = csdl.Variable(name='alpha', value=np.array([np.radians(ALPHAS[0])]))
+    alpha.set_as_design_variable()
+    u_vec = wt.evaluate(alpha=alpha)
+    out = wt.postprocessor.evaluate(u_vec, alpha=alpha)
+    out.D.set_as_objective()
+    recorder.stop()
+    sim = csdl.experimental.JaxSimulator(recorder, gpu=False)
+    root = MPI.COMM_WORLD.rank == 0
+    ds = wt.data_store
+
+    for a in ALPHAS[:3]:
+        sim[alpha] = np.array([np.radians(a)])
+        sim.run()
+    sim.compute_totals()                 # the rejected design: full-order adjoint, nothing to compare
+    sim[alpha] = np.array([np.radians(ALPHAS[4])])
+    sim.run()
+    dD_off = float(np.asarray(sim.compute_totals()[out.D, alpha]).ravel()[0])
+    assert rom.adjoint is not None
+    n_solves = len(ds.adjoint_solves)
+    assert ds.adjoint_errors == []
+
+    wt.compute_all_adjoint_errors = True
+    sim.run()                            # the same design: the ROM again
+    dD_on = float(np.asarray(sim.compute_totals()[out.D, alpha]).ravel()[0])
+    # the optimizer still gets the ROM adjoint (the re-run ROM solve restarts from its own
+    # solution, hence round-off rather than bitwise equality)
+    assert dD_on == pytest.approx(dD_off, rel=1e-9)
+    if root:
+        assert [k for _, k, _ in ds.adjoint_solves[n_solves:]] == ["rom"]
+        (eval_idx, row, absolute, relative, fom_norm), = ds.adjoint_errors
+        assert eval_idx == ds.adjoint_solves[-1][0] and row == 0
+        assert fom_norm > 0.0 and absolute > 0.0
+        assert relative == pytest.approx(absolute / fom_norm, rel=1e-12)
+        assert relative < 1.0
 
 
 @pytest.mark.unit_test
@@ -570,3 +642,19 @@ def test_reduced_adjoint_is_the_lspg_adjoint():
     model.problem.f.array[:] += df[model.rs:model.re]
     u1 = global_array(comm, rom.solve(model, np.array([0.5])).solution)
     assert g @ (u1 - u0) == pytest.approx(psi @ df, rel=1e-9)
+
+
+@pytest.mark.unit_test
+def test_solve_forward_without_snapshot_and_parameter_size_guard(in_tmp_dir):
+    """A baseline solve with snapshot=False stores nothing; snapshots of a
+    different parameter count are refused with a clear error (not a scipy
+    cdist failure)."""
+    rom = ReducedOrderModel(rb_size=2)
+    wt = make_windtunnel("euler", rom=rom)
+    wt.solve_forward(np.radians(2.0), snapshot=False)
+    assert rom.n_snapshots == 0
+    assert wt.reduced_order_model is rom
+    wt.solve_forward(np.radians(2.0))
+    assert rom.n_snapshots == 1
+    with pytest.raises(ValueError, match="same parameter vector"):
+        rom.add_snapshot(wt.sim_model, np.zeros(26))

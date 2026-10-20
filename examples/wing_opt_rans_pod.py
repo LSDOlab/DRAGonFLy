@@ -101,14 +101,14 @@ if __name__ == '__main__':
     boundary_dict = {'rho': rho_0, 'M': M_0, 'p': p_0, 'alpha': attack}
 
     # Angle-of-attack design-variable bounds.
-    attack_lower = np.radians(1.5)
-    attack_upper = np.radians(2.5)
+    attack_lower = np.radians(1.)
+    attack_upper = np.radians(3.)
 
     # FFD block: (chord, span, vertical). Three spanwise sections (root, mid-span, tip) are the
     # stations of the section variables; the chordwise basis is a quartic Bezier (5 control points),
     # which holds the thickness and camber modes below exactly.
-    ffd_bspline_deg = [4, 2, 1]
-    ffd_shape = [5, 3, 2]
+    ffd_bspline_deg = [4, 4, 1]
+    ffd_shape = [5, 5, 2]
     ffd_block_corner_list = [[(-0.1, -1e-8, 0.32), (5.1, -1e-8, -0.3)], [(7.4, 14.1, 0.32), (9.1, 14.1, -0.3)]]
 
     # The shape design variables and their bounds (see shape_design.WingShape).
@@ -135,11 +135,11 @@ if __name__ == '__main__':
     # {'bounds': (np.array([0., -0.1, -0.1]), np.array([0., 0.1, 0.1])), 'modes': 4}.
     wing = WingShape(
         planform={'sweep': np.radians((20., 30.)),     # quarter-chord sweep [rad]
-                  'aspect_ratio': (7.5, 10.),
-                  'span': (26., 30.),                  # full span; the model is the half wing
+                  'aspect_ratio': (7.5, 12.),
+                  'span': (26., 32.),                  # full span; the model is the half wing
                   'taper_ratio': (0.2, 0.4)},
         sections={'thickness': {'bounds': 0.1, 'modes': 4},
-                  'camber': {'bounds': 0.01, 'modes': 3}},
+                  'camber': {'bounds': 0.025, 'modes': 3}},
         sweep_chord_fraction=0.25,
         # the STW's trapezoid ends at y = 14; the wall's largest y (the default)
         # would include the rounded tip cap and shift AR and taper slightly
@@ -158,17 +158,18 @@ if __name__ == '__main__':
     # ||R||/||u|| below which the reduced solution replaces the full-order solve; the optimizer's ftol is 1e-6,
     # so 1e-8 leaves the reduced solution's error well below it. distance_weighting='total_derivative' is the
     # default and is spelled out for clarity: it only acts once the probe below has supplied weights.
-    rom = ReducedOrderModel(rb_size=10, basis_mode='local_weighted', eta_threshold=1e-8,
-                            distance_weighting='total_derivative')
+    rom = ReducedOrderModel(rb_size=10, basis_mode='local_weighted', eta_threshold=1e-15,
+                            distance_weighting='total_derivative', cubic_cutoff=0.8)
 
     csdl_flow_model = DG_windtunnel_model(mesh_from_file, boundary_dict, shape,
                                           mesh_inner_bdry_function=wing_inner_bdry_function,
                                           poly_order=poly_o, gamma=1.4,
-                                          filename_suffix="wing_opt_rans_pod_L3mesh_p=0_M=0_75",
+                                          filename_suffix="wing_opt_rans_local_weightedPOD_L3mesh_p=0_M=0_75",
                                           asm_overlap=1, ilu_levels=2,
                                           model_class=CompressibleRANSModel,
                                           model_kwargs={'Re': Re},
-                                          reduced_order_model=rom)
+                                          reduced_order_model=rom,
+                                          compute_all_adjoint_errors=True)
     # Pseudo-transient continuation from the free stream needs many more steps
     # than a plain Newton solve (~60 for a 2D airfoil at M 0.7; more for a
     # transonic wing).
@@ -229,7 +230,10 @@ if __name__ == '__main__':
     # the undeformed mesh: the limits of the moment constraints below (upper for root bending,
     # lower for pitching). The first
     # optimization evaluation is this same design, and starts from this converged state.
-    u_baseline, baseline_converged, _ = csdl_flow_model.solve_forward(attack)
+    # snapshot=False: this solve has no shape parameters, so its parameter vector (alpha) would not match
+    # the optimization's (shape parameters, then alpha); the first optimization evaluation is this same design
+    # and adds the snapshot.
+    u_baseline, baseline_converged, _ = csdl_flow_model.solve_forward(attack, snapshot=False)
     if not baseline_converged:
         raise RuntimeError("the baseline flow solve did not converge: no baseline moments for the constraints")
     baseline_forces = csdl_coeff_model.forces_and_coefficients(u_baseline)
