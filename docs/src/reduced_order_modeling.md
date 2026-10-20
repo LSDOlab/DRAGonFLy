@@ -132,11 +132,13 @@ The stopping rules are those of the original POD benchmark (`newton_*`, `stall_*
 
 - Each pass runs at most `newton_max_it` [15] iterations. It ends when
   $\|g\| = \|(SAV)^T S r\|$ falls below $\max(\texttt{newton\_atol}, \texttt{newton\_rtol}\,\|g_0\|)$
-  [1e-12, 1e-10], with $g_0$ from the pass's first iteration; when
+  [1e-12, 1e-10], with $g_0$ from the first iteration of the first pass (a restart does not reset it); when
   $\|\Delta a\| < \max(\texttt{newton\_atol}, \texttt{newton\_rtol} \max(\|a\|, 1))$; or when $\|g\|$ has not
   decreased over `stall_window` [3] iterations (relative `stall_rtol` [1e-10]).
 - Up to `max_outer_iterations` [3] passes run, each restarted from the current state. The solve has converged
-  when a pass ends with $\|g\| <$ `g_conv_limit` [1e-12].
+  when a pass ends with $\|g\| < \max(\texttt{newton\_atol}, \texttt{g\_conv\_limit}\,\|g_0\|)$
+  [1e-10], the same $g_0$; `g_conv_limit` = 0 never accepts. Keep `g_conv_limit` $\ge$ `newton_rtol`, or the
+  passes stop before the acceptance target.
 
 $\|g\|$ is the LSPG stationarity residual. The projected residual $V^T r$ does not vanish at the LSPG
 solution, so it is not tested. Acceptance is decided separately, by $\eta$ against `eta_threshold`.

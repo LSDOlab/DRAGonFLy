@@ -39,9 +39,10 @@ theta from positivity_step_length, optionally backtracked (Armijo) on
 ||S r||^2 / 2. The reduced system is small and solved redundantly on every
 rank. Convergence follows project-sandbox benchmark_pod.py (its PODSolver and
 outer loop): passes of at most newton_max_it iterations, each stopping on
-||g|| = ||(S A V)^T S r|| < max(atol, rtol ||g_0||), on a negligible step, or on
-a stall of ||g||; up to max_outer_iterations passes, converged when a pass
-ends with ||g|| < g_conv_limit.
+||g|| = ||(S A V)^T S r|| < max(atol, rtol ||g_0||), with g_0 from the first
+iteration of the first pass (not reset by a restart), on a negligible step, or
+on a stall of ||g||; up to max_outer_iterations passes, converged when a pass
+ends with ||g|| < max(newton_atol, g_conv_limit ||g_0||), g_0 the same reference.
 
 Derivatives. The ROM solves the LSPG stationarity condition, the projected
 residual equations
@@ -131,6 +132,9 @@ class LSPGSolver:
         self.stalled = False
         self.n_iterations = 0
         self.last_g_norm = None
+        # ||g|| of the first iteration of the first pass: the reference of rtol in every
+        # pass of this solver, so a restart does not ask for a further relative reduction
+        self.g0 = None
         self._AV = None
         self._r = None
 
@@ -199,8 +203,8 @@ class LSPGSolver:
         benchmark_pod.py uses), checked at every iteration from the reduced
         right-hand side g = (S A V)^T S r of the current state::
 
-          converged   ||g|| < max(atol, rtol ||g_0||), g_0 from this pass's first
-                      iteration; or, after a step, ||da|| < max(atol,
+          converged   ||g|| < max(atol, rtol ||g_0||), g_0 from the first iteration of
+                      the solver's first pass (kept over restarts); or, after a step, ||da|| < max(atol,
                       rtol max(||a||, 1))
           stalled     ||g|| > (1 - stall_rtol) times its value stall_window
                       iterations earlier
@@ -217,7 +221,6 @@ class LSPGSolver:
         a = self.restrict(u.x.petsc_vec)
         dx = u.x.petsc_vec.duplicate()
         self.converged = self.stalled = False
-        g0 = None
         history = []
         n = 0
         PETSc.Sys.Print("LSPG ROM solve, basis width {}".format(self.rb_size))
@@ -226,13 +229,14 @@ class LSPGSolver:
             H, g, r_norm = self._reduced_system(model)
             g_norm = float(np.linalg.norm(g))
             self.last_g_norm = g_norm
-            g0 = g_norm if g0 is None else g0
+            if self.g0 is None:
+                self.g0 = g_norm
             if not np.isfinite(g_norm):
                 PETSc.Sys.Print("ROM: non-finite reduced residual at iteration {}; stopping".format(n))
                 break
-            if g_norm < max(self.atol, self.rtol * g0):
+            if g_norm < max(self.atol, self.rtol * self.g0):
                 self.converged = True
-                PETSc.Sys.Print("ROM converged at iteration {}: |g| {:.6e} (from {:.6e})".format(n, g_norm, g0))
+                PETSc.Sys.Print("ROM converged at iteration {}: |g| {:.6e} (from {:.6e})".format(n, g_norm, self.g0))
                 break
             history.append(g_norm)
             if len(history) > self.stall_window and \
@@ -405,6 +409,10 @@ class ReducedOrderModel:
       rb_size            basis width
       basis_mode         'global' or 'local_weighted' (core/pod.py)
       max_rank           cap on the stored snapshot SVD rank (default 3 rb_size)
+      subtract_mean      local_weighted only: centre the snapshots on their weighted mean,
+                         u = V a + mean (default False)
+      mean_weighting     'snapshot_weights' (the local distance weights, default) or
+                         'uniform' (1/n per snapshot); used with subtract_mean
       qr_rank_tol        relative weighted residual (outside the span of the stored
                          snapshots) below which a snapshot adds no direction
       weightfunction, n_nonzero_weights, cubic_cutoff
@@ -434,8 +442,11 @@ class ReducedOrderModel:
                          per-pass LSPGSolver stopping rules
       max_outer_iterations
                          LSPG passes, each restarted from the current state
-      g_conv_limit       the ROM solve has converged when the last ||g|| of a
-                         pass is below this
+      g_conv_limit       the ROM solve has converged when the last ||g|| of a pass is
+                         below max(newton_atol, g_conv_limit ||g_0||), g_0 the first
+                         ||g|| of the first pass (the reference of newton_rtol too);
+                         0 never accepts. Keep it >= newton_rtol, or the passes stop
+                         before this target
       line_search        Armijo damping of the Gauss-Newton step
       eta_threshold      the ROM solution is accepted when ||R||/||u|| is below it
       min_snapshots      snapshots needed before the ROM is tried
@@ -448,11 +459,12 @@ class ReducedOrderModel:
     """
 
     def __init__(self, rb_size=20, basis_mode='global', max_rank=None, qr_rank_tol=1e-10,
+                 subtract_mean=False, mean_weighting='snapshot_weights',
                  weightfunction='Cubic', n_nonzero_weights=None, cubic_cutoff=None,
                  parameter_scales=None, distance_weighting='total_derivative',
                  inner_product='euclidean', state_scaling='freestream',
                  newton_max_it=15, newton_rtol=1e-10, newton_atol=1e-12, stall_window=3,
-                 stall_rtol=1e-10, max_outer_iterations=3, g_conv_limit=1e-12, line_search=True,
+                 stall_rtol=1e-10, max_outer_iterations=3, g_conv_limit=1e-10, line_search=True,
                  eta_threshold=1e-10, min_snapshots=2, run_fom_every_evaluation=False):
         if inner_product not in ('l2', 'euclidean'):
             raise ValueError("inner_product must be 'l2' or 'euclidean', got {!r}".format(inner_product))
@@ -461,6 +473,13 @@ class ReducedOrderModel:
             raise ValueError("state_scaling must be 'freestream', None or one scale per state component")
         self.rb_size = rb_size
         self.basis_mode = basis_mode
+        if subtract_mean and basis_mode != 'local_weighted':
+            raise ValueError("subtract_mean=True needs basis_mode='local_weighted'")
+        if mean_weighting not in ('uniform', 'snapshot_weights'):
+            raise ValueError("mean_weighting must be 'uniform' or 'snapshot_weights', got {!r}".format(
+                mean_weighting))
+        self.subtract_mean = subtract_mean
+        self.mean_weighting = mean_weighting
         self.max_rank = 3 * rb_size if max_rank is None else max_rank
         self.qr_rank_tol = qr_rank_tol
         self.weightfunction = weightfunction
@@ -523,6 +542,7 @@ class ReducedOrderModel:
         if self.pod is not None:
             self.pod.destroy()
         self.pod = PODBasis(model.mesh_obj.mesh.comm, layout.getSize(), basis_mode=self.basis_mode,
+                            subtract_mean=self.subtract_mean, mean_weighting=self.mean_weighting,
                             IP_matrix=self.W, max_rank=self.max_rank, qr_rank_tol=self.qr_rank_tol)
         PETSc.Sys.Print("Initialized POD ROM: basis_mode={}, rb_size={}, max_rank={}, n_dofs={}, "
                         "inner product {}{}".format(
@@ -666,7 +686,8 @@ class ReducedOrderModel:
                             max_it=self.newton_max_it, stall_window=self.stall_window,
                             stall_rtol=self.stall_rtol, line_search=self.line_search)
         # Up to max_outer_iterations passes, each restarted from the current
-        # state; converged when the pass's last |g| is below g_conv_limit (the
+        # state; converged when the pass's last |g| is below
+        # max(newton_atol, g_conv_limit g0), g0 the solver's first |g| (the
         # LSPG stationarity residual -- the projected residual V^T r does not
         # vanish at the LSPG solution, so it is not tested)
         converged = False
@@ -681,14 +702,16 @@ class ReducedOrderModel:
                 if not np.isfinite(residual_norm):
                     PETSc.Sys.Print("ROM: non-finite residual; stopping")
                     break
-                if solver.last_g_norm is not None and solver.last_g_norm < self.g_conv_limit:
+                g_target = max(self.newton_atol, self.g_conv_limit * solver.g0) \
+                    if self.g_conv_limit > 0.0 and solver.g0 is not None else None
+                if g_target is not None and solver.last_g_norm is not None and solver.last_g_norm < g_target:
                     converged = True
-                    PETSc.Sys.Print("LSPG converged: |g| = {:.6e} < {:.1e}".format(
-                        solver.last_g_norm, self.g_conv_limit))
+                    PETSc.Sys.Print("LSPG converged: |g| = {:.6e} < {:.6e} ({:.1e} |g0|)".format(
+                        solver.last_g_norm, g_target, self.g_conv_limit))
                     break
             else:
-                PETSc.Sys.Print("ROM: {} LSPG passes without |g| < {:.1e} (last |g| {:.6e})".format(
-                    self.max_outer_iterations, self.g_conv_limit, solver.last_g_norm))
+                PETSc.Sys.Print("ROM: {} LSPG passes without |g| < {:.1e} |g0| (last |g| {:.6e}, g0 {})".format(
+                    self.max_outer_iterations, self.g_conv_limit, solver.last_g_norm, solver.g0))
         except BaseException:
             if S is not None:
                 S.destroy()
@@ -697,6 +720,11 @@ class ReducedOrderModel:
             solver.destroy()
         self.last_solver = solver
         solver.n_iterations = iterations
+
+        # one verdict line for every way out of the loop
+        PETSc.Sys.Print("ROM LSPG solve {}: |g| = {} (g0 {}, limit {:.1e} |g0|), {} iterations".format(
+            "CONVERGED" if converged else "NOT CONVERGED", solver.last_g_norm, solver.g0,
+            self.g_conv_limit, iterations))
 
         eta = model.relative_residual_norm(residual_norm)
         model.u_vec.x.scatter_forward()
