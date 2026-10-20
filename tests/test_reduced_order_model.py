@@ -307,6 +307,8 @@ def test_windtunnel_accepts_the_rom_between_snapshots(in_tmp_dir, kind, eta_thre
     if MPI.COMM_WORLD.rank == 0:
         ds = wt.data_store
         assert [acc for _, acc in ds.ROM_meets_threshold] == [False, True, True]
+        assert len(ds.ROM_lspg_converged) == 3
+        assert all(isinstance(c, (bool, np.bool_)) for _, c in ds.ROM_lspg_converged)
         assert len(ds.global_snapshot_sing_vals_per_iteration) == 3
         assert len(ds.FOM_walltime) == (len(ALPHAS) if run_fom else 3)
         assert len(ds.rom_coefficient_errors) == (3 if run_fom else 1)
@@ -581,6 +583,19 @@ def test_outer_passes_and_absolute_g_limit():
     assert not result.converged
 
 
+@pytest.mark.unit_test
+def test_relative_g_tolerance_keeps_the_first_pass_reference():
+    """g0 is the first iteration of the first pass: a later pass does not
+    reset it, so it converges against the same relative target."""
+    model = _LinearModel(MPI.COMM_WORLD)
+    rom = _linear_rom(model, newton_max_it=1, max_outer_iterations=3, g_conv_limit=0.0)
+    rom.solve(model, np.array([0.5]))
+    solver = rom.last_solver
+    assert solver.g0 is not None and solver.g0 > 0.0
+    # the first pass of one iteration started from g0; later passes began lower
+    assert solver.last_g_norm < solver.g0
+
+
 # ----------------------------------------------------------------------
 # The reduced (LSPG) adjoint
 # ----------------------------------------------------------------------
@@ -658,3 +673,55 @@ def test_solve_forward_without_snapshot_and_parameter_size_guard(in_tmp_dir):
     assert rom.n_snapshots == 1
     with pytest.raises(ValueError, match="same parameter vector"):
         rom.add_snapshot(wt.sim_model, np.zeros(26))
+
+
+@pytest.mark.parametrize("mean_weighting", ["snapshot_weights", "uniform"])
+@pytest.mark.verification
+def test_windtunnel_rom_adjoint_with_subtracted_mean(in_tmp_dir, mean_weighting):
+    """local_weighted basis with the weighted mean subtracted (u = V a + mean):
+    the ROM is accepted, the reduced adjoint is used, and dD/dalpha matches
+    central differences of the ROM's own solves."""
+    import csdl_alpha as csdl
+    recorder = csdl.Recorder(inline=False)
+    recorder.start()
+    rom = ReducedOrderModel(rb_size=5, eta_threshold=1e-9, basis_mode='local_weighted',
+                            subtract_mean=True, mean_weighting=mean_weighting)
+    wt = make_windtunnel("euler", rom=rom, suffix="adjoint_mean")
+    alpha = csdl.Variable(name='alpha', value=np.array([np.radians(ALPHAS[0])]))
+    alpha.set_as_design_variable()
+    u_vec = wt.evaluate(alpha=alpha)
+    out = wt.postprocessor.evaluate(u_vec, alpha=alpha)
+    out.D.set_as_objective()
+    recorder.stop()
+    sim = csdl.experimental.JaxSimulator(recorder, gpu=False)
+    for a in ALPHAS[:3]:
+        sim[alpha] = np.array([np.radians(a)])
+        sim.run()
+    a = np.radians(ALPHAS[4])
+    sim[alpha] = np.array([a])
+    sim.run()
+    dD = float(np.asarray(sim.compute_totals()[out.D, alpha]).ravel()[0])
+    assert rom.pod.mean is not None and rom.adjoint is not None
+    h = 1e-5
+    fd = (wt.solve_forward(a + h)[2]["D"] - wt.solve_forward(a - h)[2]["D"]) / (2 * h)
+    assert abs(fd - dD) < 1e-6 * abs(fd), (fd, dD)
+
+
+@pytest.mark.unit_test
+def test_subtract_mean_options_are_validated():
+    with pytest.raises(ValueError, match="local_weighted"):
+        ReducedOrderModel(subtract_mean=True)
+    with pytest.raises(ValueError, match="mean_weighting"):
+        ReducedOrderModel(basis_mode='local_weighted', subtract_mean=True, mean_weighting='bogus')
+
+
+@pytest.mark.unit_test
+def test_g_conv_limit_is_relative_to_the_first_g():
+    """A linear problem converges in one iteration: accepted with a relative
+    limit, never with 0."""
+    model = _LinearModel(MPI.COMM_WORLD)
+    rom = _linear_rom(model, g_conv_limit=1e-10)
+    result = rom.solve(model, np.array([0.5]))
+    assert result.converged
+    assert rom.last_solver.last_g_norm <= max(rom.newton_atol, 1e-10 * rom.last_solver.g0)
+

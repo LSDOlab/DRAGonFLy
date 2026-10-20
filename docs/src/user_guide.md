@@ -197,7 +197,7 @@ Written to the working directory, named with `filename_suffix`:
 - `memory_logs/`: peak memory per MPI rank.
 
 `model.data_store` collects per-evaluation results (with a reduced-order model also its wall times, $\eta$,
-coefficients, acceptance, errors against the full-order solve, and the snapshot singular values: the `ROM_*` and
+coefficients, acceptance, whether the LSPG solver converged, errors against the full-order solve, and the snapshot singular values: the `ROM_*` and
 `rom_*` entries);
 `model.data_store.write_store_to_numpy_file(save_folder, save_filename)` saves them to an existing folder.
 
