@@ -58,6 +58,21 @@ class DataStore():
         # of an accepted ROM solution, 'fom' the full-order adjoint.
         self.adjoint_solves = []
 
+        # Per ROM adjoint, when DG_windtunnel_model's compute_all_adjoint_errors
+        # is on: (eval_idx, output row, ||psi_rom - psi_fom||_2, relative to
+        # ||psi_fom||_2, ||psi_fom||_2), psi_fom being the full-order adjoint at the
+        # same state and right-hand side. The row numbers the adjoint solves of
+        # one evaluation in CSDL's order (objective and constraint rows).
+        self.adjoint_errors = []
+
+        # ROM - FOM state errors at the evaluations where the FOM also ran:
+        # (eval_idx, value), the L2 norm over the domain and over the wall of
+        # u_FOM - u_ROM, absolute and relative to the L2 norm of u_FOM
+        self.absolute_l2_errors_per_iteration = []
+        self.relative_l2_errors_per_iteration = []
+        self.absolute_l2_bdry_errors_per_iteration = []
+        self.relative_l2_bdry_errors_per_iteration = []
+
         # Every output quantity of the postprocessor by name ("L", "D", "c_l",
         # "c_d", "M_<name>", "c_m_<name>"): {name: [(eval_idx, value), ...]}
         # for the full-order and the reduced-order solution of an evaluation.

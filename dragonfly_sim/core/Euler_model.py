@@ -851,6 +851,31 @@ class CompressibleEulerModel():
             addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
         return self.residual_vec_physical.norm()
 
+    def compute_L2_norm(self, input_vec, normalization_vec=None, wall_tag=None):
+        """
+        L2 norm of the state-space function with the owned entries `input_vec`,
+        over the domain, or over the boundary facets tagged `wall_tag`; every
+        component of the state is included. With `normalization_vec`, also the
+        norm relative to that function's: returns (norm, relative norm).
+        Collective.
+        """
+        if not hasattr(self, "_l2_functions"):
+            self._l2_functions = (dolfinx.fem.Function(self.functionspaces["V"], name="l2_norm"),
+                                  dolfinx.fem.Function(self.functionspaces["V"], name="l2_norm_reference"))
+
+        def norm(func, vec):
+            set_petsc_vec_array(func.x.petsc_vec, vec)
+            func.x.scatter_forward()
+            measure = self.forms.dx if wall_tag is None else self.forms.ds(wall_tag)
+            form = self.forms.compiled(("L2", wall_tag, id(func)),
+                                       lambda: ufl.inner(func, func) * measure)
+            return np.sqrt(self.mesh_obj.mesh.comm.allreduce(dolfinx.fem.assemble_scalar(form), MPI.SUM))
+
+        value = norm(self._l2_functions[0], input_vec)
+        if normalization_vec is None:
+            return value
+        return value, value / norm(self._l2_functions[1], normalization_vec)
+
     def relative_residual_norm(self, full_norm):
         """
         eta = ||r|| / ||u||, the dimensionless residual measure.

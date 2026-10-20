@@ -310,6 +310,12 @@ def test_windtunnel_accepts_the_rom_between_snapshots(in_tmp_dir, kind, eta_thre
         assert len(ds.global_snapshot_sing_vals_per_iteration) == 3
         assert len(ds.FOM_walltime) == (len(ALPHAS) if run_fom else 3)
         assert len(ds.rom_coefficient_errors) == (3 if run_fom else 1)
+        # L2 state errors, over the domain and the wall, wherever the FOM ran after the ROM
+        for errors in (ds.absolute_l2_errors_per_iteration, ds.relative_l2_errors_per_iteration,
+                       ds.absolute_l2_bdry_errors_per_iteration, ds.relative_l2_bdry_errors_per_iteration):
+            assert [e[0] for e in errors] == [e[0] for e in ds.rom_coefficient_errors]
+        for _, rel in ds.relative_l2_errors_per_iteration[1:] + ds.relative_l2_bdry_errors_per_iteration[1:]:
+            assert 0.0 <= rel < 1e-3
         for _, dcd, dcl, dcm in ds.rom_coefficient_errors[1:]:
             assert max(abs(dcd), abs(dcl), abs(dcm)) < 1e-6
         # every postprocessor output is stored by name for the ROM (and the FOM if it ran)
@@ -384,6 +390,56 @@ def test_windtunnel_rom_adjoint(in_tmp_dir, kind, eta_threshold):
         assert [acc for _, acc in ds.ROM_meets_threshold] == [False] + [True] * 4
         assert set(k for _, k, _ in ds.adjoint_solves[len(fom_kinds):]) == {"rom"}
     assert abs(fd - dD) < 1e-6 * abs(fd), (fd, dD)
+
+
+@pytest.mark.parametrize("kind, eta_threshold", [("euler", 1e-9), ("rans", 1e-7)])
+@pytest.mark.verification
+def test_windtunnel_adjoint_errors(in_tmp_dir, kind, eta_threshold):
+    """
+    compute_all_adjoint_errors records the ROM adjoint's error against the
+    full-order adjoint at the same state, and leaves the derivative handed to
+    the optimizer, and the record of adjoint solves, as they are without it.
+    """
+    import csdl_alpha as csdl
+    recorder = csdl.Recorder(inline=False)
+    recorder.start()
+    rom = ReducedOrderModel(rb_size=5, eta_threshold=eta_threshold)
+    wt = make_windtunnel(kind, rom=rom, suffix="adjoint_errors")
+    assert wt.compute_all_adjoint_errors is False
+    alpha = csdl.Variable(name='alpha', value=np.array([np.radians(ALPHAS[0])]))
+    alpha.set_as_design_variable()
+    u_vec = wt.evaluate(alpha=alpha)
+    out = wt.postprocessor.evaluate(u_vec, alpha=alpha)
+    out.D.set_as_objective()
+    recorder.stop()
+    sim = csdl.experimental.JaxSimulator(recorder, gpu=False)
+    root = MPI.COMM_WORLD.rank == 0
+    ds = wt.data_store
+
+    for a in ALPHAS[:3]:
+        sim[alpha] = np.array([np.radians(a)])
+        sim.run()
+    sim.compute_totals()                 # the rejected design: full-order adjoint, nothing to compare
+    sim[alpha] = np.array([np.radians(ALPHAS[4])])
+    sim.run()
+    dD_off = float(np.asarray(sim.compute_totals()[out.D, alpha]).ravel()[0])
+    assert rom.adjoint is not None
+    n_solves = len(ds.adjoint_solves)
+    assert ds.adjoint_errors == []
+
+    wt.compute_all_adjoint_errors = True
+    sim.run()                            # the same design: the ROM again
+    dD_on = float(np.asarray(sim.compute_totals()[out.D, alpha]).ravel()[0])
+    # the optimizer still gets the ROM adjoint (the re-run ROM solve restarts from its own
+    # solution, hence round-off rather than bitwise equality)
+    assert dD_on == pytest.approx(dD_off, rel=1e-9)
+    if root:
+        assert [k for _, k, _ in ds.adjoint_solves[n_solves:]] == ["rom"]
+        (eval_idx, row, absolute, relative, fom_norm), = ds.adjoint_errors
+        assert eval_idx == ds.adjoint_solves[-1][0] and row == 0
+        assert fom_norm > 0.0 and absolute > 0.0
+        assert relative == pytest.approx(absolute / fom_norm, rel=1e-12)
+        assert relative < 1.0
 
 
 @pytest.mark.unit_test

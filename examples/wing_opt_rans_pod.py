@@ -159,7 +159,7 @@ if __name__ == '__main__':
     # so 1e-8 leaves the reduced solution's error well below it. distance_weighting='total_derivative' is the
     # default and is spelled out for clarity: it only acts once the probe below has supplied weights.
     rom = ReducedOrderModel(rb_size=10, basis_mode='local_weighted', eta_threshold=1e-15,
-                            distance_weighting='total_derivative', cubic_cutoff=0.75)
+                            distance_weighting='total_derivative', cubic_cutoff=0.8)
 
     csdl_flow_model = DG_windtunnel_model(mesh_from_file, boundary_dict, shape,
                                           mesh_inner_bdry_function=wing_inner_bdry_function,
@@ -168,7 +168,8 @@ if __name__ == '__main__':
                                           asm_overlap=1, ilu_levels=2,
                                           model_class=CompressibleRANSModel,
                                           model_kwargs={'Re': Re},
-                                          reduced_order_model=rom)
+                                          reduced_order_model=rom,
+                                          compute_all_adjoint_errors=True)
     # Pseudo-transient continuation from the free stream needs many more steps
     # than a plain Newton solve (~60 for a 2D airfoil at M 0.7; more for a
     # transonic wing).

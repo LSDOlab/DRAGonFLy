@@ -37,7 +37,7 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
                  filename_suffix="test",
                  asm_overlap=None, ilu_levels=None,
                  model_class=CompressibleEulerModel, model_kwargs=None,
-                 reduced_order_model=None):
+                 reduced_order_model=None, compute_all_adjoint_errors=False):
         """
         boundary_dict: the free-stream state {'rho', 'p', 'M', 'alpha'} (density,
         pressure, Mach number, angle of attack in rad). The whole outer boundary
@@ -88,6 +88,13 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         try before every flow solve (see _solve), or None for full-order
         solves only. Where its solution is accepted, the derivatives use the
         adjoint of its projected equations (see apply_inverse_jacobian).
+
+        compute_all_adjoint_errors: diagnostic, default False. When a derivative
+        uses the ROM adjoint, also solve the full-order adjoint at the same state
+        and right-hand side and record the ROM adjoint's error against it in
+        data_store.adjoint_errors. The adjoint handed to the optimizer is the
+        ROM's either way; the extra full-order solve costs about as much as the
+        adjoint the ROM saves, and is not part of data_store.adjoint_solves.
         """
         super().__init__()
 
@@ -164,6 +171,10 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
 
         # POD reduced-order model (None: full-order solves only)
         self.reduced_order_model = reduced_order_model
+        self.compute_all_adjoint_errors = compute_all_adjoint_errors
+        # (eval_idx, number of adjoint solves so far at it): the output row of
+        # the derivative evaluation that CSDL is on
+        self._adjoint_row = (None, 0)
         # (parameter vector, converged) of the last evaluation if the FOM
         # solved it, else None: a re-evaluation of that design skips the ROM
         # (see _solve)
@@ -573,6 +584,7 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         solution_fom, fom_converged = self._run_fom_solve()
         if rom_forces is not None and fom_converged:
             self._log_rom_error(rom_forces)
+            self._log_rom_state_error(rom_result.solution, solution_fom)
         if accept_rom:
             PETSc.Sys.Print("Accepting ROM solution (FOM run for comparison)")
             self._fom_design = None
@@ -630,6 +642,23 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
             outputs["M_" + spec.name], outputs["c_m_" + spec.name] = M, c_m
             cms.append(c_m)
         return outputs, (c_d, c_l, *cms)
+
+    def _log_rom_state_error(self, solution_rom, solution_fom):
+        # absolute and relative L2 errors of the ROM state against the FOM state just
+        # run, over the domain and over the wall. Both are this rank's owned entries.
+        if not self.mesh.mesh.comm.allreduce(bool(np.all(np.isfinite(solution_rom))), op=MPI.LAND):
+            return
+        diff = np.subtract(solution_fom, solution_rom)
+        l2, l2_rel = self.sim_model.compute_L2_norm(diff, normalization_vec=solution_fom)
+        l2_wall, l2_wall_rel = self.sim_model.compute_L2_norm(
+            diff, normalization_vec=solution_fom, wall_tag=self.WALL_TAG)
+        if self.mesh.mesh.comm.Get_rank() == 0:
+            ds = self.data_store
+            ds.absolute_l2_errors_per_iteration += [(self.eval_idx, l2)]
+            ds.relative_l2_errors_per_iteration += [(self.eval_idx, l2_rel)]
+            ds.absolute_l2_bdry_errors_per_iteration += [(self.eval_idx, l2_wall)]
+            ds.relative_l2_bdry_errors_per_iteration += [(self.eval_idx, l2_wall_rel)]
+        PETSc.Sys.Print("ROM L2 error relative to the FOM: domain {:.3e}, wall {:.3e}".format(l2_rel, l2_wall_rel))
 
     def _moment_log_string(self, coefficients):
         return "".join(", c_m_{}: {}".format(spec.name, c)
@@ -711,80 +740,123 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
                 # compute_jacvec_product then uses like the full-order one
                 d_residuals['u_vec'] = rom.adjoint.solve(self.sim_model, d_outputs['u_vec'])
                 self._log_adjoint("rom", pre_apply_inverse_jacobian_time)
+                if self.compute_all_adjoint_errors:
+                    # after the ROM adjoint's own timing; d_residuals is not touched
+                    self._log_adjoint_error(input_vals, u_vec, alpha, mesh_node_motions,
+                                            d_outputs, d_residuals['u_vec'])
                 return
 
-            if self.sim_model.has_condensed_jacobian:
-                self._condensed_adjoint(d_outputs, d_residuals,
-                                        self._adjoint_state_key(u_vec, alpha, mesh_node_motions))
-                if self.release_solver_memory:
-                    self.sim_model.release_solver()
-                PETSc.garbage_cleanup()
-                self._log_adjoint("fom", pre_apply_inverse_jacobian_time)
-                return
-
-            self._drdu_mat = self.sim_model.assemble_dRdu_mat()
-            if not hasattr(self, '_d_output_petsc'):
-                self._d_output_petsc = self._drdu_mat.createVecLeft()
-                self._d_residual_petsc = self._drdu_mat.createVecLeft()
-                self._F_form = dolfinx.fem.form(self.sim_model.F)
-                self._residual_vec_petsc = dolfinx.fem.petsc.create_vector(
-                    dolfinx.fem.extract_function_spaces(self._F_form))
-
-            with self._residual_vec_petsc.localForm() as loc:
-                loc.set(0.0)
-            dolfinx.fem.petsc.assemble_vector(self._residual_vec_petsc, self._F_form)
-            self._residual_vec_petsc.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
-            PETSc.Sys.Print("max residual entry: {}".format(self._residual_vec_petsc.max()[1]))
-            residual_norm = self._residual_vec_petsc.norm()
-            PETSc.Sys.Print("forward eval residual norm: {}".format(residual_norm))
-
-            # (no assembly here any more: assemble_dRdu_mat above already
-            # returns the matrix assembled. It hands back the same cached
-            # Mat object every call, so the KSP's operator reference below
-            # stays valid.)
-            if not hasattr(self, '_adj_solver'):
-                self._adj_solver = PETSc.KSP().create(self.mesh.mesh.comm)
-                self._adj_solver.setOperators(self._drdu_mat)
-                self._adj_solver.setOptionsPrefix("adj_")
-
-                # define the adjoint solver settings
-                self.sim_model.apply_krylov_solver_settings(
-                    self._adj_solver, max_it=self.linear_solver_max_it,
-                    gmres_restart=200,
-                    monitor_convergence=False,
-                    rtol=self.linear_solver_rtol,
-                    atol=self.linear_solver_atol)
-
-            set_petsc_vec_array(self._d_output_petsc, d_outputs['u_vec'])
-
-            # solve the transposed linear system and output the solution
-            self._adj_solver.solveTranspose(self._d_output_petsc, self._d_residual_petsc)
-
-            rnorm = self._adj_solver.getResidualNorm()
-            PETSc.Sys.Print("adj_ solve: {} iterations, residual norm {} [{}]".format(
-                self._adj_solver.getIterationNumber(), rnorm,
-                ksp_converged_reason_name(self._adj_solver.getConvergedReason())))
-
-            if rnorm > self.linear_residual_accept_limit:
-                raise ValueError(
-                    "apply_inverse_jacobian residual norm is too high: {:.6e} > "
-                    "linear_residual_accept_limit {:.1e}".format(
-                        rnorm, self.linear_residual_accept_limit))
-
-            PETSc.Sys.Print("d_residual norm: {}".format(self._d_residual_petsc.norm()))
-
-            if mesh_node_motions is not None:
-                PETSc.Sys.Print("mesh_node_motions min, max: {}, {}".format(mesh_node_motions.min(), mesh_node_motions.max()))
-                PETSc.Sys.Print("shape parameters: {}".format(input_vals['shape_parameters']))
-            PETSc.Sys.Print("alpha: {}".format(np.degrees(alpha)))
-
-            d_residuals['u_vec'] = self._d_residual_petsc.getArray()
-
-            PETSc.garbage_cleanup()
-
-            self._log_adjoint("fom", pre_apply_inverse_jacobian_time)
+            self._fom_adjoint(input_vals, u_vec, alpha, mesh_node_motions, d_outputs, d_residuals,
+                              pre_apply_inverse_jacobian_time)
         else:
             raise ValueError("Reverse mode required")
+
+    def _fom_adjoint(self, input_vals, u_vec, alpha, mesh_node_motions, d_outputs, d_residuals,
+                     start_time, log=True):
+        """The full-order adjoint psi = (dR/dU)^-T d_outputs['u_vec'] at the model's current
+        state, written to d_residuals['u_vec']. log=False leaves it out of data_store.adjoint_solves
+        (the reference solve of compute_all_adjoint_errors)."""
+        if self.sim_model.has_condensed_jacobian:
+            self._condensed_adjoint(d_outputs, d_residuals,
+                                    self._adjoint_state_key(u_vec, alpha, mesh_node_motions))
+            if self.release_solver_memory:
+                self.sim_model.release_solver()
+            PETSc.garbage_cleanup()
+            if log:
+                self._log_adjoint("fom", start_time)
+            return
+
+        self._drdu_mat = self.sim_model.assemble_dRdu_mat()
+        if not hasattr(self, '_d_output_petsc'):
+            self._d_output_petsc = self._drdu_mat.createVecLeft()
+            self._d_residual_petsc = self._drdu_mat.createVecLeft()
+            self._F_form = dolfinx.fem.form(self.sim_model.F)
+            self._residual_vec_petsc = dolfinx.fem.petsc.create_vector(
+                dolfinx.fem.extract_function_spaces(self._F_form))
+
+        with self._residual_vec_petsc.localForm() as loc:
+            loc.set(0.0)
+        dolfinx.fem.petsc.assemble_vector(self._residual_vec_petsc, self._F_form)
+        self._residual_vec_petsc.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
+        PETSc.Sys.Print("max residual entry: {}".format(self._residual_vec_petsc.max()[1]))
+        residual_norm = self._residual_vec_petsc.norm()
+        PETSc.Sys.Print("forward eval residual norm: {}".format(residual_norm))
+
+        # (no assembly here any more: assemble_dRdu_mat above already
+        # returns the matrix assembled. It hands back the same cached
+        # Mat object every call, so the KSP's operator reference below
+        # stays valid.)
+        if not hasattr(self, '_adj_solver'):
+            self._adj_solver = PETSc.KSP().create(self.mesh.mesh.comm)
+            self._adj_solver.setOperators(self._drdu_mat)
+            self._adj_solver.setOptionsPrefix("adj_")
+
+            # define the adjoint solver settings
+            self.sim_model.apply_krylov_solver_settings(
+                self._adj_solver, max_it=self.linear_solver_max_it,
+                gmres_restart=200,
+                monitor_convergence=False,
+                rtol=self.linear_solver_rtol,
+                atol=self.linear_solver_atol)
+
+        set_petsc_vec_array(self._d_output_petsc, d_outputs['u_vec'])
+
+        # solve the transposed linear system and output the solution
+        self._adj_solver.solveTranspose(self._d_output_petsc, self._d_residual_petsc)
+
+        rnorm = self._adj_solver.getResidualNorm()
+        PETSc.Sys.Print("adj_ solve: {} iterations, residual norm {} [{}]".format(
+            self._adj_solver.getIterationNumber(), rnorm,
+            ksp_converged_reason_name(self._adj_solver.getConvergedReason())))
+
+        if rnorm > self.linear_residual_accept_limit:
+            raise ValueError(
+                "apply_inverse_jacobian residual norm is too high: {:.6e} > "
+                "linear_residual_accept_limit {:.1e}".format(
+                    rnorm, self.linear_residual_accept_limit))
+
+        PETSc.Sys.Print("d_residual norm: {}".format(self._d_residual_petsc.norm()))
+
+        if mesh_node_motions is not None:
+            PETSc.Sys.Print("mesh_node_motions min, max: {}, {}".format(mesh_node_motions.min(), mesh_node_motions.max()))
+            PETSc.Sys.Print("shape parameters: {}".format(input_vals['shape_parameters']))
+        PETSc.Sys.Print("alpha: {}".format(np.degrees(alpha)))
+
+        d_residuals['u_vec'] = self._d_residual_petsc.getArray()
+
+        PETSc.garbage_cleanup()
+
+        if log:
+            self._log_adjoint("fom", start_time)
+
+    def _log_adjoint_error(self, input_vals, u_vec, alpha, mesh_node_motions, d_outputs, psi_rom):
+        """Record the error of the ROM adjoint psi_rom against the full-order adjoint at the
+        same state, design and right-hand side: (eval_idx, output row, absolute 2-norm error,
+        relative error, ||psi_fom||) in data_store.adjoint_errors. The row is the order of the
+        adjoint solves within the evaluation, i.e. of CSDL's derivative rows. Collective."""
+        scratch = {}
+        try:
+            self._fom_adjoint(input_vals, u_vec, alpha, mesh_node_motions, d_outputs, scratch,
+                              perf_counter(), log=False)
+        except ValueError as exc:
+            # a diagnostic must not stop the optimization
+            PETSc.Sys.Print("adjoint error: the full-order reference adjoint failed: {}".format(exc))
+            return
+        # copy: the plain path returns a view of a PETSc vector reused by the next solve
+        psi_fom = np.array(scratch['u_vec'], dtype=float)
+        comm = self.mesh.mesh.comm
+        diff = comm.allreduce(float(np.sum((np.asarray(psi_rom) - psi_fom)**2)), op=MPI.SUM)
+        ref = comm.allreduce(float(psi_fom @ psi_fom), op=MPI.SUM)
+        abs_err, fom_norm = np.sqrt(diff), np.sqrt(ref)
+        rel_err = abs_err / fom_norm if fom_norm > 0.0 else np.nan
+
+        eval_idx = self.eval_idx - 1
+        row = self._adjoint_row[1] if self._adjoint_row[0] == eval_idx else 0
+        self._adjoint_row = (eval_idx, row + 1)
+        if comm.Get_rank() == 0:
+            self.data_store.adjoint_errors += [(eval_idx, row, float(abs_err), float(rel_err), float(fom_norm))]
+        PETSc.Sys.Print("ROM adjoint error (output row {}): |psi_rom - psi_fom| = {:.3e}, relative {:.3e}".format(
+            row, abs_err, rel_err))
 
     def _log_adjoint(self, kind, start_time):
         # which adjoint ('rom' or 'fom') the derivative of the last evaluation
