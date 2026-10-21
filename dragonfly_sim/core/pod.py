@@ -15,7 +15,15 @@ current design point::
 
 Both bases are W-orthonormal (V^T W V = I). core/reduced_order_model.py
 builds W and drives the reduced solves.
+
+The local_weighted basis can be centred on an offset c in the span of the
+snapshots, u = V a + c (PODBasis centering): their weighted mean, or the
+warm-start solution of the current solve. Since the snapshots exist only as
+their SVD S = U Sigma VT, c is taken in the span of U, c = U g, and
+subtracting it from every weighted column is the rank-one update
+Sigma VT diag(w) - g (1^T diag(w)) of the small factor: only that changes.
 """
+import warnings
 from copy import deepcopy
 from time import perf_counter
 
@@ -288,38 +296,120 @@ class SnapshotMatrix:
         self.rank = 0
 
 
+CENTERINGS = (None, 'mean', 'warm_start')
+
+
+def resolve_centering(centering, subtract_mean, basis_mode):
+    """
+    The centring of a POD basis: None, 'mean' or 'warm_start'. centering='auto'
+    is 'warm_start' for the local_weighted basis and None for the global one;
+    subtract_mean (deprecated; None: not given) is centering='mean' (True) or
+    None (False). Centring needs basis_mode='local_weighted': the snapshots
+    exist only as their SVD, so it composes into the small weighted factor that
+    only local_weighted forms.
+    """
+    if subtract_mean is not None:
+        warnings.warn("subtract_mean is deprecated; use centering='mean' (or None)",
+                      DeprecationWarning, stacklevel=3)
+        if centering not in ('auto', None, 'mean'):
+            raise ValueError("subtract_mean conflicts with centering={!r}".format(centering))
+        centering = 'mean' if subtract_mean else None
+    if centering == 'auto':
+        centering = 'warm_start' if basis_mode == 'local_weighted' else None
+    if centering not in CENTERINGS:
+        raise ValueError("centering must be one of {} or 'auto', got {!r}".format(CENTERINGS, centering))
+    if centering is not None and basis_mode != 'local_weighted':
+        raise ValueError("centering={!r} needs basis_mode='local_weighted'".format(centering))
+    return centering
+
+
 class PODBasis:
     """
     A reduced basis from the snapshots in a SnapshotMatrix (see the module
     docstring for the basis modes). `basis` is the current basis, a
     distributed MATDENSE in the state layout, rebuilt (destroyed and
     reallocated) by every construct_basis call.
+
+    centering (local_weighted only; see resolve_centering): None, 'mean' (the
+    weighted mean of the snapshots, weighted as mean_weighting says) or
+    'warm_start' (the warm-start solution passed to construct_basis, projected
+    onto the snapshot span). `mean` is the offset c of the current basis, u =
+    V a + c, or None. subtract_mean is the deprecated form of centering='mean'.
     """
     SUPPORTED_BASIS_MODES = ('global', 'local_weighted')
     WEIGHT_FUNCTIONS = ('Cubic', 'Linear', 'Quadratic', 'InverseDistance')
+    # a warm start further than this (relative, in the W norm) from the snapshot
+    # span loses that part from the offset, which is reported
+    WARM_START_SPAN_TOL = 1e-6
+    # singular values of the centred, weighted snapshots below this fraction of
+    # the largest carry no direction and give no basis vector
+    BASIS_RANK_RTOL = 1e-12
 
-    def __init__(self, comm, n_dofs, basis_mode='global', subtract_mean=False,
-                 mean_weighting='snapshot_weights', IP_matrix=None, max_rank=None, qr_rank_tol=1e-10):
+    def __init__(self, comm, n_dofs, basis_mode='global', subtract_mean=None,
+                 mean_weighting='snapshot_weights', IP_matrix=None, max_rank=None, qr_rank_tol=1e-10,
+                 centering=None):
         if basis_mode not in self.SUPPORTED_BASIS_MODES:
             raise ValueError("basis_mode must be one of {}, got {!r}".format(
                 self.SUPPORTED_BASIS_MODES, basis_mode))
-        if subtract_mean and basis_mode != 'local_weighted':
-            # the snapshots exist only as their SVD, so centring composes into
-            # the small weighted factor that only local_weighted forms
-            raise NotImplementedError("subtract_mean=True needs basis_mode='local_weighted'")
+        centering = resolve_centering(centering, subtract_mean, basis_mode)
         if mean_weighting not in ('uniform', 'snapshot_weights'):
             raise ValueError("mean_weighting must be 'uniform' or 'snapshot_weights', got {!r}".format(
                 mean_weighting))
         self.comm = comm
         self.n_dofs = n_dofs
         self.basis_mode = basis_mode
-        self.subtract_mean = subtract_mean
+        self.centering = centering
         self.mean_weighting = mean_weighting
         self.IP_matrix = IP_matrix
         self.snapshot_matrix = SnapshotMatrix(comm, n_dofs, W=IP_matrix, qr_rank_tol=qr_rank_tol,
                                               reorthogonalize=True, max_rank=max_rank)
         self.basis = None
         self.mean = None
+        # ||u0 - U U^T W u0||_W / ||u0||_W of the last warm-start centring
+        self.warm_start_span_residual = None
+
+    @property
+    def subtract_mean(self):
+        return self.centering is not None
+
+    def _warm_start_projection(self, warm_start, U, Sig_np, VT_np):
+        """
+        g = U^T W u0: the coordinates in U of the W-orthogonal projection of
+        `warm_start` (a Vec in the state layout) onto the snapshot span, the
+        offset U g. One projection onto U is the only full-order work.
+
+        The snapshot least-squares fit of the warm start, the minimum-norm x
+        with (Sigma VT) x = g (so S x = U g), is only logged: x grows like
+        g / sigma_min when the warm start is not a well-scaled combination of
+        the snapshots, and centring through it loses ~eps cond(Sigma) in
+        relative accuracy; through g it does not depend on Sigma. Collective.
+        """
+        sm = self.snapshot_matrix
+        U_local = U.getDenseArray()
+        Wu, owns = sm._apply_W(warm_start)
+        g = self.comm.allreduce(U_local.T @ Wu.getArray(readonly=True), op=MPI.SUM)
+        u_norm = sm._weighted_norm(warm_start, Wu)
+        if owns:
+            Wu.destroy()
+        x = np.linalg.lstsq(Sig_np[:, None] * VT_np, g, rcond=None)[0]
+        # the part of u0 outside the span, formed explicitly: ||u0||_W^2 - ||g||^2
+        # would cancel to sqrt(machine epsilon)
+        e = warm_start.duplicate()
+        e.getArray()[:] = warm_start.getArray(readonly=True) - U_local @ g
+        We, owns = sm._apply_W(e)
+        resid = sm._weighted_norm(e, We) / u_norm if u_norm > 0.0 else 0.0
+        if owns:
+            We.destroy()
+        e.destroy()
+        self.warm_start_span_residual = resid
+        PETSc.Sys.Print("warm-start centring: snapshot coefficients {} (sum {:.6f}, norm {:.3e}); relative "
+                        "distance of the warm start from the snapshot span {:.3e}".format(
+                            x, x.sum(), np.linalg.norm(x), resid))
+        if resid > self.WARM_START_SPAN_TOL:
+            PETSc.Sys.Print("WARNING: the warm start lies outside the snapshot span (relative W-norm "
+                            "residual {:.3e} > {:.1e}); the offset is its projection onto the span".format(
+                                resid, self.WARM_START_SPAN_TOL))
+        return g
 
     def _set_basis_from_local_block(self, basis_local_block):
         """
@@ -413,7 +503,7 @@ class PODBasis:
 
     def construct_basis(self, rb_size=10, local_parametervector=None, parameter_weights=None,
                         weightfunction='Cubic', n_nonzero_weights=None, cubic_cutoff=None,
-                        return_distance_norms=False, layout_vec=None):
+                        return_distance_norms=False, layout_vec=None, warm_start=None):
         """
         (Re)build self.basis from the current snapshot SVD; with no snapshots
         self.basis becomes None.
@@ -432,6 +522,11 @@ class PODBasis:
                                  r_rb the smallest radius that leaves the
                                  rb_size nearest accepted snapshots a nonzero
                                  weight (utils/pod_utils.basis_size_floor)
+
+          warm_start             centering='warm_start': the warm-start solution
+                                 of the solve the basis is for (a Vec in the
+                                 state layout); the offset is its projection
+                                 onto the snapshot span
 
         `layout_vec` (the state vector) guards the one invariant the reduced
         solve depends on: the basis rows are distributed exactly like it.
@@ -453,6 +548,11 @@ class PODBasis:
             self.mean = None
             return None
 
+        # the offset belongs to one basis: rebuilt below, or none (global, or a
+        # single snapshot)
+        if self.mean is not None:
+            self.mean.destroy()
+            self.mean = None
         parameter_distnorm = None
         if self.basis_mode == 'global' or n_snapshots < 2:
             # bounded by the rank, not n_snapshots: a rank-deficient snapshot
@@ -474,30 +574,46 @@ class PODBasis:
 
             Sig_np = np.asarray(Sig_vec.getArray()).ravel()
             VT_np = VT.getDenseArray()
-            if self.subtract_mean:
-                # centring is the rank-1 right factor H = I - c 1^T: S_c = S H,
-                # so H W = W - c (1^T W), and the mean S c = U (Sig * (VT c))
-                c_vec = weights.copy() if self.mean_weighting == 'snapshot_weights' \
-                    else np.full(num_rows, 1.0 / max(num_rows, 1))
-                if self.mean is not None:
-                    self.mean.destroy()
+            # the weighted snapshots in U coordinates: S diag(w) = U K
+            K = Sig_np[:, None] * (VT_np @ weight_mat)
+            if self.centering is not None:
+                # the offset c = U g_c lies in the snapshot span, and subtracting it
+                # from every weighted column is the rank-1 update K - g_c (1^T diag(w))
+                # of the small factor. The mean is S x for weights x over the columns
+                # (g_c = Sig VT x, x bounded); the warm start enters through its
+                # projection g_c = U^T W u0 directly (see _warm_start_projection)
+                if self.centering == 'warm_start':
+                    if warm_start is None:
+                        raise ValueError("centering='warm_start' needs the warm_start solution")
+                    g_c = self._warm_start_projection(warm_start, U, Sig_np, VT_np)
+                else:
+                    x = weights.copy() if self.mean_weighting == 'snapshot_weights' \
+                        else np.full(num_rows, 1.0 / max(num_rows, 1))
+                    g_c = Sig_np * (VT_np @ x)
                 self.mean = U.createVecLeft()
-                self.mean.getArray()[:] = U.getDenseArray() @ (Sig_np * (VT_np @ c_vec))
+                self.mean.getArray()[:] = U.getDenseArray() @ g_c
                 self.mean.assemble()
-                weight_mat = weight_mat - np.outer(c_vec, weight_mat.sum(axis=0))
+                K = K - np.outer(g_c, weight_mat.sum(axis=0))
 
-            # SVD of diag(Sig) VT W: small (rank x num_cols), replicated, so dense scipy
+            # SVD of K: small (rank x num_cols), replicated, so dense scipy
             t0 = perf_counter()
-            U_tilde_np, _, _ = sp_la.svd(Sig_np[:, None] * (VT_np @ weight_mat), full_matrices=False)
+            U_tilde_np, sig_tilde, _ = sp_la.svd(K, full_matrices=False)
             t1 = perf_counter()
 
+            # Centring removes a direction whenever the offset is an affine
+            # combination of the weighted snapshots (the weighted mean, or a warm
+            # start that is one of them): its singular value is zero and its left
+            # singular vector arbitrary, so the basis stops at the numerical rank
+            n_rank = int(np.count_nonzero(sig_tilde > self.BASIS_RANK_RTOL * sig_tilde.max())) \
+                if sig_tilde.size and sig_tilde.max() > 0.0 else 0
             # the basis is U U_tilde truncated to rb_size; truncate U_tilde first
             # so the intermediate never exceeds rb_size columns
-            k = min(rb_size, U_tilde_np.shape[1])
+            k = min(rb_size, n_rank)
             self._set_basis_from_local_block(U.getDenseArray() @ U_tilde_np[:, :k])
-            PETSc.Sys.Print("local_weighted basis: {} of {} snapshots carry nonzero weight -> {} basis "
-                            "vectors (rb_size = {}); small SVD time {}".format(
-                                num_cols, n_snapshots, k, rb_size, t1 - t0))
+            PETSc.Sys.Print("local_weighted basis{}: {} of {} snapshots carry nonzero weight -> {} basis "
+                            "vectors (rb_size = {}, numerical rank {}); small SVD time {}".format(
+                                "" if self.centering is None else ", centred ({})".format(self.centering),
+                                num_cols, n_snapshots, k, rb_size, n_rank, t1 - t0))
 
         PETSc.Sys.Print("Computed POD basis: {} rows (global) x {} columns".format(*self.basis.getSize()))
         return parameter_distnorm if return_distance_norms else None

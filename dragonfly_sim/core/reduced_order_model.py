@@ -70,7 +70,7 @@ import scipy.linalg as sp_la
 from mpi4py import MPI
 from petsc4py import PETSc
 
-from dragonfly_sim.core.pod import PODBasis
+from dragonfly_sim.core.pod import PODBasis, resolve_centering
 from dragonfly_sim.utils.pod_utils import DiagonalWeight, tsqr
 from dragonfly_sim.utils.derived_fields import diagonal_mass_inverse
 from dragonfly_sim.utils.solver_profiling import PROFILER as _PROF
@@ -416,10 +416,15 @@ class ReducedOrderModel:
       rb_size            basis width
       basis_mode         'global' or 'local_weighted' (core/pod.py)
       max_rank           cap on the stored snapshot SVD rank (default 3 rb_size)
-      subtract_mean      local_weighted only: centre the snapshots on their weighted mean,
-                         u = V a + mean (default False)
+      centering          local_weighted only: the offset c the snapshots are centred on,
+                         u = V a + c (core/pod.py): 'warm_start' (the solve's warm
+                         start, i.e. the model's u_vec at solve(), projected onto the
+                         snapshot span), 'mean' (their weighted mean) or None. The
+                         default 'auto' is 'warm_start' for local_weighted and None for
+                         global. subtract_mean=True/False is the deprecated form of
+                         'mean'/None
       mean_weighting     'snapshot_weights' (the local distance weights, default) or
-                         'uniform' (1/n per snapshot); used with subtract_mean
+                         'uniform' (1/n per snapshot); used with centering='mean'
       qr_rank_tol        relative weighted residual (outside the span of the stored
                          snapshots) below which a snapshot adds no direction
       weightfunction, n_nonzero_weights, cubic_cutoff
@@ -466,7 +471,7 @@ class ReducedOrderModel:
     """
 
     def __init__(self, rb_size=20, basis_mode='global', max_rank=None, qr_rank_tol=1e-10,
-                 subtract_mean=False, mean_weighting='snapshot_weights',
+                 centering='auto', subtract_mean=None, mean_weighting='snapshot_weights',
                  weightfunction='Cubic', n_nonzero_weights=None, cubic_cutoff=None,
                  parameter_scales=None, distance_weighting='total_derivative',
                  inner_product='euclidean', state_scaling='freestream',
@@ -480,12 +485,10 @@ class ReducedOrderModel:
             raise ValueError("state_scaling must be 'freestream', None or one scale per state component")
         self.rb_size = rb_size
         self.basis_mode = basis_mode
-        if subtract_mean and basis_mode != 'local_weighted':
-            raise ValueError("subtract_mean=True needs basis_mode='local_weighted'")
+        self.centering = resolve_centering(centering, subtract_mean, basis_mode)
         if mean_weighting not in ('uniform', 'snapshot_weights'):
             raise ValueError("mean_weighting must be 'uniform' or 'snapshot_weights', got {!r}".format(
                 mean_weighting))
-        self.subtract_mean = subtract_mean
         self.mean_weighting = mean_weighting
         self.max_rank = 3 * rb_size if max_rank is None else max_rank
         self.qr_rank_tol = qr_rank_tol
@@ -549,11 +552,11 @@ class ReducedOrderModel:
         if self.pod is not None:
             self.pod.destroy()
         self.pod = PODBasis(model.mesh_obj.mesh.comm, layout.getSize(), basis_mode=self.basis_mode,
-                            subtract_mean=self.subtract_mean, mean_weighting=self.mean_weighting,
+                            centering=self.centering, mean_weighting=self.mean_weighting,
                             IP_matrix=self.W, max_rank=self.max_rank, qr_rank_tol=self.qr_rank_tol)
-        PETSc.Sys.Print("Initialized POD ROM: basis_mode={}, rb_size={}, max_rank={}, n_dofs={}, "
-                        "inner product {}{}".format(
-                            self.basis_mode, self.rb_size, self.max_rank, layout.getSize(),
+        PETSc.Sys.Print("Initialized POD ROM: basis_mode={}, centering={}, rb_size={}, max_rank={}, "
+                        "n_dofs={}, inner product {}{}".format(
+                            self.basis_mode, self.centering, self.rb_size, self.max_rank, layout.getSize(),
                             self.inner_product,
                             "" if self.scales is None else ", state scales {}".format(self.scales)))
 
@@ -682,7 +685,8 @@ class ReducedOrderModel:
                                      weightfunction=self.weightfunction,
                                      n_nonzero_weights=self.n_nonzero_weights,
                                      cubic_cutoff=self.cubic_cutoff,
-                                     layout_vec=model.u_vec.x.petsc_vec)
+                                     layout_vec=model.u_vec.x.petsc_vec,
+                                     warm_start=model.u_vec.x.petsc_vec)
         if self.pod.basis is None or self.pod.basis.getSize()[1] == 0:
             PETSc.Sys.Print("ROM: empty POD basis; skipping the ROM solve")
             return None

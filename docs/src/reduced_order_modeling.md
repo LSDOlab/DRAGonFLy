@@ -62,6 +62,31 @@ still counts in the singular values and in the weights of `local_weighted`. `POD
   directions), and a smaller $c$ lets more snapshots contribute to it. Only snapshots with a basis column count
   towards `rb_size`, not repeated parameter vectors. `parameter_scales` weights the parameters in the distance.
 
+The `local_weighted` basis can be centred on an offset $c$ in the span of the snapshots, so that the reduced
+state is $u = c + V a$ (`ReducedOrderModel(centering=...)`):
+
+- `centering="warm_start"`, the default for `local_weighted`: $c$ is the warm start of the solve, projected onto
+  the snapshot span. In a transonic sweep the snapshot mean smears the shock over its range of positions; the
+  warm start has a sharp shock near the right place, so the truncated basis spends its modes on deviations from
+  an admissible state.
+- `centering="mean"`: the weighted mean of the snapshots, with `mean_weighting="snapshot_weights"` (the
+  distance weights, default) or `"uniform"`.
+- `centering=None`: no offset. This is the only choice for `basis_mode="global"`.
+
+The snapshots exist only as their SVD $S = U\Sigma V_s^T$, so the weighted snapshots are $S D = U K$ with the
+small factor $K = \Sigma V_s^T D$, $D$ the diagonal of snapshot weights, and an offset in the snapshot span is
+$c = U g$. Subtracting it from every weighted snapshot is the rank-one update $K - g\,\mathbf{1}^T D$. For the
+mean, $g = \Sigma V_s^T x$ with the (bounded) mean weights $x$. For the warm start $u_0$, $g = U^T W u_0$, so $c$
+is the $W$-projection of $u_0$ onto the snapshot span; this projection is the only full-order work. Its
+snapshot least-squares fit $x$ (the minimum-norm solution of $\Sigma V_s^T x = g$) is logged but not used: $x$
+grows like $1/\sigma_\text{min}$ when $u_0$ is not a well-scaled combination of the snapshots, and centring
+through it would lose about $\varepsilon\,\mathrm{cond}(\Sigma)$ in relative accuracy. When $c$ is an affine
+combination of the snapshots (the mean; a warm start that is a snapshot or an earlier ROM solution), the
+centred snapshots lose a direction, and the basis stops at their numerical rank. A warm start further than
+$10^{-6}$ (relative, in the $W$ norm) from the snapshot span is reported; only its projection enters the
+offset. The LSPG solve starts at $a = 0$, that is at the offset: exactly at the warm start whenever it lies in
+the snapshot span, as a snapshot or an earlier ROM solution does.
+
 ### Output-sensitivity weights in an optimization
 
 Shape variables and the angle of attack differ in units and in how strongly the outputs respond to them, so the
@@ -180,7 +205,8 @@ This is the derivative of the reduced equations with the basis held fixed. Two k
   on the mesh. These terms are linear in the residual of the accepted solution, so they are of relative size
   $O(\eta)$.
 - For `basis_mode="local_weighted"` the basis depends on $x$ through the snapshot weights, and that dependence
-  is not differentiated. For `"global"` the basis is fixed.
+  is not differentiated. Neither is the offset's dependence on $x$ (through the weights for the mean) or on the
+  evaluation history (the warm start). For `"global"` the basis is fixed.
 
 CSDL re-runs the model before every derivative evaluation, so each design is evaluated at least twice. A
 re-evaluation of the design that the full-order model solved last skips the ROM. The full-order solve restarts

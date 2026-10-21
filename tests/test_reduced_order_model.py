@@ -716,17 +716,18 @@ def test_solve_forward_without_snapshot_and_parameter_size_guard(in_tmp_dir):
         rom.add_snapshot(wt.sim_model, np.zeros(26))
 
 
-@pytest.mark.parametrize("mean_weighting", ["snapshot_weights", "uniform"])
+@pytest.mark.parametrize("centering, mean_weighting", [("mean", "snapshot_weights"), ("mean", "uniform"),
+                                                       ("warm_start", "snapshot_weights")])
 @pytest.mark.verification
-def test_windtunnel_rom_adjoint_with_subtracted_mean(in_tmp_dir, mean_weighting):
-    """local_weighted basis with the weighted mean subtracted (u = V a + mean):
-    the ROM is accepted, the reduced adjoint is used, and dD/dalpha matches
-    central differences of the ROM's own solves."""
+def test_windtunnel_rom_adjoint_with_centred_basis(in_tmp_dir, centering, mean_weighting):
+    """local_weighted basis centred on the weighted mean or the warm start
+    (u = V a + c): the ROM is accepted, the reduced adjoint is used, and
+    dD/dalpha matches central differences of the ROM's own solves."""
     import csdl_alpha as csdl
     recorder = csdl.Recorder(inline=False)
     recorder.start()
     rom = ReducedOrderModel(rb_size=5, eta_threshold=1e-9, basis_mode='local_weighted',
-                            subtract_mean=True, mean_weighting=mean_weighting)
+                            centering=centering, mean_weighting=mean_weighting)
     wt = make_windtunnel("euler", rom=rom, suffix="adjoint_mean")
     alpha = csdl.Variable(name='alpha', value=np.array([np.radians(ALPHAS[0])]))
     alpha.set_as_design_variable()
@@ -749,11 +750,16 @@ def test_windtunnel_rom_adjoint_with_subtracted_mean(in_tmp_dir, mean_weighting)
 
 
 @pytest.mark.unit_test
-def test_subtract_mean_options_are_validated():
+def test_centering_options_are_validated():
+    assert ReducedOrderModel(basis_mode='local_weighted').centering == 'warm_start'   # the default
+    assert ReducedOrderModel().centering is None                                     # global: none
+    assert ReducedOrderModel(basis_mode='local_weighted', centering=None).centering is None
     with pytest.raises(ValueError, match="local_weighted"):
-        ReducedOrderModel(subtract_mean=True)
+        ReducedOrderModel(centering='mean')
     with pytest.raises(ValueError, match="mean_weighting"):
-        ReducedOrderModel(basis_mode='local_weighted', subtract_mean=True, mean_weighting='bogus')
+        ReducedOrderModel(basis_mode='local_weighted', centering='mean', mean_weighting='bogus')
+    with pytest.warns(DeprecationWarning):
+        assert ReducedOrderModel(basis_mode='local_weighted', subtract_mean=True).centering == 'mean'
 
 
 @pytest.mark.unit_test

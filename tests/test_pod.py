@@ -22,7 +22,7 @@ import scipy.sparse as sp_sparse
 from mpi4py import MPI
 from petsc4py import PETSc
 
-from dragonfly_sim.core.pod import SnapshotMatrix, PODBasis
+from dragonfly_sim.core.pod import SnapshotMatrix, PODBasis, resolve_centering
 from dragonfly_sim.utils.pod_utils import (cubic_dist_hat, cubic_dist_hat_fixed, cubic_weights,
                                            basis_size_floor, DiagonalWeight)
 from dragonfly_sim.utils.petsc_utils import set_petsc_vec_array
@@ -732,3 +732,194 @@ class TestPODLocalWeightedBasis:
         assert w[0] == pytest.approx(1.0)
         pod.destroy()
         template.destroy()
+
+
+class TestPODCentering:
+    """
+    Centred local_weighted bases, u = V a + c, against dense references, in a
+    diagonal weight W = diag(w): the basis spans the leading W-singular
+    vectors of (X - c 1^T) diag(weights), and for centering='warm_start' the
+    offset c is the W-projection of the warm start onto the snapshot span.
+    The query point lies between the snapshot parameters and the
+    InverseDistance weights are all nonzero.
+    """
+    N_DOFS = 40
+    N_SNAPSHOTS = 6
+    QUERY = np.array([2.5])
+    SEED = 20261021
+
+    @contextlib.contextmanager
+    def _case(self, centering, mean_weighting='snapshot_weights'):
+        comm = MPI.COMM_WORLD
+        rng = np.random.default_rng(self.SEED)
+        X = rng.standard_normal((self.N_DOFS, self.N_SNAPSHOTS))
+        w_dofs = 10.0 ** rng.uniform(-1.0, 1.0, self.N_DOFS)
+        template = dense_vec(comm, self.N_DOFS)
+        rstart, rend = template.getOwnershipRange()
+        w_vec = template.duplicate()
+        set_petsc_vec_array(w_vec, w_dofs[rstart:rend])
+        pod = PODBasis(comm, self.N_DOFS, basis_mode='local_weighted', IP_matrix=DiagonalWeight(w_vec),
+                       centering=centering, mean_weighting=mean_weighting)
+        try:
+            for j in range(self.N_SNAPSHOTS):
+                set_petsc_vec_array(template, X[rstart:rend, j])
+                pod.snapshot_matrix.process_and_append_to_snapshot_lists(template, np.array([float(j)]))
+            yield pod, template, X, w_dofs
+        finally:
+            pod.destroy()
+            w_vec.destroy()
+            template.destroy()
+
+    def _build(self, pod, template, rb_size, warm_start=None):
+        """(V, offset or None, snapshot weights), replicated. Collective."""
+        u0 = None
+        if warm_start is not None:
+            rstart, rend = template.getOwnershipRange()
+            u0 = template.duplicate()
+            set_petsc_vec_array(u0, warm_start[rstart:rend])
+        try:
+            pod.construct_basis(rb_size=rb_size, local_parametervector=self.QUERY,
+                                weightfunction='InverseDistance', layout_vec=template, warm_start=u0)
+        finally:
+            if u0 is not None:
+                u0.destroy()
+        comm = MPI.COMM_WORLD
+        V = np.vstack(comm.allgather(pod.basis.getDenseArray().copy()))
+        offset = None if pod.mean is None else np.concatenate(comm.allgather(pod.mean.getArray().copy()))
+        weights, _ = pod._local_weighted_snapshot_weights(self.QUERY, 'InverseDistance', None, None, rb_size)
+        return V, offset, weights
+
+    @staticmethod
+    def _projector(V, w_dofs):
+        """The W-orthogonal projector V V^T W onto span(V)."""
+        return V @ (V.T * w_dofs[None, :])
+
+    def _reference_basis(self, X, c, weights, w_dofs, k):
+        """The leading k W-singular vectors of (X - c 1^T) diag(weights)."""
+        Y = np.sqrt(w_dofs)[:, None] * ((X - c[:, None]) * weights[None, :])
+        U = np.linalg.svd(Y, full_matrices=False)[0][:, :k]
+        return U / np.sqrt(w_dofs)[:, None]
+
+    @pytest.mark.unit_test
+    def test_warm_start_in_the_span_is_the_offset(self):
+        with self._case('warm_start') as (pod, template, X, w_dofs):
+            u0 = X @ np.array([0.3, -0.2, 0.5, 0.1, 0.4, 0.7])
+            V, offset, _ = self._build(pod, template, rb_size=3, warm_start=u0)
+            assert offset == pytest.approx(u0, rel=1e-10, abs=1e-10)
+            assert pod.warm_start_span_residual < 1e-10
+            assert V.T @ (w_dofs[:, None] * V) == pytest.approx(np.eye(3), abs=1e-12)
+
+    @pytest.mark.verification
+    @pytest.mark.parametrize("rb_size", [3, 6])
+    def test_basis_spans_the_centred_weighted_snapshots(self, rb_size):
+        """Truncated and full: the same subspace as the dense SVD of the
+        explicitly centred, weighted snapshot matrix (the offset is not an
+        affine combination, so all 6 directions remain)."""
+        with self._case('warm_start') as (pod, template, X, w_dofs):
+            u0 = X @ np.array([0.3, -0.2, 0.5, 0.1, 0.4, 0.7])
+            V, _, weights = self._build(pod, template, rb_size=rb_size, warm_start=u0)
+            assert V.shape[1] == rb_size
+            V_ref = self._reference_basis(X, u0, weights, w_dofs, rb_size)
+            assert np.abs(self._projector(V, w_dofs) - self._projector(V_ref, w_dofs)).max() < 1e-8
+
+    @pytest.mark.unit_test
+    def test_snapshot_warm_start_drops_the_vanishing_direction(self):
+        """A warm start equal to a snapshot zeroes its centred column: one
+        direction fewer, and no arbitrary vector in its place."""
+        with self._case('warm_start') as (pod, template, X, w_dofs):
+            u0 = X[:, 2].copy()
+            V, offset, weights = self._build(pod, template, rb_size=self.N_SNAPSHOTS, warm_start=u0)
+            assert V.shape[1] == self.N_SNAPSHOTS - 1
+            assert offset == pytest.approx(u0, rel=1e-10, abs=1e-10)
+            Xc = (X - u0[:, None]) * weights[None, :]
+            assert np.abs(Xc - self._projector(V, w_dofs) @ Xc).max() < 1e-10 * np.abs(Xc).max()
+
+    @pytest.mark.verification
+    def test_untruncated_affine_hull_does_not_depend_on_the_offset(self):
+        """Untruncated, mean-centred and warm-start-centred (on a snapshot)
+        bases describe the same affine hull of the snapshots: a held-out
+        affine combination is reconstructed exactly by both."""
+        b = np.random.default_rng(1).uniform(0.1, 1.0, self.N_SNAPSHOTS)
+        b /= b.sum()
+        recon = {}
+        for centering in ('mean', 'warm_start'):
+            with self._case(centering) as (pod, template, X, w_dofs):
+                p = X @ b
+                V, c, _ = self._build(pod, template, rb_size=self.N_SNAPSHOTS,
+                                      warm_start=X[:, 0].copy() if centering == 'warm_start' else None)
+                assert V.shape[1] == self.N_SNAPSHOTS - 1
+                recon[centering] = c + self._projector(V, w_dofs) @ (p - c)
+        assert recon['mean'] == pytest.approx(p, rel=1e-10, abs=1e-10)
+        assert recon['warm_start'] == pytest.approx(p, rel=1e-10, abs=1e-10)
+
+    @pytest.mark.unit_test
+    def test_warm_start_outside_the_span_is_projected(self):
+        with self._case('warm_start') as (pod, template, X, w_dofs):
+            a = np.array([0.3, -0.2, 0.5, 0.1, 0.4, 0.7])
+            n = np.random.default_rng(2).standard_normal(self.N_DOFS)
+            G = X.T @ (w_dofs[:, None] * X)
+            n_perp = n - X @ np.linalg.solve(G, X.T @ (w_dofs * n))
+            u0 = X @ a + 0.1 * n_perp
+            _, offset, _ = self._build(pod, template, rb_size=3, warm_start=u0)
+            assert offset == pytest.approx(X @ a, rel=1e-9, abs=1e-9)
+            w_norm = lambda v: np.sqrt(v @ (w_dofs * v))
+            assert pod.warm_start_span_residual == pytest.approx(w_norm(0.1 * n_perp) / w_norm(u0), rel=1e-6)
+
+    @pytest.mark.unit_test
+    def test_warm_start_centering_needs_a_warm_start(self):
+        with self._case('warm_start') as (pod, template, X, w_dofs):
+            with pytest.raises(ValueError, match="warm_start"):
+                pod.construct_basis(rb_size=3, local_parametervector=self.QUERY, layout_vec=template)
+
+    @pytest.mark.unit_test
+    def test_centering_options(self):
+        assert resolve_centering('auto', None, 'local_weighted') == 'warm_start'
+        assert resolve_centering('auto', None, 'global') is None
+        assert resolve_centering(None, None, 'local_weighted') is None
+        with pytest.raises(ValueError, match="local_weighted"):
+            resolve_centering('warm_start', None, 'global')
+        with pytest.raises(ValueError, match="centering"):
+            resolve_centering('median', None, 'local_weighted')
+        with pytest.warns(DeprecationWarning):
+            assert resolve_centering('auto', True, 'local_weighted') == 'mean'
+        with pytest.warns(DeprecationWarning):
+            assert resolve_centering('auto', False, 'local_weighted') is None
+        with pytest.warns(DeprecationWarning), pytest.raises(ValueError, match="conflicts"):
+            resolve_centering('warm_start', True, 'local_weighted')
+
+    @pytest.mark.verification
+    def test_warm_start_centring_does_not_depend_on_the_snapshot_conditioning(self):
+        """Stored singular values over ~9 decades and a warm start with an O(1)
+        part along the smallest one, plus a part outside the span: its snapshot
+        least-squares coefficients are ~1e9, yet the offset is the W-projection
+        U U^T W u0 and the basis the dense centred one, to round-off of the
+        data, not eps cond(Sigma)."""
+        comm = MPI.COMM_WORLD
+        rng = np.random.default_rng(self.SEED + 1)
+        n_dofs, n_snap = self.N_DOFS, self.N_SNAPSHOTS
+        Q_true = np.linalg.qr(rng.standard_normal((n_dofs, n_snap + 1)))[0]
+        VT_true = np.linalg.qr(rng.standard_normal((n_snap, n_snap)))[0]
+        X = Q_true[:, :n_snap] @ (np.logspace(0, -9, n_snap)[:, None] * VT_true)
+        template = dense_vec(comm, n_dofs)
+        rstart, rend = template.getOwnershipRange()
+        pod = PODBasis(comm, n_dofs, basis_mode='local_weighted', centering='warm_start', qr_rank_tol=1e-14)
+        try:
+            for j in range(n_snap):
+                set_petsc_vec_array(template, X[rstart:rend, j])
+                pod.snapshot_matrix.process_and_append_to_snapshot_lists(template, np.array([float(j)]))
+            sigma = pod.snapshot_matrix.Sigma.getArray().copy()
+            assert pod.snapshot_matrix.rank == n_snap and sigma.max() / sigma.min() > 1e8
+            # the stored triplet is the reference: what the basis is built from
+            U = np.vstack(comm.allgather(pod.snapshot_matrix.U.getDenseArray().copy()))
+            S_stored = U @ (sigma[:, None] * pod.snapshot_matrix.VT.getDenseArray())
+            u0 = X @ rng.uniform(0.1, 1.0, n_snap) + U[:, -1] + 1e-3 * Q_true[:, n_snap]
+            w_dofs = np.ones(n_dofs)
+            V, offset, weights = self._build(pod, template, rb_size=3, warm_start=u0)
+            c_ref = U @ (U.T @ u0)
+            assert np.linalg.norm(offset - c_ref) < 1e-13 * np.linalg.norm(c_ref)
+            assert pod.warm_start_span_residual == pytest.approx(1e-3 / np.linalg.norm(u0), rel=1e-6)
+            V_ref = self._reference_basis(S_stored, c_ref, weights, w_dofs, 3)
+            assert np.abs(self._projector(V, w_dofs) - self._projector(V_ref, w_dofs)).max() < 1e-10
+        finally:
+            pod.destroy()
+            template.destroy()
