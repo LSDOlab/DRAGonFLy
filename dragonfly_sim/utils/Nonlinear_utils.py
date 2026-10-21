@@ -16,6 +16,8 @@ from dolfinx.fem.function import Function as _Function
 
 from petsc4py import PETSc
 
+from dragonfly_sim.utils.solver_profiling import PROFILER as _PROF
+
 
 class NonlinearProblem_mod:
     """Nonlinear problem class for solving the non-linear problem
@@ -113,15 +115,16 @@ class NonlinearProblem_mod:
         # PETSc.Sys.Print("Start construct b")
         # # Reset the residual vector
         # print("Call F in NonlinearProblem_mod")
-        with self._b.localForm() as b_local:
-            b_local.set(0.0)
+        with _PROF.phase("assemble:residual"):
+            with self._b.localForm() as b_local:
+                b_local.set(0.0)
 
-        assemble_vector(self._b, self._L)
+            assemble_vector(self._b, self._L)
 
-        apply_lifting(self._b, [self._a], bcs=[self.bcs], x0=[self.u.x.petsc_vec], alpha=-1.0)
-        self._b.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
-        set_bc(self._b, self.bcs, self.u.x.petsc_vec, -1.0)
-        self._b.ghostUpdate(addv=PETSc.InsertMode.INSERT_VALUES, mode=PETSc.ScatterMode.FORWARD)
+            apply_lifting(self._b, [self._a], bcs=[self.bcs], x0=[self.u.x.petsc_vec], alpha=-1.0)
+            self._b.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
+            set_bc(self._b, self.bcs, self.u.x.petsc_vec, -1.0)
+            self._b.ghostUpdate(addv=PETSc.InsertMode.INSERT_VALUES, mode=PETSc.ScatterMode.FORWARD)
 
         self._b.copy(b)  # copy content of self._b into vector b
 
@@ -136,9 +139,10 @@ class NonlinearProblem_mod:
         # print("Call J in NonlinearProblem_mod")
         # print("A shape in J: {}".format(A.getSize()))
 
-        self._A.zeroEntries()
-        assemble_matrix(self._A, self._a, self.bcs)
-        self._A.assemble()
+        with _PROF.phase("assemble:jacobian"):
+            self._A.zeroEntries()
+            assemble_matrix(self._A, self._a, self.bcs)
+            self._A.assemble()
 
         # SNESNewtonSolver hands in self._A itself; any other matrix gets a
         # copy.

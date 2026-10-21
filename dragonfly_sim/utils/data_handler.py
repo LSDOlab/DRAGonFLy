@@ -67,6 +67,15 @@ class DataStore():
         # one evaluation in CSDL's order (objective and constraint rows).
         self.adjoint_errors = []
 
+        # Phase timing (utils/solver_profiling.py), when profiling is on: per
+        # forward evaluation ('forward': all of solve_residual_equations,
+        # containing the 'rom' and 'fom' flow solves, which are also recorded
+        # on their own) and per adjoint solve ('adjoint_rom' / 'adjoint_fom'),
+        # (eval_idx, kind, {phase: (self time, total time, calls)}), the
+        # slowest rank's times in seconds. Phases are named "group:name";
+        # self times partition a record, totals include nested phases.
+        self.phase_times = []
+
         # ROM - FOM state errors at the evaluations where the FOM also ran:
         # (eval_idx, value), the L2 norm over the domain and over the wall of
         # u_FOM - u_ROM, absolute and relative to the L2 norm of u_FOM
@@ -92,6 +101,23 @@ class DataStore():
         store = {"FOM": self.FOM_outputs, "ROM": self.ROM_outputs}[kind]
         for name, value in values.items():
             store.setdefault(name, []).append((eval_idx, float(value)))
+
+    def record_phase_times(self, kind, eval_idx, phases):
+        """Append the phase timing {phase: (self, total, calls)} of one solve."""
+        self.phase_times.append((eval_idx, kind, dict(phases)))
+
+    def phase_time_series(self, kind, by_group=False):
+        """(eval_idx array, {phase: self-time array}) of the records of `kind`, 0 where a
+        phase did not occur in a record; by_group sums the phases of a group (the name before
+        the first ':'). Self times, so the phases of a record add up to its time."""
+        records = [(i, p) for i, k, p in self.phase_times if k == kind]
+        key = (lambda n: n.split(":", 1)[0]) if by_group else (lambda n: n)
+        names = sorted({key(n) for _, p in records for n in p})
+        series = {n: np.zeros(len(records)) for n in names}
+        for r, (_, p) in enumerate(records):
+            for n, (self_time, _, _) in p.items():
+                series[key(n)][r] += self_time
+        return np.array([i for i, _ in records], dtype=int), series
 
     @property
     def output_names(self):

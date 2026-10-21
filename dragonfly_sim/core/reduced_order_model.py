@@ -73,6 +73,7 @@ from petsc4py import PETSc
 from dragonfly_sim.core.pod import PODBasis
 from dragonfly_sim.utils.pod_utils import DiagonalWeight, tsqr
 from dragonfly_sim.utils.derived_fields import diagonal_mass_inverse
+from dragonfly_sim.utils.solver_profiling import PROFILER as _PROF
 
 
 def scaled_jacobian_basis(model, V, S, AV=None):
@@ -152,20 +153,22 @@ class LSPGSolver:
     # -- maps between the full and reduced spaces --------------------------
     def restrict(self, u_vec):
         """a = V^T W (u - mean), replicated on every rank."""
-        x = u_vec.getArray(readonly=True).copy()
-        if self.mean is not None:
-            x -= self.mean.getArray(readonly=True)
-        if self.W is not None:
-            x *= self.W.getArray(readonly=True)
-        return self.comm.allreduce(self.V.getDenseArray().T @ x, op=MPI.SUM)
+        with _PROF.phase("rom:expand"):
+            x = u_vec.getArray(readonly=True).copy()
+            if self.mean is not None:
+                x -= self.mean.getArray(readonly=True)
+            if self.W is not None:
+                x *= self.W.getArray(readonly=True)
+            return self.comm.allreduce(self.V.getDenseArray().T @ x, op=MPI.SUM)
 
     def expand(self, a, u):
         """u <- V a (+ mean), ghosts updated."""
-        x = u.x.petsc_vec
-        x.array[:] = self.V.getDenseArray() @ a
-        if self.mean is not None:
-            x.axpy(1.0, self.mean)
-        u.x.scatter_forward()
+        with _PROF.phase("rom:expand"):
+            x = u.x.petsc_vec
+            x.array[:] = self.V.getDenseArray() @ a
+            if self.mean is not None:
+                x.axpy(1.0, self.mean)
+            u.x.scatter_forward()
 
     # -- the reduced Newton loop ---------------------------------------------
     def _weighted_residual(self, model):
@@ -174,10 +177,11 @@ class LSPGSolver:
         if self._r is None:
             self._r = problem._b.duplicate()
         problem.F(model.u_vec.x.petsc_vec, self._r)
-        r = self._r.getArray(readonly=True)
-        if self.S is not None:
-            r = self.S.getArray(readonly=True) * r
-        return r, float(np.sqrt(self.comm.allreduce(float(r @ r), op=MPI.SUM)))
+        with _PROF.phase("rom:project"):
+            r = self._r.getArray(readonly=True)
+            if self.S is not None:
+                r = self.S.getArray(readonly=True) * r
+            return r, float(np.sqrt(self.comm.allreduce(float(r @ r), op=MPI.SUM)))
 
     def _reduced_system(self, model):
         """(H, g, ||S r||) with H = (S A V)^T (S A V), g = (S A V)^T S r at the
@@ -186,9 +190,10 @@ class LSPGSolver:
         if self._AV is not None and self._AV.getSize()[1] != self.V.getSize()[1]:
             self._AV.destroy()
             self._AV = None
-        SAV, self._AV = scaled_jacobian_basis(model, self.V, self.S, self._AV)
-        H = self.comm.allreduce(SAV.T @ SAV, op=MPI.SUM)
-        g = self.comm.allreduce(SAV.T @ r, op=MPI.SUM)
+        with _PROF.phase("rom:project"):
+            SAV, self._AV = scaled_jacobian_basis(model, self.V, self.S, self._AV)
+            H = self.comm.allreduce(SAV.T @ SAV, op=MPI.SUM)
+            g = self.comm.allreduce(SAV.T @ r, op=MPI.SUM)
         return H, g, r_norm
 
     def solve(self, model):
@@ -247,7 +252,8 @@ class LSPGSolver:
                                                  self.stall_window))
                 break
             try:
-                da = np.linalg.solve(H, -g)
+                with _PROF.phase("solve:reduced"):
+                    da = np.linalg.solve(H, -g)
             except np.linalg.LinAlgError:
                 PETSc.Sys.Print("ROM: singular reduced Jacobian at iteration {}".format(n))
                 break
@@ -255,7 +261,8 @@ class LSPGSolver:
             dx.array[:] = -(self.V.getDenseArray() @ da)
             theta, _ = model.positivity_step_length(u.x.petsc_vec, dx)
             if self.line_search:
-                theta = self._backtrack(model, a, da, theta, 0.5 * r_norm**2, float(g @ da))
+                with _PROF.phase("rom:line_search"):
+                    theta = self._backtrack(model, a, da, theta, 0.5 * r_norm**2, float(g @ da))
             a = a + theta * da
             da_norm = float(np.linalg.norm(da))
             PETSc.Sys.Print("ROM iter {}: |g| = {:.6e}, ||S r|| = {:.6e}, |da| = {:.6e}, theta = {:.4f}".format(
@@ -668,19 +675,21 @@ class ReducedOrderModel:
             return None
         t0 = perf_counter()
         comm = model.mesh_obj.mesh.comm
-        self.pod.construct_basis(rb_size=self.rb_size,
-                                 local_parametervector=np.asarray(parameter_vector, dtype=float),
-                                 parameter_weights=self._distance_weights(len(parameter_vector)),
-                                 weightfunction=self.weightfunction,
-                                 n_nonzero_weights=self.n_nonzero_weights,
-                                 cubic_cutoff=self.cubic_cutoff,
-                                 layout_vec=model.u_vec.x.petsc_vec)
+        with _PROF.phase("rom:basis"):
+            self.pod.construct_basis(rb_size=self.rb_size,
+                                     local_parametervector=np.asarray(parameter_vector, dtype=float),
+                                     parameter_weights=self._distance_weights(len(parameter_vector)),
+                                     weightfunction=self.weightfunction,
+                                     n_nonzero_weights=self.n_nonzero_weights,
+                                     cubic_cutoff=self.cubic_cutoff,
+                                     layout_vec=model.u_vec.x.petsc_vec)
         if self.pod.basis is None or self.pod.basis.getSize()[1] == 0:
             PETSc.Sys.Print("ROM: empty POD basis; skipping the ROM solve")
             return None
 
         model.set_up_solver()
-        S = self._diagonal(model, mass_power=-0.5, scale_power=-1.0)
+        with _PROF.phase("rom:weights"):
+            S = self._diagonal(model, mass_power=-0.5, scale_power=-1.0)
         solver = LSPGSolver(self.pod.basis, comm, W=None if self.W is None else self.W.w, S=S,
                             mean=self.pod.mean, rtol=self.newton_rtol, atol=self.newton_atol,
                             max_it=self.newton_max_it, stall_window=self.stall_window,

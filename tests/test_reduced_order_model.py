@@ -57,8 +57,8 @@ def in_tmp_dir(tmp_path):
     os.chdir(cwd)
 
 
-def make_windtunnel(kind, rom=None, Re=200.0, suffix="rom"):
-    kw = {}
+def make_windtunnel(kind, rom=None, Re=200.0, suffix="rom", **extra):
+    kw = dict(extra)
     if kind == "rans":
         kw = dict(model_class=CompressibleRANSModel, model_kwargs={"Re": Re})
     wt = DG_windtunnel_model(jittered_square(8), BC, moments=[("pitch", (0.25, 0.), "pitch")],
@@ -442,6 +442,47 @@ def test_windtunnel_adjoint_errors(in_tmp_dir, kind, eta_threshold):
         assert fom_norm > 0.0 and absolute > 0.0
         assert relative == pytest.approx(absolute / fom_norm, rel=1e-12)
         assert relative < 1.0
+
+
+@pytest.mark.verification
+def test_windtunnel_records_phase_times(in_tmp_dir):
+    """profile_phases records the phases of every forward evaluation, of its ROM and FOM flow
+    solves and of its adjoint in data_store.phase_times; the adjoint is the ROM's here."""
+    import csdl_alpha as csdl
+    from dragonfly_sim.utils.solver_profiling import PROFILER
+    recorder = csdl.Recorder(inline=False)
+    recorder.start()
+    rom = ReducedOrderModel(rb_size=5, eta_threshold=1e-9)
+    wt = make_windtunnel("euler", rom=rom, suffix="phases", profile_phases=True)
+    try:
+        alpha = csdl.Variable(name='alpha', value=np.array([np.radians(ALPHAS[0])]))
+        alpha.set_as_design_variable()
+        u_vec = wt.evaluate(alpha=alpha)
+        out = wt.postprocessor.evaluate(u_vec, alpha=alpha)
+        out.D.set_as_objective()
+        recorder.stop()
+        sim = csdl.experimental.JaxSimulator(recorder, gpu=False)
+        for a in tuple(ALPHAS[:3]) + (ALPHAS[4],):
+            sim[alpha] = np.array([np.radians(a)])
+            sim.run()
+        sim.compute_totals()                       # at ALPHAS[4]: the ROM was accepted
+        if MPI.COMM_WORLD.rank == 0:
+            ds = wt.data_store
+            kinds = [k for _, k, _ in ds.phase_times]
+            # compute_totals re-runs the design, hence five forward evaluations
+            assert kinds.count("forward") == 5 and "fom" in kinds and "rom" in kinds
+            assert kinds[-1] == "adjoint_rom"
+            idx, forward = ds.phase_time_series("forward", by_group=True)
+            assert list(idx) == [0, 1, 2, 3, 4]
+            assert "assemble" in forward and "solve" in forward
+            # self times partition a record: the phases of the ROM solve add up to no more than
+            # the wall time recorded for it, which also covers the unprofiled remainder
+            _, rom_phases = ds.phase_time_series("rom", by_group=True)
+            assert sum(v.sum() for v in rom_phases.values()) <= sum(w for _, w in ds.ROM_walltime) + 1e-6
+            assert all(v >= 0.0 for _, _, p in ds.phase_times for t in p.values() for v in t[:2])
+    finally:
+        PROFILER.configure(enabled=False)
+        PROFILER.reset()
 
 
 @pytest.mark.unit_test

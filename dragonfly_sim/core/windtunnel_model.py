@@ -21,6 +21,7 @@ from dragonfly_sim.utils.petsc_utils import set_petsc_vec_array
 from dragonfly_sim.utils.derived_fields import destroy_chained_operator
 from dragonfly_sim.utils.solver_utils import ksp_converged_reason_name
 from dragonfly_sim.core.postprocessor import DG_postprocessor
+from dragonfly_sim.utils.solver_profiling import PROFILER as _PROF
 
 
 # TODO: Look into using entropy variables instead of conservative variables;
@@ -37,7 +38,7 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
                  filename_suffix="test",
                  asm_overlap=None, ilu_levels=None,
                  model_class=CompressibleEulerModel, model_kwargs=None,
-                 reduced_order_model=None, compute_all_adjoint_errors=False):
+                 reduced_order_model=None, compute_all_adjoint_errors=False, profile_phases=False):
         """
         boundary_dict: the free-stream state {'rho', 'p', 'M', 'alpha'} (density,
         pressure, Mach number, angle of attack in rad). The whole outer boundary
@@ -95,6 +96,10 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         data_store.adjoint_errors. The adjoint handed to the optimizer is the
         ROM's either way; the extra full-order solve costs about as much as the
         adjoint the ROM saves, and is not part of data_store.adjoint_solves.
+
+        profile_phases: time the phases of the flow solves, mesh motion, ROM and adjoint
+        (see enable_profiling) and record them per evaluation in data_store.phase_times;
+        default False.
         """
         super().__init__()
 
@@ -172,6 +177,8 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         # POD reduced-order model (None: full-order solves only)
         self.reduced_order_model = reduced_order_model
         self.compute_all_adjoint_errors = compute_all_adjoint_errors
+        if profile_phases:
+            self.enable_profiling()
         # (eval_idx, number of adjoint solves so far at it): the output row of
         # the derivative evaluation that CSDL is on
         self._adjoint_row = (None, 0)
@@ -460,7 +467,28 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
             self.previous_solution = solution
         return solution, converged, self.postprocessor.forces_and_coefficients(solution)
 
+    def enable_profiling(self, enabled=True, barriers=True, reset=True):
+        """Phase timing of the flow solves, the mesh motion, the ROM and the adjoint
+        (utils/solver_profiling.py): per-evaluation records in data_store.phase_times.
+        barriers=True synchronizes the ranks at every phase edge so that load imbalance is
+        charged to the phase causing it (a few percent of run time); pass False to measure
+        undisturbed wall time. The profiler is shared by every model in the process.
+        Also the constructor's profile_phases=True. Collective."""
+        return self.sim_model.enable_profiling(enabled=enabled, barriers=barriers, reset=reset)
+
+    def _record_phases(self, kind, eval_idx, before):
+        # the phase times spent since the snapshot `before` (None: profiling off); collective
+        if before is None:
+            return
+        phases = _PROF.delta(before)
+        if phases and self.mesh.mesh.comm.Get_rank() == 0:
+            self.data_store.record_phase_times(kind, eval_idx, phases)
+
+    def _phase_snapshot(self):
+        return _PROF.snapshot() if _PROF.enabled else None
+
     def solve_residual_equations(self, input_vals, output_vals):
+        phases_before = self._phase_snapshot()
         # Define inputs
         mesh_node_motions = input_vals['mesh_node_motions'] if 'mesh_node_motions' in input_vals else None
         shape_parameters = input_vals['shape_parameters'] if 'shape_parameters' in input_vals else None
@@ -517,10 +545,11 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
             PETSc.Sys.Print("Writing aligned output frame at eval_idx {} (FOM solution)".format(
                 self.eval_idx))
             # we write the deformation and the solution outputs to the same time step indices
-            if mesh_node_motions is not None:
-                self.mesh.write_deformation_output(mesh_node_motions, self.eval_idx)
-            self.sim_model.write_solution_output(self.eval_idx,
-                                                 solution_array=solution_output)
+            with _PROF.phase("output:solution"):
+                if mesh_node_motions is not None:
+                    self.mesh.write_deformation_output(mesh_node_motions, self.eval_idx)
+                self.sim_model.write_solution_output(self.eval_idx,
+                                                     solution_array=solution_output)
             self._last_written_design = design
 
         # Explicitly collect garbage and cleanup PETSc objects
@@ -529,6 +558,7 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
 
         self._log_memory("after Euler PDE solve")
 
+        self._record_phases("forward", self.eval_idx, phases_before)
         self.eval_idx += 1
 
     @staticmethod
@@ -572,7 +602,9 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
             PETSc.Sys.Print("Re-evaluating the design the FOM solved last: skipping the ROM")
         else:
             self.sim_model.interpolate_solution_vector(self.previous_solution)
+            phases_before = self._phase_snapshot()
             rom_result = rom.solve(self.sim_model, parameter_vector)
+            self._record_phases("rom", self.eval_idx, phases_before)
             if rom_result is not None:
                 rom_forces = self._log_rom_solve(rom_result)
         accept_rom = rom_result is not None and rom_result.accepted
@@ -608,7 +640,8 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
 
     def _log_rom_solve(self, result):
         # coefficients of the ROM solution, logged like the FOM's
-        outputs, (cd, cl, *cms) = self._evaluate_outputs(result.solution)
+        with _PROF.phase("post:coefficients"):
+            outputs, (cd, cl, *cms) = self._evaluate_outputs(result.solution)
         cms = tuple(cms)
         if self.mesh.mesh.comm.Get_rank() == 0:
             self.data_store.record_outputs("ROM", self.eval_idx, outputs)
@@ -666,6 +699,12 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
                        for spec, c in zip(self.postprocessor.moment_specs, coefficients))
 
     def _run_fom_solve(self):
+        phases_before = self._phase_snapshot()
+        out = self._run_fom_solve_untimed()
+        self._record_phases("fom", self.eval_idx, phases_before)
+        return out
+
+    def _run_fom_solve_untimed(self):
         # Run the FOM model and output its solution
 
         # store pre-FOM time stamp for performance profiling
@@ -695,7 +734,8 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         fom_post_time = perf_counter()
         PETSc.Sys.Print("FOM wall time: {}".format(fom_post_time - fom_pre_time))
 
-        outputs_fom, (cd_fom, cl_fom, *cms_fom) = self._evaluate_outputs(solution_fom)
+        with _PROF.phase("post:coefficients"):
+            outputs_fom, (cd_fom, cl_fom, *cms_fom) = self._evaluate_outputs(solution_fom)
         cms_fom = tuple(cms_fom)
         self._last_fom_coefficients = (cd_fom, cl_fom) + cms_fom
 
@@ -712,6 +752,7 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
 
     def apply_inverse_jacobian(self, input_vals, outputs, d_outputs, d_residuals, mode):
         pre_apply_inverse_jacobian_time = perf_counter()
+        self._adjoint_phases_before = self._phase_snapshot()
         # Here we solve the adjoint equation when calculating derivatives for optimization
         print("starting apply_inverse_jacobian in DG_windtunnel_model...")
 
@@ -865,6 +906,7 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         walltime = perf_counter() - start_time
         if self.mesh.mesh.comm.Get_rank() == 0:
             self.data_store.adjoint_solves += [(self.eval_idx - 1, kind, walltime)]
+        self._record_phases("adjoint_" + kind, self.eval_idx - 1, self._adjoint_phases_before)
         PETSc.Sys.Print("apply_inverse_jacobian total time ({} adjoint): {}".format(kind, walltime))
 
     def _condensed_adjoint(self, d_outputs, d_residuals, state_key):
