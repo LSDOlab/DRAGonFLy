@@ -154,8 +154,8 @@ def test_release_solver_memory_gives_the_same_rans_derivatives(in_tmp_dir):
 @pytest.mark.parametrize("once", [False, True])
 @pytest.mark.unit_test
 def test_solution_file_fields_and_write_once_per_design(once, in_tmp_dir, monkeypatch):
-    """The solution file holds the state as separate fields plus velocity and
-    pressure; with write_once_per_design, re-evaluating a design (CSDL re-runs
+    """The solution file holds the unknowns as separate fields plus density
+    and Mach number; with write_once_per_design, re-evaluating a design (CSDL re-runs
     the model for the derivatives) writes no second frame."""
     from dragonfly_sim.core.RANS_model import CompressibleRANSModel
     recorder = csdl.Recorder(inline=False)
@@ -168,8 +168,8 @@ def test_solution_file_fields_and_write_once_per_design(once, in_tmp_dir, monkey
     wt.set_up_sim()
     flow = wt.sim_model.flow
     writer = flow.fom_solution_writer
-    assert writer.field_names == ["density", "momentum", "energy", "rho_nu_tilde",
-                                  "velocity", "pressure"]
+    assert writer.field_names == ["pressure", "velocity", "temperature", "nu_tilde",
+                                  "density", "mach"]
     labels = []
     monkeypatch.setattr(writer, "interpolate_and_write",
                         lambda values, write_counter=None, time=None: labels.append(
@@ -189,14 +189,17 @@ def test_solution_file_fields_and_write_once_per_design(once, in_tmp_dir, monkey
 
     # the fields of the last frame are the components of the state
     values = labels[-1][1]
-    U = flow.u_vec.x.array.reshape(-1, flow.n_state)
-    np.testing.assert_allclose(values["density"], U[:, 0], rtol=1e-14)
-    np.testing.assert_allclose(values["momentum"].reshape(-1, 2), U[:, 1:3], rtol=1e-14)
-    np.testing.assert_allclose(values["energy"], U[:, 3], rtol=1e-14)
-    np.testing.assert_allclose(values["rho_nu_tilde"], U[:, 4], rtol=1e-14)
-    np.testing.assert_allclose(values["velocity"].reshape(-1, 2), U[:, 1:3] / U[:, :1], rtol=1e-13)
-    p = 0.4 * (U[:, 3] - 0.5 * (U[:, 1] ** 2 + U[:, 2] ** 2) / U[:, 0])
-    np.testing.assert_allclose(values["pressure"], p, rtol=1e-12)
+    V = flow.u_vec.x.array.reshape(-1, flow.n_state)
+    np.testing.assert_allclose(values["pressure"], V[:, 0], rtol=1e-14)
+    np.testing.assert_allclose(values["velocity"].reshape(-1, 2), V[:, 1:3], rtol=1e-14)
+    np.testing.assert_allclose(values["temperature"], V[:, 3], rtol=1e-14)
+    np.testing.assert_allclose(values["nu_tilde"], V[:, 4], rtol=1e-14)
+    # ideal gas in the solver's units: rho = (p_ref + p')/(R T), M^2 = |u|^2 / (gamma R T)
+    gas = flow.material
+    p_ref, R, g = float(gas.p_ref.value), float(gas.R.value), gas.gamma
+    np.testing.assert_allclose(values["density"], (p_ref + V[:, 0]) / (R * V[:, 3]), rtol=1e-13)
+    np.testing.assert_allclose(values["mach"], np.hypot(V[:, 1], V[:, 2]) / np.sqrt(g * R * V[:, 3]),
+                               rtol=1e-13)
     for w in (writer, wt.mesh._deformation_writer):
         if w is not None and w.writer is not None:
             w.writer.close()

@@ -7,7 +7,6 @@ import dolfinx
 import csdl_alpha as csdl
 
 from dragonfly_sim.utils.postprocessor_utils import moment_about
-from dragonfly_sim.utils.Euler_utils import pressure
 
 
 class MomentSpec:
@@ -119,8 +118,11 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
         # as well as some quantities that need to be initialized here and are modified later
         n = self.sim_model.dimensions
         if self.p_inf_dim is not None and self.L_ref_dim is not None:
-            self.force_scale = float(self.p_inf_dim) * float(self.L_ref_dim) ** (n - 1)
-            self.moment_scale = float(self.p_inf_dim) * float(self.L_ref_dim) ** n
+            # the solver's pressure unit is rho_inf u_inf^2 = p_inf_dim / p_inf
+            # (p_inf = farfield_conditions['p'], the free-stream pressure in it)
+            p_unit = float(self.p_inf_dim) / float(self.sim_model.farfield_conditions['p'])
+            self.force_scale = p_unit * float(self.L_ref_dim) ** (n - 1)
+            self.moment_scale = p_unit * float(self.L_ref_dim) ** n
         else:
             self.force_scale = 1.0
             self.moment_scale = 1.0
@@ -198,9 +200,7 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
         if self.sim_model.derived_fields:
             # the viscous traction reads the reconstructed gradient
             self.sim_model.update_derived_fields()
-            return self.sim_model.wall_force_density(self.sim_model.u_vec, self.mesh_obj.n)
-        p = pressure(self.sim_model.u_vec, self.sim_model.gamma)
-        return p*self.mesh_obj.n
+        return self.sim_model.wall_force_density(self.sim_model.u_vec, self.mesh_obj.n)
 
     def _assemble_value_and_coefficient(self, form, normalizer):
         raw_val = self.mesh_obj.mesh.comm.allreduce(

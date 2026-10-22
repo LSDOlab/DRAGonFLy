@@ -23,9 +23,6 @@ from dragonfly_sim.utils.solver_utils import ksp_converged_reason_name
 from dragonfly_sim.core.postprocessor import DG_postprocessor
 
 
-# TODO: Look into using entropy variables instead of conservative variables;
-#       these would potentially allow us to do simulations from low Mach all
-#       the way to supersonic
 class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
     # The solve/adjoint callbacks contain MPI collectives (PETSc, mpi4py) and deform
     # the shared mesh, so they must never overlap -- also on a single process.
@@ -39,8 +36,10 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
                  model_class=CompressibleEulerModel, model_kwargs=None,
                  reduced_order_model=None):
         """
-        boundary_dict: the free-stream state {'rho', 'p', 'M', 'alpha'} (density,
-        pressure, Mach number, angle of attack in rad). The whole outer boundary
+        boundary_dict: the free-stream state in the fluid's far-field format,
+        for the default ideal gas {'rho', 'p', 'M', 'alpha'} (density,
+        pressure, Mach number, angle of attack in rad); another fluid is a
+        `material` in model_kwargs (core/materials.py). The whole outer boundary
         is a characteristic far field built from it, so the angle of attack can
         change by any amount during an optimization; there is no inflow/outflow
         division to choose or to keep valid.
@@ -133,7 +132,7 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
                          wall_tags=wall_tags, symmetry_tags=symmetry_tags)
         if model_class is CompressibleEulerModel:
             _euler_kwargs = dict(poly_order=poly_order, gamma=gamma)
-            self.sim_model = CompressibleEulerModel(self.mesh, **_euler_kwargs)
+            self.sim_model = CompressibleEulerModel(self.mesh, **_euler_kwargs, **(model_kwargs or {}))
         else:
             self.sim_model = model_class(self.mesh, gamma=gamma, **(model_kwargs or {}))
         # TODO: Perhaps split up CompressibleEulerModel into an Euler model class and a solver class that facilitates solver interactions; 

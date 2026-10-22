@@ -32,7 +32,7 @@ from mpi4py import MPI
 
 from dragonfly_sim.core.mesh_manager import Mesh
 from dragonfly_sim.core.Euler_model import CompressibleEulerModel
-from dragonfly_sim.utils.Euler_utils import flux
+from cases import FREESTREAM, primitive_from_physical
 from dragonfly_sim.core.form_manager import CELL_TAG, INTERIOR_FACET_TAG
 
 _MPI_CHILD_ENV = "FORM_MANAGER_TEST_MPI_CHILD"
@@ -75,6 +75,7 @@ def build_model(poly_order=0, n=8, comm=None):
         measure_metadata=metadata)
 
     model = CompressibleEulerModel(mesh_obj, poly_order=poly_order)
+    model.define_farfield_conditions(FREESTREAM)
     model.define_elements_functionspaces()
     model.define_trial_testfunctions()
     # Populates model.bcs with the weak slip-wall flux integral on ds(WALL_TAG),
@@ -96,11 +97,7 @@ def seed_state(model, seed=0):
     uy = -0.15 + 0.1 * np.sin(x - 3.0 * y)
     p = 1.0 + 0.25 * np.cos(x + 2.0 * y)
 
-    arr = np.zeros((coords.shape[0], bs))
-    arr[:, 0] = rho
-    arr[:, 1] = rho * ux
-    arr[:, 2] = rho * uy
-    arr[:, 3] = p / (model.gamma - 1.0) + 0.5 * rho * (ux ** 2 + uy ** 2)
+    arr = primitive_from_physical(model, rho, np.column_stack([ux, uy]), p)
     model.u_vec.x.array[:] = arr.flatten()
     model.u_vec.x.scatter_forward()
 
@@ -118,12 +115,13 @@ def untagged_residual(model):
                      metadata=metadata)
 
     u, v, n = model.u_vec, model.v_vec, model.mesh_obj.n
-    F = (-ufl.inner(ufl.grad(v), flux(u, model.gamma)) * dx
-         + ufl.inner(model.flux_function(u('+'), u('-'), n('+'), model.gamma),
+    th = model.thermo
+    F = (-ufl.inner(ufl.grad(v), th(u).flux()) * dx
+         + ufl.inner(model.flux_function(th(u('+')), th(u('-')), n('+')),
                      v('+') - v('-')) * dS)
 
     from dragonfly_sim.utils.Euler_utils import boundary_flux, slip_wall_state
-    F += ufl.inner(boundary_flux(u, slip_wall_state(u, n), n, model.gamma),
+    F += ufl.inner(boundary_flux(th(u), th(slip_wall_state(u, n, model.n_mean)), n),
                    v) * ds(WALL_TAG)
     return F
 

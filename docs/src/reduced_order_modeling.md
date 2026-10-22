@@ -100,10 +100,12 @@ $$
 (u, v)_W = \sum_i \frac{u_i v_i}{s_{k(i)}^2}, \qquad W = D^{-2},
 $$
 
-with $s_k$ a typical magnitude of state component $k$: the free-stream $\rho$, $\rho U$ and
-$p/(\gamma-1) + \rho U^2/2$, and for RANS the turbulence model's scale of its variable. Without $D$, the
-Spalart-Allmaras variable $\rho\tilde\nu$ ($\sim 10^{-4}$ at $Re = 6\times10^6$) would carry no weight next to
-$\rho E \sim 2$, and a truncated basis would drop it.
+with $s_k$ a typical magnitude of state component $k$: 1 for the mean flow $(p', \mathbf{u}, T)$ (scaled with
+the free stream: dynamic pressure, speed and temperature), and for RANS the turbulence model's scale of its
+variable. Without $D$, the Spalart-Allmaras variable $\tilde\nu$ ($\sim 10^{-6}$ at $Re = 3\times10^6$) would
+carry no weight next to $T \sim 1$, and a truncated basis would drop it. The relative residual
+$\eta = \|r\|/\|u\|$ is measured in these units; thresholds calibrated with the former conservative unknowns
+need recalibrating.
 
 `inner_product="l2"` adds the DG0 mass matrix, $W = M D^{-2}$, i.e. $\int_\Omega \sum_k u_k v_k / s_k^2\,
 d\mathbf{x}$. On NACA0012 angle-of-attack sweeps (Euler at $M = 0.8$, SA RANS at $M = 0.7$) it was 10 to 100

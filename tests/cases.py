@@ -39,7 +39,8 @@ def channel_tags(mesh_obj):
     return farfield, ~farfield
 
 
-def euler_channel_model(n=8, comm=None, quadrature_degree=1, bc_dict=FREESTREAM, build_weakform=True):
+def euler_channel_model(n=8, comm=None, quadrature_degree=1, bc_dict=FREESTREAM, build_weakform=True,
+                        **model_kwargs):
     """
     The release Euler model on a jittered unit-square channel: the
     characteristic far field on the left and right, slip walls top and
@@ -53,7 +54,7 @@ def euler_channel_model(n=8, comm=None, quadrature_degree=1, bc_dict=FREESTREAM,
     mesh_obj.form_manager.build_boundary_measure(measure_metadata=meta)
     mesh_obj.form_manager.build_cell_and_interior_facet_measures(measure_metadata=meta)
 
-    model = CompressibleEulerModel(mesh_obj, poly_order=0)
+    model = CompressibleEulerModel(mesh_obj, poly_order=0, **model_kwargs)
     model.residual_conv_limit = 1e-9
     model.max_newton_iterations = 100
     model.define_farfield_conditions(bc_dict)
@@ -68,10 +69,42 @@ def euler_channel_model(n=8, comm=None, quadrature_degree=1, bc_dict=FREESTREAM,
     return model
 
 
+def primitive_from_physical(model, rho, u, p):
+    """
+    The unknowns (p', u, T) (rows of an (n, 2 + dim) array) of a state given
+    as density, velocity (n, dim) and pressure in the far-field dict's own
+    units (the ideal gas's material.dimensional), i.e. scaled with the free
+    stream as the solver does (core/materials.py).
+    """
+    ref = model.material.dimensional
+    q = ref['rho'] * ref['speed'] ** 2
+    return np.column_stack([(p - ref['p']) / q, u / ref['speed'],
+                            (p / rho) / (ref['p'] / ref['rho'])])
+
+
+def legacy_conservative(model, V):
+    """
+    The inverse of primitive_from_physical followed by the former unknowns:
+    the conservative (rho, rho u, rho E) of the ideal gas, in the far-field
+    dict's units, of primitive rows V.
+    """
+    ref = model.material.dimensional
+    g = model.material.gamma
+    q = ref['rho'] * ref['speed'] ** 2
+    d = V.shape[1] - 2
+    p = ref['p'] + q * V[:, 0]
+    u = V[:, 1:1 + d] * ref['speed']
+    rho = p / (V[:, 1 + d] * ref['p'] / ref['rho'])
+    E = p / (g - 1.0) + 0.5 * rho * np.sum(u * u, axis=1)
+    return np.column_stack([rho, rho[:, None] * u, E])
+
+
 def seed_mean_flow(model, amplitude=1.0):
     """
     A smooth, strictly physical mean-flow state (no vacuum, no negative
-    pressure) written into model.u_vec; extra components are left as they are.
+    pressure) written into model.u_vec; extra components are left as they
+    are. Defined in the far-field dict's units (rho_inf = p_inf = 1 for
+    FREESTREAM), so it is the same physical state whatever the unknowns.
     """
     V = model.functionspaces["V"]
     coords = V.tabulate_dof_coordinates()
@@ -82,11 +115,7 @@ def seed_mean_flow(model, amplitude=1.0):
     uy = -0.05 + amplitude * 0.1 * np.sin(x - 3.0 * y)
     p = 1.0 + amplitude * 0.25 * np.cos(x + 2.0 * y)
     arr = model.u_vec.x.array.reshape(-1, bs).copy()
-    gamma = model.gamma
-    arr[:, 0] = rho
-    arr[:, 1] = rho * ux
-    arr[:, 2] = rho * uy
-    arr[:, 3] = p / (gamma - 1.0) + 0.5 * rho * (ux ** 2 + uy ** 2)
+    arr[:, :model.n_mean] = primitive_from_physical(model, rho, np.column_stack([ux, uy]), p)
     model.u_vec.x.array[:] = arr.ravel()
     model.u_vec.x.scatter_forward()
 
@@ -112,11 +141,12 @@ def gather_by_original_cell(V, local_array, comm=None):
 # RANS
 # ----------------------------------------------------------------------
 def rans_square_model(turbulence_model, n=6, comm=None, jitter=0.01, Re=50.0, quadrature_degree=2,
-                      wall_bottom=False, **rans_kwargs):
+                      wall_bottom=False, farfield=None, **rans_kwargs):
     """
     CompressibleRANSModel on the unit square, function spaces defined,
     no boundary conditions yet. Every boundary facet carries tag 1, or with
-    wall_bottom the bottom side carries WALL_TAG.
+    wall_bottom the bottom side carries WALL_TAG. `farfield` is the
+    material's far-field dict (default: air at M 0.5).
     """
     from dragonfly_sim.core.RANS_model import CompressibleRANSModel
     comm = comm if comm is not None else MPI.COMM_WORLD
@@ -137,26 +167,26 @@ def rans_square_model(turbulence_model, n=6, comm=None, jitter=0.01, Re=50.0, qu
     mesh_obj.form_manager.build_cell_and_interior_facet_measures(measure_metadata=meta)
     model = CompressibleRANSModel(mesh_obj, Re=Re, turbulence_model=turbulence_model, **rans_kwargs)
     model.define_farfield_conditions(
-        {'rho': 1.0, 'M': 0.5, 'p': 1.0, 'alpha': 0.0})
+        farfield if farfield is not None else {'rho': 1.0, 'M': 0.5, 'p': 1.0, 'alpha': 0.0})
     model.define_elements_functionspaces()
     model.define_trial_testfunctions()
     return model
 
 
 def manufactured_state(model):
-    """A smooth, physical manufactured state (with a positive nu_tilde)."""
+    """A smooth, physical manufactured state V = (p', u, v, T[, nu_tilde]) in
+    the solver's units (free-stream speed and density 1), with a positive
+    nu_tilde."""
     import ufl
-    gamma = model.gamma
     x = ufl.SpatialCoordinate(model.mesh_obj.mesh)
     pi = np.pi
-    rho = 1.0 + 0.2 * ufl.sin(pi * x[0]) * ufl.cos(0.5 * pi * x[1])
-    u = 0.5 + 0.15 * ufl.cos(pi * x[0] + 0.3) * ufl.sin(pi * x[1])
-    v = -0.1 + 0.1 * ufl.sin(pi * (x[0] - x[1]))
-    p = 1.0 + 0.15 * ufl.cos(pi * x[0]) * ufl.sin(0.5 * pi * x[1] + 0.2)
-    comps = [rho, rho * u, rho * v, p / (gamma - 1.0) + 0.5 * rho * (u * u + v * v)]
+    p = 0.4 * ufl.cos(pi * x[0]) * ufl.sin(0.5 * pi * x[1] + 0.2)
+    u = 1.0 + 0.3 * ufl.cos(pi * x[0] + 0.3) * ufl.sin(pi * x[1])
+    v = -0.2 + 0.2 * ufl.sin(pi * (x[0] - x[1]))
+    T = 1.0 + 0.15 * ufl.sin(pi * x[0]) * ufl.cos(0.5 * pi * x[1])
+    comps = [p, u, v, T]
     if model.n_extra:
-        nu_t = model.mu_inf_const * (3.0 + 2.0 * ufl.sin(pi * x[0]) * ufl.sin(pi * x[1]))
-        comps.append(rho * nu_t)
+        comps.append(model.mu_inf_const * (3.0 + 2.0 * ufl.sin(pi * x[0]) * ufl.sin(pi * x[1])))
     return ufl.as_vector(comps), x
 
 
@@ -168,18 +198,18 @@ def mms_rans_model(turbulence_model, n, Re=2.0, jitter=0.01, **rans_kwargs):
     inviscid and viscous boundary terms. Returns (model, U_e).
     """
     import ufl
-    from dragonfly_sim.utils.NS_utils import extended_flux
     model = rans_square_model(turbulence_model, n=n, Re=Re, jitter=jitter, **rans_kwargs)
     U_e, x = manufactured_state(model)
-    nm, gamma = model.n_mean, model.gamma
+    nm = model.n_mean
+    th_e = model.thermo(U_e)
     if model.n_extra:
         # a smooth stand-in for the wall distance: the source only needs to
         # be the same function in the discrete and the exact problem
         model.wall_distance = 0.2 + x[1]
-    strong = ufl.div(extended_flux(U_e, gamma, nm)) - ufl.div(model.viscous_flux(U_e, ufl.grad(U_e)))
+    strong = ufl.div(th_e.flux()) - ufl.div(model.viscous_flux(U_e, ufl.grad(U_e)))
     if model.n_extra:
         mu = model.laminar_viscosity(U_e)
-        S = model.turbulence_model.sources(U_e, ufl.grad(U_e), mu, model.wall_distance, nm, gamma)
+        S = model.turbulence_model.sources(U_e, th_e, ufl.grad(U_e), mu, model.wall_distance, nm)
         strong = strong - ufl.as_vector([0.0] * nm + S)
     model.flow.residual_terms.append(lambda: - ufl.inner(strong, model.v_vec) * model.forms.dx)
     model.add_boundary_condition(1, U_e, "dirichlet")

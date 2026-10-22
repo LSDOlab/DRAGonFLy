@@ -14,6 +14,9 @@ The main entry points:
   underlying flow discretization and mesh handling
 - `dragonfly_sim.core.RANS_model.CompressibleRANSModel` and `dragonfly_sim.core.turbulence_models`: RANS and
   the turbulence closures (see [RANS, time integration and far fields](flow_models.md))
+- `dragonfly_sim.core.materials`: the fluids (`IdealGas`, `ConstantDensity`) and the thermodynamic state
+  (`thermo`, `ThermoState`) every flux is written in (see [fluids and variables](flow_models.md#fluids-and-variables))
+- `dragonfly_sim.core.shock_capturing.BarterDarmofalAV`: the p = 0 Barter-Darmofal artificial viscosity
 - `dragonfly_sim.core.time_integration`: `TimeIntegrator`, `CFLController`, `StepSizeController`
 - `dragonfly_sim.core.farfield.TransverseFarfield`: the transverse (riemann2) far field
 - `dragonfly_sim.core.reduced_order_model`: `ReducedOrderModel`, `LSPGSolver` and `dragonfly_sim.core.pod`:

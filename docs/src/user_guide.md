@@ -187,8 +187,10 @@ solve every time, to compare the two. Basis, inner product and stopping rules ar
 ## Output files
 Written to the working directory, named with `filename_suffix`:
 - `FOM_solution_*.bp`, `mesh_deformation_*.bp`: solution and mesh deformation per evaluation, in ADIOS2/VTX
-  format (open in ParaView). The solution file holds separate fields: `density`, `momentum` (vector), `energy`
-  ($\rho E$), each transported turbulence variable (e.g. `rho_nu_tilde`), `velocity` (vector) and `pressure`.
+  format (open in ParaView). The solution file holds separate fields, in the solver's (free-stream) units: `pressure` (the
+  gauge pressure $p'$, so $C_p = 2p'$), `velocity` (vector), `temperature`, each transported turbulence variable
+  (e.g. `nu_tilde`) and auxiliary unknown (`sigma`, with shock capturing), `density` and, for a compressible fluid,
+  `mach`.
   With a shape parameterization, the solution is written on the deformed mesh it was solved on, and the mesh
   deformation on the baseline mesh (apply it with *Warp By Vector*); frame $k$ of each file belongs to the same
   evaluation. `write_mesh_deformation = False` leaves out the mesh deformation file, and

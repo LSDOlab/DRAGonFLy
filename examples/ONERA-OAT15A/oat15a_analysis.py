@@ -129,6 +129,20 @@ def parse_args():
     p.add_argument("--report-limiter", action="store_true",
                    help="print which cells block the Newton step whenever the positivity limiter cuts it")
     # output
+    p.add_argument("--fluid", choices=("air", "water"), default="air",
+                   help="water: constant density at --water-speed and T_inf, preconditioned (Re as given)")
+    p.add_argument("--water-speed", type=float, default=5.0, help="free-stream speed of water [m/s]")
+    p.add_argument("--preconditioning", action="store_true",
+                   help="local low-Mach (Weiss-Smith) preconditioning of the flux and pseudo-time term")
+    p.add_argument("--precond-floor", type=float, default=1.0,
+                   help="reference velocity floor of the preconditioning, in free-stream speeds")
+    p.add_argument("--av", action="store_true",
+                   help="Barter-Darmofal artificial viscosity (core/shock_capturing.py)")
+    p.add_argument("--av-C", type=float, default=0.5, help="artificial viscosity coefficient")
+    p.add_argument("--av-eta", type=float, default=0.1, help="artificial viscosity sensor scale")
+    p.add_argument("--av-no-ducros", action="store_true", help="artificial viscosity without the Ducros switch")
+    p.add_argument("--av-directional", action="store_true",
+                   help="artificial viscosity only on the facets crossing the pressure gradient")
     p.add_argument("--out-dir", default=".")
     p.add_argument("--label", default="")
     p.add_argument("--write-fields", action="store_true",
@@ -331,10 +345,11 @@ def first_order_state(msh, args, alpha, kind):
     can be filled cell by cell. The model is freed before returning.
     """
     if kind == "euler":
-        mesh_obj, model, _ = build_model(msh, model="euler", mach=args.mach, alpha_deg=alpha)
+        mesh_obj, model, _ = build_model(msh, model="euler", mach=args.mach, alpha_deg=alpha,
+                                         **precond_options(args))
     else:
         mesh_obj, model, _ = build_model(msh, model="sa", mach=args.mach, alpha_deg=alpha, Re=args.Re,
-                                         T_inf=args.T_inf, muscl=False)
+                                         T_inf=args.T_inf, muscl=False, **precond_options(args))
     model.report_positivity_limiter = args.report_limiter
     model.krylov_rtol = args.krylov_rtol
     model.use_ptc = True
@@ -356,6 +371,20 @@ def first_order_state(msh, args, alpha, kind):
     gc.collect()
     PETSc.garbage_cleanup(msh.comm)
     return state, cell_block, info
+
+
+def precond_options(args):
+    """build_model's low-Mach preconditioning keywords."""
+    return dict(preconditioning=args.preconditioning or None, preconditioning_floor=args.precond_floor,
+                fluid=args.fluid, water_speed=args.water_speed)
+
+
+def av_options(args):
+    """build_model's shock_capturing option."""
+    if not args.av:
+        return None
+    return dict(C=args.av_C, eta=args.av_eta, ducros=False if args.av_no_ducros else None,
+                directional=args.av_directional)
 
 
 def apply_state(model, state, cell_block):
@@ -392,7 +421,8 @@ def solve_case(msh, args, alpha, n_wall_edges):
     limiter, limiter_eps = resolve_limiter(args)
     mesh_obj, model, _ = build_model(msh, model=args.model, mach=args.mach, alpha_deg=alpha, Re=args.Re,
                                      T_inf=args.T_inf, limiter=limiter,
-                                     limiter_eps=limiter_eps, euler_muscl=euler_muscl(args))
+                                     limiter_eps=limiter_eps, euler_muscl=euler_muscl(args),
+                                     shock_capturing=av_options(args), **precond_options(args))
     PETSc.Sys.Print("model {}{}: MUSCL limiter {} (eps {})".format(
         args.model, " with MUSCL" if args.model == "euler" and euler_muscl(args) else "",
         limiter or "none", limiter_eps if limiter else "-"))

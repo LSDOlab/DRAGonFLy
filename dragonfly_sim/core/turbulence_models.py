@@ -1,36 +1,39 @@
 """
 Turbulence closures for CompressibleRANSModel.
 
-A model contributes n_vars conservative transported scalars rho*phi_k. They
-are appended after the mean flow in the state vector and solved fully
-coupled with it. The RANS model asks the closure for the following, all UFL
-expressions of the state U (mean flow in U[:n_mean], scalars after it):
+A model contributes n_vars transported scalars phi_k. They are appended
+after the primitive mean flow (p', u, T) in the state vector V and solved
+fully coupled with it; the conserved quantity is rho*phi_k (the equations
+stay in density-weighted conservative form). The RANS model asks the closure
+for the following, all UFL expressions of the state V (mean flow in
+V[:n_mean], scalars after it), its ThermoState th (core/materials.py) and a
+gradient G of V:
 
-    eddy_viscosity(U, mu, n_mean)                  mu_t
-    diffusive_fluxes(U, mu, n_mean)                -> f(grad_phi, grad_rho), one
-                                                   viscous-flux row per scalar
-    sources(U, grad_U, mu, d, n_mean, gamma)       one source per scalar (right-hand side)
-    freestream_values(fs)                          conservative rho*phi_inf per scalar
-    wall_values(U, n_mean)                         conservative values on a no-slip wall
+    eddy_viscosity(V, th, mu, n_mean)              mu_t
+    diffusive_fluxes(V, th, mu, n_mean)            -> f(G), one viscous-flux row
+                                                   per scalar
+    sources(V, th, G, mu, d, n_mean)               one source per scalar (right-hand side)
+    freestream_values(fs)                          phi_inf per scalar
+    wall_values(V, n_mean)                         values on a no-slip wall
     limiter_scales(fs)                             a magnitude per scalar, for the MUSCL
                                                    limiter's smoothing parameter
 
-`fs` is a dict with the free stream: rho, p, c, M, speed (M c) and mu (a
-dolfinx Constant: mu_inf follows set_mach). Convection needs nothing from
-the closure: every scalar is carried with the mean flow, rho*phi*u
-(NS_utils.extended_flux), and upwinded with the mean flow's wave speeds. A
-closure whose sources need the distance to the wall sets
-needs_wall_distance.
+`fs` is a dict with the free stream in the solver's units: rho, speed and mu
+(a dolfinx Constant, 1/Re). Convection needs nothing from the closure: every
+scalar is carried with the mean flow, rho*phi*u (ThermoState.flux), and
+upwinded with the mean flow's wave speeds. A closure whose sources need the
+distance to the wall sets needs_wall_distance. Nothing here depends on the
+fluid: density and its gradient come from the ThermoState.
 
 Laminar is the zero-equation case (pure Navier-Stokes). Adding a closure,
 k-omega SST say, is a new subclass with n_vars = 2 and names
-("rho_k", "rho_omega"). Nothing in CompressibleRANSModel changes: the state
+("k", "omega"). Nothing in CompressibleRANSModel changes: the state
 size, boundary values, limiter scales, the Jacobian and the adjoint all
 follow from this interface.
 """
 import ufl
 
-from dragonfly_sim.utils.NS_utils import primitive_gradients, vorticity_magnitude
+from dragonfly_sim.utils.NS_utils import gradient_rows, velocity_gradient, vorticity_magnitude
 
 
 class TurbulenceModel:
@@ -39,19 +42,19 @@ class TurbulenceModel:
     names = ()
     needs_wall_distance = False
 
-    def eddy_viscosity(self, U, mu, n_mean):
+    def eddy_viscosity(self, V, th, mu, n_mean):
         return 0.0
 
-    def diffusive_fluxes(self, U, mu, n_mean):
-        return lambda grad_phi, grad_rho: []
+    def diffusive_fluxes(self, V, th, mu, n_mean):
+        return lambda G: []
 
-    def sources(self, U, grad_U, mu, d, n_mean, gamma):
+    def sources(self, V, th, G, mu, d, n_mean):
         return []
 
     def freestream_values(self, fs):
         return []
 
-    def wall_values(self, U, n_mean):
+    def wall_values(self, V, n_mean):
         return []
 
     def limiter_scales(self, fs):
@@ -88,7 +91,7 @@ class SpalartAllmarasNeg(TurbulenceModel):
     nu~ = 0.
     """
     n_vars = 1
-    names = ("rho_nu_tilde",)
+    names = ("nu_tilde",)
     needs_wall_distance = True
 
     cb1 = 0.1355
@@ -154,38 +157,32 @@ class SpalartAllmarasNeg(TurbulenceModel):
                 ufl.conditional(positive, D_pos, D_neg))
 
     # --- the TurbulenceModel interface -----------------------------------
-    def _nu_tilde(self, U, n_mean):
-        return U[n_mean] / U[0]
+    def eddy_viscosity(self, V, th, mu, n_mean):
+        nu_t = V[n_mean]
+        chi = nu_t * th.rho / mu
+        return ufl.conditional(ufl.ge(nu_t, 0.0), th.rho * nu_t * self.fv1(chi), 0.0)
 
-    def eddy_viscosity(self, U, mu, n_mean):
-        rho = U[0]
-        nu_t = self._nu_tilde(U, n_mean)
-        chi = nu_t * rho / mu
-        return ufl.conditional(ufl.ge(nu_t, 0.0), rho * nu_t * self.fv1(chi), 0.0)
+    def diffusive_fluxes(self, V, th, mu, n_mean):
+        nu_t = V[n_mean]
+        coeff = (mu + th.rho * nu_t * self.fn(nu_t * th.rho / mu)) / self.sigma
+        return lambda G: [coeff * gradient_rows(G, n_mean)]
 
-    def diffusive_fluxes(self, U, mu, n_mean):
-        rho = U[0]
-        nu_t = self._nu_tilde(U, n_mean)
-        coeff = (mu + rho * nu_t * self.fn(nu_t * rho / mu)) / self.sigma
-        return lambda grad_phi, grad_rho: [coeff * grad_phi[0]]
-
-    def sources(self, U, grad_U, mu, d, n_mean, gamma):
-        rho = U[0]
+    def sources(self, V, th, G, mu, d, n_mean):
+        rho = th.rho
         nu = mu / rho
-        nu_t = self._nu_tilde(U, n_mean)
-        grad_u, _, grad_phi, grad_rho = primitive_gradients(U, grad_U, gamma, n_mean)
-        grad_nt = grad_phi[0]
-        Omega = vorticity_magnitude(grad_u)
+        nu_t = V[n_mean]
+        grad_nt = gradient_rows(G, n_mean)
+        Omega = vorticity_magnitude(velocity_gradient(G, n_mean))
         # d is zero only on the wall itself; quadrature points never sit there
         d_safe = ufl.max_value(d, 1e-14)
         P, D = self.production_destruction(nu_t, nu, Omega, d_safe)
         fn = self.fn(nu_t / nu)
         return [rho * (P - D)
                 + self.cb2 / self.sigma * rho * ufl.dot(grad_nt, grad_nt)
-                - (nu + nu_t * fn) / self.sigma * ufl.dot(grad_rho, grad_nt)]
+                - (nu + nu_t * fn) / self.sigma * ufl.dot(th.grad_rho(G), grad_nt)]
 
     def freestream_values(self, fs):
-        return [self.chi_inf * fs['mu']]   # rho_inf * (chi_inf * mu_inf / rho_inf)
+        return [self.chi_inf * fs['mu'] / fs['rho']]
 
-    def wall_values(self, U, n_mean):
+    def wall_values(self, V, n_mean):
         return [0.0]

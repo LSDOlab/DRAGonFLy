@@ -42,6 +42,7 @@ import dolfinx
 
 from dragonfly_sim.core.mesh_manager import Mesh
 from dragonfly_sim.core.Euler_model import CompressibleEulerModel
+from dragonfly_sim.core.materials import ConstantDensity
 from dragonfly_sim.core.RANS_model import CompressibleRANSModel
 from dragonfly_sim.core.reconstruction import GreenGaussReconstruction
 from dragonfly_sim.core.turbulence_models import Laminar, SpalartAllmarasNeg
@@ -51,7 +52,6 @@ from dragonfly_sim.utils.mesh_io_utils import load_dolfinx_mesh
 from dragonfly_sim.utils.postprocessor_utils import moment_integrand
 from dragonfly_sim.core.time_integration import StepSizeController, CFLController
 from dragonfly_sim.utils.checkpoint import save_checkpoint, load_checkpoint
-from dragonfly_sim.utils.Euler_utils import pressure
 from dragonfly_sim.utils.filewriter import FileWriter
 
 RESTART_KEYS = ("mesh", "mach", "alpha", "Re", "model", "farfield")
@@ -81,19 +81,17 @@ def install_euler_muscl(flow, limiter=None, limiter_eps=1e-2):
     flow.problem.configure_snes(flow.solver.snes, "compact_pc") (the RANS model
     does this itself).
     """
-    ff = flow.farfield_conditions
-    speed = ff['M'] * ff['c']
-    scales = ([ff['rho']] + [ff['rho'] * speed] * flow.dimensions
-              + [ff['p'] / (flow.gamma - 1.0) + 0.5 * ff['rho'] * speed ** 2])
     GreenGaussReconstruction(flow, muscl=True, limiter=limiter, limiter_eps=limiter_eps,
-                             limiter_scales=lambda: scales).install()
+                             limiter_scales=flow.state_scale_expressions).install()
 
 
 def build_model(dolfinx_mesh, model="sa", mach=0.5, alpha_deg=0.0, Re=6e6, geometry="airfoil",
                 farfield="riemann", gamma=1.4, T_inf=300.0, quadrature_degree=1,
                 asm_overlap=None, ilu_levels=None, direct=False, muscl=True, limiter=None,
                 limiter_eps=1e-2, jacobian_mode="compact_pc", ff_beta=0.5, ff_relax_length=50.0,
-                inner_bdry_function=None, euler_muscl=False, wall_tags=None, symmetry_tags=None):
+                inner_bdry_function=None, euler_muscl=False, wall_tags=None, symmetry_tags=None,
+                preconditioning=None, preconditioning_floor=1.0, shock_capturing=None, fluid="air",
+                water_speed=5.0):
     """
     Build a ready-to-solve model on `dolfinx_mesh`.
 
@@ -110,6 +108,15 @@ def build_model(dolfinx_mesh, model="sa", mach=0.5, alpha_deg=0.0, Re=6e6, geome
     with wall_tags, from the mesh's own boundary tags (symmetry_tags: the
     symmetry planes; every other boundary is far field).
 
+    fluid     "air" (an ideal gas at Mach number `mach`) or "water" (constant
+              density at `water_speed` m/s and T_inf, always preconditioned);
+              Re is the chord Reynolds number either way.
+    preconditioning switches the models' low-Mach preconditioning on or off
+    (None: the fluid's default, off for air); preconditioning_floor is its
+    reference velocity floor (CompressibleEulerModel). shock_capturing (True or
+    a dict of options) adds the Barter-Darmofal artificial viscosity
+    (core/shock_capturing.py).
+
     The body (inner boundary) is the model's wall: slip for Euler, adiabatic
     no-slip otherwise. In 3D the y = 0 plane is a symmetry (slip) plane.
     Returns (mesh_obj, model, transverse); transverse is the
@@ -120,13 +127,24 @@ def build_model(dolfinx_mesh, model="sa", mach=0.5, alpha_deg=0.0, Re=6e6, geome
         raise ValueError("farfield must be riemann or riemann2")
     inner = None if wall_tags is not None else (inner_bdry_function or GEOMETRIES[geometry]["inner"])
     mesh_obj = Mesh(dolfinx_mesh, inner, wall_tags=wall_tags, symmetry_tags=symmetry_tags)
+    material = None
+    if fluid == "water":
+        material = ConstantDensity()
+    elif fluid != "air":
+        raise ValueError("fluid must be air or water")
     if model == "euler":
-        flow = CompressibleEulerModel(mesh_obj, poly_order=0, gamma=gamma)
+        flow = CompressibleEulerModel(mesh_obj, poly_order=0, gamma=gamma, material=material,
+                                      preconditioning=preconditioning,
+                                      preconditioning_floor=preconditioning_floor,
+                                      shock_capturing=shock_capturing)
     elif model in ("sa", "laminar"):
         turb = SpalartAllmarasNeg() if model == "sa" else Laminar()
         flow = CompressibleRANSModel(mesh_obj, Re=Re, turbulence_model=turb, gamma=gamma,
                                      T_inf_dim=T_inf, muscl=muscl, limiter=limiter,
-                                     limiter_eps=limiter_eps, jacobian_mode=jacobian_mode)
+                                     limiter_eps=limiter_eps, jacobian_mode=jacobian_mode,
+                                     preconditioning=preconditioning,
+                                     preconditioning_floor=preconditioning_floor,
+                                     shock_capturing=shock_capturing, material=material)
     else:
         raise ValueError("model must be euler, laminar or sa")
     flow.direct_linear_solver = direct
@@ -135,7 +153,10 @@ def build_model(dolfinx_mesh, model="sa", mach=0.5, alpha_deg=0.0, Re=6e6, geome
     if ilu_levels is not None:
         flow.ilu_levels = ilu_levels
     alpha = np.radians(alpha_deg)
-    flow.define_farfield_conditions({'rho': 1.0, 'M': mach, 'p': 1.0, 'alpha': alpha})
+    if fluid == "water":
+        flow.define_farfield_conditions({'U': water_speed, 'T': T_inf, 'p': 101325.0, 'alpha': alpha})
+    else:
+        flow.define_farfield_conditions({'rho': 1.0, 'M': mach, 'p': 1.0, 'alpha': alpha})
 
     inner_mask = np.asarray(mesh_obj.inner_bdry_facet_mask, dtype=bool)
     sym_tags = []
@@ -182,9 +203,8 @@ class ForceCoefficients:
         comm = msh.comm
         self.model, self.comm = model, comm
         dim = msh.topology.dim
-        gamma = model.gamma
         ff = model.farfield_conditions
-        q_inf = 0.5 * ff['rho'] * (ff['M'] * ff['c']) ** 2
+        q_inf = 0.5 * ff['rho'] * ff['speed'] ** 2
         n = mesh_obj.n
         ds = mesh_obj.form_manager.ds(wall_tag)
         drag_vec = model._inflow_direction_numpy(np.radians(alpha_deg))
@@ -201,7 +221,7 @@ class ForceCoefficients:
             centre = aero_centre or (0.25, 0.0, 0.0)
         u = model.u_vec
         force = model.wall_force_density(u, n)
-        friction = force - pressure(model.mean_flow(u), gamma) * n
+        friction = force - model.thermo(u).p * n
         lever = ufl.SpatialCoordinate(msh) - ufl.as_vector(list(centre))
         qS = q_inf * S_ref
         self.S_ref, self.c_ref = S_ref, c_ref
@@ -237,7 +257,15 @@ def parse_args():
     p.add_argument("--alpha", type=float, default=2.0, help="angle of attack [deg]")
     p.add_argument("--Re", type=float, default=6e6)
     p.add_argument("--T-inf", type=float, default=300.0, help="free-stream temperature [K] (Sutherland)")
-    p.add_argument("--farfield", choices=("riemann", "riemann2"), default="riemann")
+    p.add_argument("--farfield", choices=("riemann", "riemann2"), default="riemann",
+                   help="riemann: the characteristic far field (the free stream as a ghost state "
+                        "with preconditioning or water)")
+    p.add_argument("--fluid", choices=("air", "water"), default="air",
+                   help="water: constant density at --water-speed and T_inf, preconditioned (Re as given)")
+    p.add_argument("--water-speed", type=float, default=5.0, help="free-stream speed of water [m/s]")
+    p.add_argument("--preconditioning", action="store_true", help="low-Mach (Weiss-Smith) preconditioning")
+    p.add_argument("--precond-floor", type=float, default=1.0,
+                   help="preconditioning reference velocity floor, in free-stream speeds")
     p.add_argument("--ff-beta", type=float, default=0.5, help="riemann2 transverse weight")
     p.add_argument("--ff-relax-length", type=float, default=50.0, help="riemann2 relaxation length")
     # numerics
@@ -256,7 +284,8 @@ def parse_args():
     p.add_argument("--unsteady", action="store_true")
     p.add_argument("--dual-time", action="store_true", help="PTC inside every physical step")
     p.add_argument("--steps", type=int, default=2000)
-    p.add_argument("--dt", type=float, default=0.05)
+    p.add_argument("--dt", type=float, default=0.05,
+                   help="physical time step, in chords / free-stream speed")
     p.add_argument("--dt-start", type=float, default=1e-3)
     p.add_argument("--dt-growth", type=float, default=1.5)
     p.add_argument("--max-retries", type=int, default=8)
@@ -265,6 +294,8 @@ def parse_args():
     p.add_argument("--newton-atol", type=float, default=1e-10)
     p.add_argument("--newton-max-it", type=int, default=20)
     p.add_argument("--restart", default=None, help="checkpoint .npz to continue from")
+    p.add_argument("--alpha-step", action="store_true",
+                   help="the restart may change the angle of attack: a step change in alpha (transient response)")
     # output
     p.add_argument("--out-dir", default=".")
     p.add_argument("--label", default="")
@@ -284,9 +315,9 @@ def wall_writer(model, mesh_obj):
         return lambda path: None
     fdim = 1
     ff = model.farfield_conditions
-    q_inf = 0.5 * ff['rho'] * (ff['M'] * ff['c']) ** 2
+    q_inf = 0.5 * ff['rho'] * ff['speed'] ** 2
     u, n = model.u_vec, mesh_obj.n
-    cp = (pressure(model.mean_flow(u), model.gamma) - ff['p']) / q_inf
+    cp = model.thermo(u).p / q_inf      # the gauge pressure p - p_inf
     fields = [ufl.SpatialCoordinate(msh)[0], ufl.SpatialCoordinate(msh)[1], cp]
     if hasattr(model, "skin_friction_vector"):
         drag_dir = ufl.as_vector(list(model._inflow_direction_numpy(ff['alpha'])))
@@ -319,10 +350,9 @@ def field_writer(model, directory, prefix=""):
     comm = model.u_vec.function_space.mesh.comm
     Vs = model.functionspaces["V_scalar"]
     p_f, M_f = dolfinx.fem.Function(Vs, name="pressure"), dolfinx.fem.Function(Vs, name="mach")
-    U = model.mean_flow(model.u_vec)
-    p_e = pressure(U, model.gamma)
-    vel = ufl.as_vector([U[1 + i] / U[0] for i in range(model.dimensions)])
-    M_e = ufl.sqrt(ufl.dot(vel, vel)) / ufl.sqrt(model.gamma * p_e / U[0])
+    th = model.thermo(model.u_vec)
+    p_e = th.p                                   # gauge pressure, in rho_inf u_inf^2
+    M_e = ufl.sqrt(ufl.dot(th.u, th.u) * th.inv_c2)
     pts = Vs.element.interpolation_points
     exprs = [(p_f, dolfinx.fem.Expression(p_e, pts)), (M_f, dolfinx.fem.Expression(M_e, pts))]
     writers = [(FileWriter(os.path.join(directory, prefix + name), comm, f.function_space), f)
@@ -352,7 +382,9 @@ def main():
         muscl=not args.no_muscl, limiter=None if args.limiter == "none" else args.limiter,
         limiter_eps=args.limiter_eps, jacobian_mode=args.jacobian, ff_beta=args.ff_beta,
         ff_relax_length=args.ff_relax_length,
-        wall_tags=parse_tags(args.wall_tags), symmetry_tags=parse_tags(args.symmetry_tags))
+        wall_tags=parse_tags(args.wall_tags), symmetry_tags=parse_tags(args.symmetry_tags),
+        preconditioning=args.preconditioning or None, preconditioning_floor=args.precond_floor,
+        fluid=args.fluid, water_speed=args.water_speed)
     model.report_positivity_limiter = False
 
     # run folder: unique, created by rank 0
@@ -365,7 +397,7 @@ def main():
         run_dir = tempfile.mkdtemp(prefix=stem + time.strftime("%Y%m%d-%H%M%S_"), dir=args.out_dir)
     run_dir = comm.bcast(run_dir, root=0)
 
-    config = {"mesh": os.path.abspath(args.mesh), "mach": args.mach, "alpha": args.alpha,
+    config = {"mesh": os.path.abspath(args.mesh), "fluid": args.fluid, "mach": args.mach, "alpha": args.alpha,
               "Re": args.Re, "model": args.model, "farfield": args.farfield}
     coefficients = ForceCoefficients(model, mesh_obj, args.alpha, aero_centre=geo["aero_centre"])
     write_wall = wall_writer(model, mesh_obj)
@@ -421,10 +453,17 @@ def main():
     step0, t0, dt_prev = 0, 0.0, None
     if args.restart:
         meta = load_checkpoint(args.restart, ckpt_fields, optional=True)
-        bad = {k: (meta.get(k), config[k]) for k in RESTART_KEYS if meta.get(k) != config[k]}
+        if meta.get("steady"):
+            # a steady solution (field "u"): both history levels start from it
+            load_checkpoint(args.restart, [model.u_vec])
+            for f in (term.U_n, term.U_nm1):
+                f.x.array[:] = model.u_vec.x.array
+        keys = [k for k in RESTART_KEYS if not (args.alpha_step and k == "alpha")]
+        bad = {k: (meta.get(k), config[k]) for k in keys if meta.get(k) != config[k]}
         if bad:
             raise ValueError("restart settings differ from the checkpoint: {}".format(bad))
-        step0, t0 = meta["step"], meta["t"]
+        # a steady checkpoint (no step, no time) starts the transient at t = 0
+        step0, t0 = meta.get("step", 0), meta.get("t", 0.0)
         dt_prev = meta.get("dt_last") if step0 >= 1 else None
         model.u_vec.x.array[:] = term.U_n.x.array
         model.u_vec.x.scatter_forward()

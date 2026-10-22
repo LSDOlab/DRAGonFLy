@@ -2,14 +2,19 @@
 Time integration: pseudo-transient continuation (PTC) for steady solves and
 BDF1/BDF2 for unsteady ones, on one residual.
 
-    R*(U) = R(U) + inv_dt (a0 U + a1 U^n + a2 U^{n-1})       physical BDF term
-                 + (w_K / CFL) (U - U_old)                    pseudo-time term
+    R*(V) = R(V) + inv_dt (a0 U(V) + a1 U(V^n) + a2 U(V^{n-1}))   physical BDF term
+                 + (w_K / CFL) Gamma(V_old) (V - V_old)            pseudo-time term
 
-R is the model's steady residual (model.F, unchanged, which is what the
-adjoint differentiates). w_K = lambda_K / h_K (+ the model's
-time_scale_terms, e.g. viscous 2 nu / h^2) is the cell's inverse local time
-step at CFL 1, evaluated at U_old. Both terms are lumped DG0 mass terms and
-both live only in TimeTerm.augment(), so they never enter model.F.
+with V the unknowns and U(V) the conserved state (model.conserved): the
+physical term is the BDF derivative of the conserved state, so the scheme
+stays conservative in time whatever the unknowns are. Gamma is
+model.pseudo_time_increment: dU/dV at V_old, the time derivative the
+pseudo-time term stands in for (or its preconditioned form). R is the
+model's steady residual (model.F, unchanged, which is what the adjoint
+differentiates). w_K = lambda_K / h_K (+ the model's time_scale_terms, e.g.
+viscous 2 nu / h^2) is the cell's inverse local time step at CFL 1,
+evaluated at V_old. Both terms are lumped DG0 mass terms and both live only
+in TimeTerm.augment(), so they never enter model.F.
 
 Modes (all one step loop, TimeIntegrator._newton_step):
 
@@ -201,10 +206,12 @@ class TimeTerm:
         u, v, dx = m.u_vec, m.v_vec, m.forms.dx
         if self.pseudo:
             w = self.local_inverse_time_scale(self.U_old)
-            F = F + w * self.inv_cfl * ufl.inner(u - self.U_old, v) * dx
+            F = F + w * self.inv_cfl * ufl.inner(m.pseudo_time_increment(self.U_old, u - self.U_old),
+                                                 v) * dx
         if self.physical:
             a0, a1, a2 = self.a
-            F = F + self.inv_dt * ufl.inner(a0 * u + a1 * self.U_n + a2 * self.U_nm1, v) * dx
+            U = m.conserved
+            F = F + self.inv_dt * ufl.inner(a0 * U(u) + a1 * U(self.U_n) + a2 * U(self.U_nm1), v) * dx
         return F
 
     def set_bdf(self, order, dt, dt_prev=None):
@@ -360,12 +367,17 @@ class TimeIntegrator:
             self._copy(self.term.U_nm1, self.model.u_vec)
 
     def advance(self, step_control, order=2, newton_rtol=1e-8, newton_atol=1e-10,
-                newton_max_it=20, dual_time=None):
+                newton_max_it=20, dual_time=None, newton_criterion="residual"):
         """
         One physical time step from U^n. The step size comes from
         step_control (StepSizeController); a failed Newton solve restores
         U^n and halves dt, up to step_control.max_retries times.
         `dual_time` (a CFLController) switches the inner solve to PTC on R*.
+        newton_criterion "residual" tests |R*| against newton_atol and
+        newton_rtol |R*_0|; "incremental" tests the Newton update ||dx||
+        against newton_atol and newton_rtol times the first update -- for
+        meshes whose huge far-field cells put the residual's round-off
+        floor (~ eps/dt |U| |K|) above any useful absolute tolerance.
         Returns a StepRecord; record.accepted is False if every retry failed.
         """
         m, term = self.model, self.term
@@ -380,7 +392,7 @@ class TimeIntegrator:
                 b.prepare(k, ratio, dt)
             if dual_time is None:
                 term.set_cfl(None)
-                ok, rec = self._newton_solve(newton_rtol, newton_atol, newton_max_it)
+                ok, rec = self._newton_solve(newton_rtol, newton_atol, newton_max_it, newton_criterion)
             else:
                 ok, rec = self._dual_time_solve(dual_time, newton_rtol, newton_atol, newton_max_it)
             if ok:
@@ -401,11 +413,11 @@ class TimeIntegrator:
         self._copy(term.U_n, m.u_vec)
         return rec
 
-    def _newton_solve(self, rtol, atol, max_it):
+    def _newton_solve(self, rtol, atol, max_it, criterion="residual"):
         m = self.model
         solver = m.solver
         crit = (solver.convergence_criterion, solver.rtol, solver.atol, solver.max_it)
-        solver.convergence_criterion, solver.rtol, solver.atol, solver.max_it = "residual", rtol, atol, max_it
+        solver.convergence_criterion, solver.rtol, solver.atol, solver.max_it = criterion, rtol, atol, max_it
         snes = solver.snes
         snes.setConvergenceHistory(reset=True)
         try:

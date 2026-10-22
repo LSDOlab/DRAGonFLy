@@ -15,10 +15,10 @@ from dragonfly_sim.utils.petsc_utils import set_petsc_vec_array
 from dragonfly_sim.utils.solver_utils import (locate_positivity_limiting_nodes, ksp_converged_reason_name,
                                               ksp_norm_type_name, ksp_pc_side_name)
 from dragonfly_sim.core.form_manager import FormManager
-from dragonfly_sim.utils.Euler_utils import primitives, pressure, energy_density, flux, slip_wall_state, hll_flux, boundary_flux
-from dragonfly_sim.utils.NS_utils import (mean_flow, concat_state, extended_flux, extended_normal_flux,
-                                          extended_hll_flux, extended_boundary_flux)
-from dragonfly_sim.utils.farfield_utils import riemann_farfield_state
+from dragonfly_sim.utils.Euler_utils import (slip_wall_state, hll_flux, boundary_flux, spectral_radius,
+                                             smooth_max)
+from dragonfly_sim.utils.NS_utils import mean_flow, concat_state
+from dragonfly_sim.core.materials import IdealGas, thermo, state_vector
 from dragonfly_sim.utils.filewriter import FileWriter
 
 
@@ -27,12 +27,20 @@ class CompressibleEulerModel():
     The p = 0 DG (cell-centred finite-volume) compressible Euler model, and
     the host every other flow model in the package is built on.
 
-    State: the conservative mean flow (rho, rho u, rho E), n_mean = 2 + dim
-    components per cell, optionally followed by `extra_variables`
-    transported scalars (n_state components in all). The scalars are
-    convected with the mean flow (NS_utils.extended_flux) and are not
-    positivity-limited. With no extra variables every form below is the
-    plain Euler one.
+    State: the primitive mean flow V = (p', u, T) -- gauge pressure,
+    velocity, temperature, n_mean = 2 + dim components per cell -- optionally
+    followed by `extra_variables` transported scalars phi_k (n_state
+    components in all). The residual is the conservative one in U(V) =
+    (rho, rho u, rho E', rho phi) (core/materials.py): every flux is
+    evaluated on the ThermoState of its traces, so shocks keep their
+    conservative jump conditions. The scalars are convected with the mean
+    flow and are not positivity-limited.
+
+    The fluid is the `material` (core/materials.py; an IdealGas with
+    `gamma` by default), the only fluid-specific code. All quantities are
+    scaled with the far-field state (see core/materials.py); the energy
+    equation is weighted by 1/(h_T T_ref), which keeps the residual rows
+    of one size at every Mach number.
 
     Plug-in points. CompressibleRANSModel fills these; for the plain Euler
     model they are all empty or None, and the residual, Jacobian and
@@ -50,6 +58,10 @@ class CompressibleEulerModel():
         wall_bc             (tag) -> None, replaces the slip wall in define_wall_bc
         wall_traction       (U, n) -> traction added to p n in wall_force_density
         time_scale_terms    callables (U) -> added to the PTC inverse time scale
+        preconditioning_speeds
+                            callables (U, h) -> a squared speed the low-Mach
+                            reference velocity U_r may not drop below (e.g.
+                            the viscous (nu/h)^2)
         derived_fields      DerivedField objects (utils/derived_fields.py):
                             fields the residual reads that are not unknowns
                             (a reconstructed gradient, cell centres, the wall
@@ -70,26 +82,51 @@ class CompressibleEulerModel():
     only, so self.F stays the steady residual that the adjoint
     differentiates.
     """
-    def __init__(self, mesh, poly_order=0, gamma=1.4, flux_function=hll_flux, extra_variables=()):  # llf_flux  # hll_flux
+    def __init__(self, mesh, poly_order=0, gamma=1.4, flux_function=hll_flux, extra_variables=(),
+                 material=None, preconditioning=None, preconditioning_floor=1.0, shock_capturing=None):
+        """
+        preconditioning: local low-Mach (Weiss-Smith) preconditioning of the
+            flux dissipation and the pseudo-time term (see
+            low_mach_preconditioning); None means on exactly when the
+            material needs it (an incompressible fluid).
+        preconditioning_floor: the reference velocity's floor, as a fraction
+            of the free-stream speed. 1 (U_r >= u_inf, as Turkel recommends):
+            smaller floors slowed the transonic RANS start from the free
+            stream twofold (0.1, 0.3 on Rizzi grid 1) or stalled it (0.1 on
+            grid 4); U_r = O(u_inf) keeps the low-Mach scaling either way.
+        shock_capturing: None, or True or a dict of options (possibly empty) for the
+            Barter-Darmofal artificial viscosity (core/shock_capturing.py),
+            which adds its viscosity field as an auxiliary unknown.
+        """
         if poly_order > 0:
             raise ValueError("This release only support 0th-order DG bases for now")
 
         self.mesh_obj = mesh
         self.poly_order = poly_order
-        self.gamma = gamma
+        self.material = IdealGas(gamma) if material is None else material
+        if preconditioning is None:
+            preconditioning = self.material.incompressible
+        if self.material.incompressible and not preconditioning:
+            raise ValueError("an incompressible fluid needs the low-Mach preconditioning")
+        self.preconditioning = bool(preconditioning)
+        self.preconditioning_floor = float(preconditioning_floor)
+        # kept for callers that read it; None for a fluid without one
+        self.gamma = getattr(self.material, "gamma", None)
         self.dimensions = self.mesh_obj.mesh._ufl_domain._geometric_dimension
 
         self.flux_function = flux_function
 
-        # State layout: mean flow, then the transported scalars
+        # State layout: mean flow, then the transported scalars, then the
+        # auxiliary (not conserved, not transported) unknowns
         self.extra_variables = tuple(extra_variables)
+        # True: the artificial viscosity with its default options; False/None: none
+        shock_capturing = {True: {}, False: None}.get(shock_capturing, shock_capturing) \
+            if isinstance(shock_capturing, bool) else shock_capturing
+        self.aux_variables = ("sigma",) if shock_capturing is not None else ()
         self.n_mean = 2 + self.dimensions
         self.n_extra = len(self.extra_variables)
-        self.n_state = self.n_mean + self.n_extra
-        if self.n_extra and flux_function is not hll_flux:
-            raise NotImplementedError(
-                "Extra transported variables need the HLL flux (NS_utils.extended_hll_flux); "
-                "the other Riemann fluxes have no extended-state version.")
+        self.n_aux = len(self.aux_variables)
+        self.n_state = self.n_mean + self.n_extra + self.n_aux
 
         # Plug-in points (see the class docstring); all inert by default
         self.boundary_states = []
@@ -101,6 +138,13 @@ class CompressibleEulerModel():
         self.wall_bc = None
         self.wall_traction = None
         self.time_scale_terms = []
+        self.preconditioning_speeds = []
+        self.shock_capturing = None
+        if shock_capturing is not None:
+            from dragonfly_sim.core.shock_capturing import BarterDarmofalAV
+            if self.material.incompressible:
+                raise ValueError("shock capturing for an incompressible fluid: there are no shocks")
+            self.shock_capturing = BarterDarmofalAV(self, **shock_capturing)
         self.derived_fields = []
         self.problem_factory = None
         self.extra_scales = None
@@ -119,6 +163,12 @@ class CompressibleEulerModel():
         # Smallest positivity step length applied since the caller last
         # reset it; the PTC CFL law reads it.
         self.last_step_theta = 1.0
+        # Largest relative change of the absolute pressure and the
+        # temperature per Newton step (positivity_step_length): an update of
+        # the primitive unknowns misses the quadratic kinetic-energy term
+        # an update of rho E carries, which overheats cells in the large
+        # steps of an impulsive start. None: positivity only.
+        self.max_relative_change = 0.5
 
         # Krylov solver of the Newton steps (see apply_krylov_solver_settings);
         # direct_linear_solver switches every linear solve to MUMPS.
@@ -159,6 +209,10 @@ class CompressibleEulerModel():
         # ASM overlap and ILU fill for the preconditioner 
         self.asm_overlap = 2
         self.ilu_levels = 2
+        # ASM subdomain solver: "ilu" (ILU(ilu_levels)) or "lu" (exact
+        # subdomain factorizations: more memory, robust where ILU stalls,
+        # e.g. the zero pressure diagonal of an incompressible time step)
+        self.subdomain_solver = "ilu"
 
         self.fom_solution_writer = None
         self._output_fields = []
@@ -169,23 +223,23 @@ class CompressibleEulerModel():
 
     def output_field_expressions(self):
         """The fields of the solution file, as (name, value shape, UFL
-        expression of u_vec): the conservative state as separate fields --
-        density rho, momentum rho*u (a vector), energy rho*E, and each
-        transported scalar under its own name (e.g. rho_nu_tilde) -- then the
-        velocity u (a vector) and the pressure p."""
+        expression of u_vec), in the solver's units: the unknowns as separate
+        fields -- the gauge pressure p' (pressure; C_p = 2 p'), the velocity
+        u (a vector), the temperature T and each transported scalar under its
+        own name (e.g. nu_tilde) -- then the density and, for a compressible
+        fluid, the Mach number."""
         dim = self.dimensions
-        U = self.mean_flow(self.u_vec)
-        momentum = ufl.as_vector([U[1 + i] for i in range(dim)])
-        fields = [("density", (), U[0]),
-                  ("momentum", (dim,), momentum),
-                  ("energy", (), U[1 + dim])]
+        th = self.thermo(self.u_vec)
+        fields = [("pressure", (), th.p), ("velocity", (dim,), th.u), ("temperature", (), th.T)]
         fields += [(name, (), self.u_vec[self.n_mean + k])
-                   for k, name in enumerate(self.extra_variables)]
-        fields += [("velocity", (dim,), momentum / U[0]),
-                   ("pressure", (), pressure(U, self.gamma))]
+                   for k, name in enumerate(self.extra_variables + self.aux_variables)]
+        fields += [("density", (), th.rho)]
+        if not self.material.incompressible:
+            fields += [("mach", (), ufl.sqrt(ufl.dot(th.u, th.u) * th.inv_c2))]
         return fields
 
-    def define_sol_export_files(self, func_space=None, file_name_addendum=None, mesh_deformation=False):
+    def define_sol_export_files(self, func_space=None, file_name_addendum=None, mesh_deformation=False,
+                                time_dependent=False, file_name=None):
         """Open FOM_solution_<suffix>.bp, one file holding every output field
         (output_field_expressions) as a separate, named field; the mesh is
         stored once per frame for all of them. Collective.
@@ -196,6 +250,10 @@ class CompressibleEulerModel():
         see DG_windtunnel_model.solve_residual_equations. mesh_deformation=True
         writes each frame on the deformed mesh it was solved on. func_space is
         unused (the fields define their own spaces); it is kept for callers.
+
+        time_dependent: frames are labelled with the physical time
+        (write_solution_output(..., time=t)) instead of the evaluation index,
+        for unsteady runs; file_name replaces FOM_solution_<suffix>.
         """
         spaces = {}
         self._output_fields = []
@@ -210,20 +268,21 @@ class CompressibleEulerModel():
                 (name, dolfinx.fem.Function(V, name=name),
                  dolfinx.fem.Expression(expr, V.element.interpolation_points)))
         self.fom_solution_writer = FileWriter(
-            "FOM_solution_{}".format(file_name_addendum), self.mesh_obj.mesh.comm,
+            file_name or "FOM_solution_{}".format(file_name_addendum), self.mesh_obj.mesh.comm,
             {name: f.function_space for name, f, _ in self._output_fields},
-            mesh_deformation=mesh_deformation)
+            mesh_deformation=mesh_deformation, time_dependent=time_dependent)
         self.export_solutions = True
 
-    def _write_output_fields(self, write_counter):
+    def _write_output_fields(self, write_counter, time=None):
         """Interpolate the output fields off the current u_vec and write one
         frame. u_vec must already hold the state being exported. Collective."""
         for _, f, expr in self._output_fields:
             f.interpolate(expr)
+        label = dict(time=time) if self.fom_solution_writer.time_dependent else dict(write_counter=write_counter)
         self.fom_solution_writer.interpolate_and_write(
-            {name: f for name, f, _ in self._output_fields}, write_counter=write_counter)
+            {name: f for name, f, _ in self._output_fields}, **label)
 
-    def write_solution_output(self, write_counter, solution_array=None):
+    def write_solution_output(self, write_counter, solution_array=None, time=None):
         """Write one aligned output frame at index `write_counter`.
 
         Called once per design evaluation from
@@ -233,7 +292,8 @@ class CompressibleEulerModel():
 
         `solution_array` is the accepted solution of the evaluation, passed
         explicitly rather than read off self.u_vec. Passing None writes
-        whatever u_vec currently holds.
+        whatever u_vec currently holds. `time` labels the frame of a
+        time-dependent writer (define_sol_export_files(time_dependent=True)).
         """
         if not self.export_solutions:
             return
@@ -241,7 +301,7 @@ class CompressibleEulerModel():
         if solution_array is not None:
             self.interpolate_solution_vector(solution_array)
 
-        self._write_output_fields(write_counter)
+        self._write_output_fields(write_counter, time)
 
     def define_elements_functionspaces(self):
         # Throughout this class we need access to various function spaces; this is where we define them
@@ -251,40 +311,39 @@ class CompressibleEulerModel():
         }
 
     def define_trial_testfunctions(self):
-        # Define the trial and test functions for the weak form
+        # Define the trial and test functions for the weak form. Every form
+        # tests with v_vec, the test function with the energy row weighted by
+        # 1/(h_T T_ref): rho u H carries the enthalpy h ~ c_p T, which is
+        # 1/((gamma - 1) M^2) times the kinetic terms, and would otherwise
+        # make the energy rows dominate every residual norm at low Mach.
         self.u_vec = dolfinx.fem.Function(self.functionspaces["V"], name="u")
-        self.v_vec = ufl.TestFunction(self.functionspaces["V"])
+        self.v_test = ufl.TestFunction(self.functionspaces["V"])
+        w_energy = 1.0 / self.material.energy_scale()
+        e = self.n_mean - 1
+        self.v_vec = ufl.as_vector([w_energy * self.v_test[i] if i == e else self.v_test[i]
+                                    for i in range(self.n_state)])
 
     def define_farfield_conditions(self, farfield):
         """
         Set the free-stream state the far-field boundary condition relaxes to.
 
-        `farfield` is {'rho', 'p', 'M', 'alpha'}: density, pressure, Mach
-        number and angle of attack (rad). This is all the user states; the
-        boundary treatment (inflow, outflow) follows from it per facet in
-        define_farfield_bc, through the characteristic state.
+        `farfield` is the material's far-field dict, for an ideal gas
+        {'rho', 'p', 'M', 'alpha'}: density, pressure, Mach number and angle
+        of attack (rad). This is all the user states; the boundary treatment
+        (inflow, outflow) follows from it per facet in define_farfield_bc,
+        through the characteristic state. The material scales every quantity
+        with it (core/materials.py), so farfield_conditions holds the free
+        stream in the solver's units: rho = 1, speed |u| = 1, the absolute
+        pressure p (1/(gamma M^2) for an ideal gas) and the sound speed c.
 
-        NOTE: the far field is the subsonic characteristic one, so M < 1.
-        A supersonic free stream needs a different boundary state in
-        define_farfield_bc (all variables from the free stream at inflow, all
-        from the interior at outflow); this is the one place that would change.
+        NOTE: the ideal gas's far field is the subsonic characteristic one,
+        so M < 1. A supersonic free stream needs a different boundary state
+        (all variables from the free stream at inflow, all from the interior
+        at outflow); IdealGas.farfield_state is the one place that would
+        change.
         """
-        if not isinstance(farfield, dict) or set(farfield) != {'rho', 'p', 'M', 'alpha'}:
-            raise ValueError(
-                "The far-field conditions are a flat dict {{'rho': ..., 'p': ..., 'M': ..., "
-                "'alpha': ...}} (density, pressure, Mach number, angle of attack in rad); "
-                "got {}. The former {{'inlet': {{...}}, 'outlet': {{...}}}} form is gone: "
-                "pass the contents of 'inlet' and drop 'outlet'.".format(
-                    sorted(farfield) if isinstance(farfield, dict) else type(farfield).__name__))
-        rho, p, M, alpha = (float(farfield[k]) for k in ('rho', 'p', 'M', 'alpha'))
-        if rho <= 0.0 or p <= 0.0:
-            raise ValueError("far-field density and pressure must be positive")
-        if not 0.0 <= M < 1.0:
-            raise NotImplementedError(
-                "far-field Mach number {} outside [0, 1): only the subsonic "
-                "characteristic far field is implemented".format(M))
-
-        c = (self.gamma * p / rho) ** 0.5  # speed of sound
+        ref = self.material.bind(self.mesh_obj.mesh, farfield)
+        alpha = float(farfield['alpha'])
 
         # Since angle of attack is a design parameter we define it as a UFL variable;
         # this allows us to use Dolfin's automatic differentiation for it
@@ -297,20 +356,16 @@ class CompressibleEulerModel():
         flow_dir = dolfinx.fem.Constant(
             self.mesh_obj.mesh, self._inflow_direction_numpy(alpha))
 
-        # defining the reference velocity so we can update it later
-        # if the Mach number gets modified
-        self.u_ref_const = dolfinx.fem.Constant(self.mesh_obj.mesh, M*c)
+        # the free-stream speed, the velocity unit
+        self.u_ref_const = dolfinx.fem.Constant(self.mesh_obj.mesh, ref['speed'])
         u_inf = self.u_ref_const * inflow_dir
 
-        self.farfield_conditions = {'rho': rho,
-                                    'p': p,
-                                    'M': M,
-                                    'alpha': alpha,
-                                    'inflow_angle': self._inflow_direction_numpy(alpha),
-                                    'c': c,
-                                    'flow_dir': flow_dir,
-                                    'u': u_inf,
-                                    'u_ref': self.u_ref_const}
+        self.farfield_conditions = dict(ref)
+        self.farfield_conditions.update({'alpha': alpha,
+                                         'inflow_angle': self._inflow_direction_numpy(alpha),
+                                         'flow_dir': flow_dir,
+                                         'u': u_inf,
+                                         'u_ref': self.u_ref_const})
 
     def _inflow_direction_ufl(self):
         # unit freestream direction as a UFL expression
@@ -344,25 +399,30 @@ class CompressibleEulerModel():
         self.farfield_conditions['flow_dir'].value = inflow_angle
 
     def set_mach(self, M):
-        # propagate the new Mach number `M` to all model dependencies
-        M = float(M)
-        c = self.farfield_conditions['c']
-        self.u_ref_const.value = M * c
-        self.farfield_conditions['M'] = M
+        """Propagate a new Mach number to the material's constants. The
+        velocity unit stays the free-stream speed, so the far-field state in
+        the solver's units is unchanged; the absolute pressure p_ref =
+        1/(gamma M^2) and the sound speed move."""
+        self.farfield_conditions.update(self.material.set_mach(M))
 
-    def compute_initial_conditions_from_farfield(self):
-        # The initial guess used in the Newton solver: the free stream.
+    def freestream_state(self):
+        """The free stream V_inf = (0, u_inf, 1, phi_inf) as a UFL vector."""
         ff = self.farfield_conditions
-        rho_in = dolfinx.fem.Constant(self.mesh_obj.mesh, ff['rho'])
-        rhoE_in_guess = energy_density(ff['p'], rho_in, ff['u'], self.gamma)
-        self.initial_conditions = ufl.as_vector((rho_in, *[rho_in*ff['u'][i] for i in range(self.dimensions)], rhoE_in_guess))
+        extras = []
         if self.n_extra:
-            # plain numbers become Constants on this mesh, so the initial
-            # condition stays interpolable
+            # plain numbers become Constants on this mesh, so the state stays
+            # interpolable
             extras = [v if isinstance(v, ufl.core.expr.Expr)
                       else dolfinx.fem.Constant(self.mesh_obj.mesh, float(v))
                       for v in self._freestream_scalars()]
-            self.initial_conditions = concat_state(self.initial_conditions, extras)
+        msh = self.mesh_obj.mesh
+        zero = dolfinx.fem.Constant(msh, 0.0)
+        return state_vector(zero, ff['u'], dolfinx.fem.Constant(msh, 1.0),
+                            extras + [zero] * self.n_aux)
+
+    def compute_initial_conditions_from_farfield(self):
+        # The initial guess used in the Newton solver: the free stream.
+        self.initial_conditions = self.freestream_state()
 
     def interpolate_solution_vector(self, interpolant=None):
         if interpolant is None:
@@ -382,8 +442,89 @@ class CompressibleEulerModel():
     # State layout
     # ------------------------------------------------------------------
     def mean_flow(self, U):
-        """The mean-flow slice (rho, rho u, rho E) of a state expression."""
+        """The mean-flow slice (p', u, T) of a state expression."""
         return mean_flow(U, self.n_mean)
+
+    def thermo(self, V):
+        """The ThermoState (core/materials.py) of a state expression V: the
+        conserved state, the physical flux and the material derivatives. V
+        may be the mean flow alone."""
+        return thermo(self.material, V, self.n_mean, min(self.n_extra, V.ufl_shape[0] - self.n_mean))
+
+    def embed(self, x):
+        """A vector (or the rows of a tensor) over the conserved components,
+        padded with zero rows for the auxiliary unknowns, which have no
+        flux and no time derivative. The identity without them."""
+        if not self.n_aux:
+            return x
+        if len(x.ufl_shape) == 1:
+            return ufl.as_vector([x[i] for i in range(x.ufl_shape[0])] + [0.0] * self.n_aux)
+        zero = [0.0] * x.ufl_shape[1]
+        rows = [[x[i, j] for j in range(x.ufl_shape[1])] for i in range(x.ufl_shape[0])]
+        return ufl.as_tensor(rows + [zero] * self.n_aux)
+
+    def with_aux(self, V_b, V=None):
+        """A boundary state V_b given without the auxiliary unknowns, completed
+        with V's (the interior's: zero normal gradient)."""
+        if not self.n_aux or V_b.ufl_shape[0] == self.n_state:
+            return V_b
+        V = self.u_vec if V is None else V
+        n_c = self.n_mean + self.n_extra
+        return ufl.as_vector([V_b[i] for i in range(n_c)] + [V[i] for i in range(n_c, self.n_state)])
+
+    def conserved(self, V):
+        """The conserved state U(V) the residual and the physical time term
+        are written in (embedded: zero for the auxiliary unknowns)."""
+        return self.embed(self.thermo(V).U)
+
+    def pseudo_time_increment(self, V_old, dV):
+        """
+        The pseudo-time term's increment Gamma dV at V_old: dU/dV dV, plus
+        with low-Mach preconditioning the Weiss-Smith correction of the
+        pressure column, (1/U_r^2 - 1/c^2) dp' (1, u, H, phi). The physical
+        time derivative is never preconditioned.
+        """
+        Vv = ufl.variable(V_old)
+        inc = ufl.dot(ufl.diff(self.conserved(Vv), Vv), dV)
+        if not self.preconditioning:
+            return inc
+        th = self.low_mach_preconditioning(self.thermo(V_old), V_old, self.mesh_obj.h_min)
+        d = self.dimensions
+        w = ufl.as_vector([1.0] + [th.u[i] for i in range(d)] + [th.H] + list(th.phi))
+        return inc + (th.inv_Ur2 - th.inv_c2) * dV[0] * self.embed(w)
+
+    def low_mach_preconditioning(self, th, V, h, pressure_jump=None):
+        """
+        th with its preconditioning set: 1/U_r^2 (ThermoState.inv_Ur2), the
+        local reference velocity of the Weiss-Smith preconditioner,
+
+            1/U_r^2 = max(1/c^2, 1/max(|u|, eps u_inf, sqrt(|dp'|/rho), cutoffs)^2),
+
+        with smooth maxima (kinks stall Newton). The 1/c^2 floor caps U_r at
+        c, so the preconditioning switches itself off wherever the flow is
+        sonic or faster; for an incompressible fluid (1/c^2 = 0) it is
+        always active. The pressure-jump term (faces only, pressure_jump =
+        p'_+ - p'_-) keeps stagnation points robust; the
+        preconditioning_speeds plug-ins add e.g. the viscous cutoff nu/h.
+        Unchanged (inv_Ur2 None) without preconditioning.
+        """
+        if not self.preconditioning:
+            return th
+        Ur2 = smooth_max(ufl.dot(th.u, th.u), (self.preconditioning_floor * self.u_ref_const) ** 2)
+        if pressure_jump is not None:
+            Ur2 = smooth_max(Ur2, ufl.sqrt(pressure_jump ** 2 + 1e-24) / th.rho)
+        for term in self.preconditioning_speeds:
+            Ur2 = smooth_max(Ur2, term(V, h))
+        th.inv_Ur2 = smooth_max(th.inv_c2, 1.0 / Ur2)
+        return th
+
+    def _flux_states(self, V_a, V_b, h):
+        """ThermoStates of a facet's two states, preconditioned with the
+        facet's pressure jump."""
+        th_a, th_b = self.thermo(V_a), self.thermo(V_b)
+        dp = V_a[0] - V_b[0]
+        return (self.low_mach_preconditioning(th_a, V_a, h, dp),
+                self.low_mach_preconditioning(th_b, V_b, h, dp))
 
     def _freestream_scalars(self):
         if self.freestream_scalars is None:
@@ -404,26 +545,29 @@ class CompressibleEulerModel():
     # ------------------------------------------------------------------
     def add_boundary_condition(self, meshtag, U_b, kind, inviscid_flux="llf"):
         """
-        Weakly impose the boundary state U_b on ds(meshtag) and register it.
+        Weakly impose the boundary state U_b (a state V_b in the unknowns'
+        layout) on ds(meshtag) and register it.
 
         inviscid_flux="llf" is the one-sided Lax-Friedrichs boundary flux
-        against U_b (Euler_utils.boundary_flux); "exact" is the physical flux
-        of U_b itself, for states that already carry the upwinding (the
+        against U_b (Euler_utils.boundary_flux); "numerical" is the interior
+        numerical flux with U_b as the ghost state (the upwinding picks the
+        incoming characteristics from it); "exact" is the physical flux of
+        U_b itself, for states that already carry the upwinding (the
         characteristic far field) or that must have no mass flux (no-slip
         wall). The boundary_terms plug-ins add their terms (e.g. viscous
         fluxes) to the same integral.
         """
-        U, n = self.u_vec, self.mesh_obj.n
+        n, h = self.mesh_obj.n, self.mesh_obj.h_min
+        U_b = self.with_aux(U_b)
         if inviscid_flux == "llf":
-            if self.n_extra:
-                f = extended_boundary_flux(U, U_b, n, self.gamma, self.n_mean)
-            else:
-                f = boundary_flux(U, U_b, n, self.gamma)
+            f = boundary_flux(*self._flux_states(self.u_vec, U_b, h), n)
+        elif inviscid_flux == "numerical":
+            f = self.flux_function(*self._flux_states(self.u_vec, U_b, h), n)
         elif inviscid_flux == "exact":
-            f = extended_normal_flux(U_b, n, self.gamma, self.n_mean)
+            f = self.thermo(U_b).normal_flux(n)
         else:
-            raise ValueError("inviscid_flux must be 'llf' or 'exact'")
-        F = ufl.inner(f, self.v_vec) * self.forms.ds(meshtag)
+            raise ValueError("inviscid_flux must be 'llf', 'numerical' or 'exact'")
+        F = ufl.inner(self.embed(f), self.v_vec) * self.forms.ds(meshtag)
         for term in self.boundary_terms:
             extra = term(U_b, meshtag, kind)
             if extra is not None:
@@ -433,7 +577,7 @@ class CompressibleEulerModel():
 
     def define_slipwall_bc(self, meshtag):
         # define the weak form term for natural enforcement of the slip wall boundary condition
-        u_wall = slip_wall_state(self.mean_flow(self.u_vec), self.mesh_obj.n)
+        u_wall = slip_wall_state(self.mean_flow(self.u_vec), self.mesh_obj.n, self.n_mean)
         self.add_boundary_condition(meshtag, self._boundary_state(u_wall, "slip"), "slip")
 
     def define_wall_bc(self, meshtag):
@@ -459,56 +603,64 @@ class CompressibleEulerModel():
         transverse correction to the incoming invariant: the 'riemann2' far
         field of unsteady runs.
 
+        With low-Mach preconditioning (or a material without Riemann
+        invariants) the far field is instead the free stream as a ghost
+        state through the preconditioned numerical flux. The Riemann
+        invariants are those of the unpreconditioned system: their boundary
+        pressure follows the normal velocity through the acoustic impedance
+        rho c, 1/M times the dynamic pressure scale, which leaves the
+        pressure level of a preconditioned low-Mach solution all but
+        undetermined (it drifts, and PTC stalls, at M = 0.001). The ghost
+        state pins it through the same pressure-jump dissipation dp'/U_r
+        that couples pressure and velocity inside the domain, and the
+        upwinding still takes each facet's character from the (now
+        preconditioned) wave speeds, so no inflow/outflow division is made
+        either; the transported scalars are upwinded with it.
+
         The state depends on alpha through the free-stream velocity, so
         dR/dalpha follows automatically.
         """
-        ff = self.farfield_conditions
+        if self.preconditioning or not hasattr(self.material, "farfield_state"):
+            if transverse is not None:
+                raise NotImplementedError("the transverse far field (riemann2) corrects the "
+                                          "unpreconditioned characteristic far field")
+            self.add_boundary_condition(meshtag, self.freestream_state(), "farfield",
+                                        inviscid_flux="numerical")
+            return
         R_in = None if transverse is None else transverse.R_in
-        U_b, inflow = riemann_farfield_state(self.mean_flow(self.u_vec), self.mesh_obj.n,
-                                             ff['rho'], ff['u'], ff['p'], self.gamma,
-                                             R_in=R_in)
+        U_b, inflow = self.material.farfield_state(self.thermo(self.mean_flow(self.u_vec)),
+                                                   self.mesh_obj.n, self.farfield_conditions['u'],
+                                                   R_in=R_in)
         self.add_boundary_condition(meshtag, self._boundary_state(U_b, "farfield", inflow),
                                     "farfield", inviscid_flux="exact")
         if transverse is not None:
             self.transverse_farfield = transverse
 
     def compute_interior_integral_terms(self):
-        if not self.n_extra and self.face_traces is None and not self.residual_terms:
-            # the plain Euler residual, written exactly as it always was
-            F_vol = ufl.inner(ufl.grad(self.v_vec), flux(self.u_vec, self.gamma)) * self.forms.dx
-
-            F_int = ufl.inner(
-                self.flux_function(self.u_vec('+'), self.u_vec('-'), self.mesh_obj.n('+'), self.gamma),
-                self.v_vec('+') - self.v_vec('-')) * self.forms.dS
-            return -F_vol + F_int
-
         U, v, n = self.u_vec, self.v_vec, self.mesh_obj.n
-        F = -ufl.inner(ufl.grad(v), extended_flux(U, self.gamma, self.n_mean)) * self.forms.dx
+        # the volume term vanishes at p = 0 (grad v = 0); kept for the form's generality
+        F = -ufl.inner(ufl.grad(v), self.embed(self.thermo(U).flux())) * self.forms.dx
         U_p, U_m = self.face_traces() if self.face_traces is not None else (U('+'), U('-'))
-        if self.n_extra:
-            F_num = extended_hll_flux(U_p, U_m, n('+'), self.gamma, self.n_mean)
-        else:
-            F_num = self.flux_function(U_p, U_m, n('+'), self.gamma)
-        F += ufl.inner(F_num, v('+') - v('-')) * self.forms.dS
+        h = self.mesh_obj.h_min
+        F_num = self.flux_function(*self._flux_states(U_p, U_m, 0.5 * (h('+') + h('-'))), n('+'))
+        F += ufl.inner(self.embed(F_num), v('+') - v('-')) * self.forms.dS
         for term in self.residual_terms:
             F += term()
         return F
 
-    def _lambda_max_expr(self, U):
-        """The largest wave speed |u| + c of the state U (mean flow), with rho
-        and p floored as in Euler_utils.signed_wave_speeds."""
-        U = self.mean_flow(U)
-        rho, u_vel, _ = primitives(U)
-        p = pressure(U, self.gamma)
-        rho_safe = ufl.max_value(rho, 1e-8)
-        p_safe = ufl.max_value(p, 1e-8)
-        c = ufl.sqrt(self.gamma * p_safe / rho_safe)
-        return ufl.sqrt(ufl.dot(u_vel, u_vel)) + c
+    def _lambda_max_expr(self, U, h=None):
+        """The largest wave speed |u| + c of the state U, |u'| + c' with
+        low-Mach preconditioning (Euler_utils.spectral_radius); h is the
+        length of the preconditioning's cutoffs (h_min by default)."""
+        h = self.mesh_obj.h_min if h is None else h
+        th = self.low_mach_preconditioning(self.thermo(self.mean_flow(U)), U, h)
+        return spectral_radius(th)
 
     def wall_force_density(self, U, n):
-        """Force per unit wall area on the body: pressure, plus the
+        """Force per unit wall area on the body: the gauge pressure p' (the
+        reference pressure integrates to zero over a closed body), plus the
         wall_traction plug-in's viscous traction when there is one."""
-        f = pressure(self.mean_flow(U), self.gamma) * n
+        f = U[0] * n
         if self.wall_traction is not None:
             f = f + self.wall_traction(U, n)
         return f
@@ -683,10 +835,11 @@ class CompressibleEulerModel():
         """
         Step length for the update x - theta dx: (theta, cap), with the
         step-length cap = min((tau / (||dx|| / max(||x||, 1)))^0.5, 1) and theta
-        <= cap the largest step keeping density and pressure positive in every
-        cell (transported extra variables are not limited). Used by the Newton
-        step limiter and by the reduced-order solve
-        (core/reduced_order_model.py). Collective.
+        <= cap the largest step keeping the material's positivity constraints
+        (absolute pressure and temperature) in every cell, and changing them
+        by at most max_relative_change; transported extra variables are not
+        limited. Used by the Newton step limiter and by the
+        reduced-order solve (core/reduced_order_model.py). Collective.
         """
         dx_norm = dx.norm()
         relative_dx = dx_norm / max(x.norm(), 1.)
@@ -694,9 +847,13 @@ class CompressibleEulerModel():
 
         from dragonfly_sim.utils.solver_utils import compute_positivity_preserving_theta
         theta = compute_positivity_preserving_theta(
-            self.mesh_obj.mesh.comm, x.array, dx.array, gamma=self.gamma, initial_theta=initial_theta,
-            block_size=self.n_state, n_mean=self.n_mean if self.n_extra else None)
+            self.mesh_obj.mesh.comm, x.array, dx.array, self.positivity_constraints(),
+            initial_theta=initial_theta, block_size=self.n_state, max_change=self.max_relative_change)
         return theta, initial_theta
+
+    def positivity_constraints(self):
+        """[(state component, lower bound)] the Newton step limiter holds."""
+        return self.material.positivity_constraints(self.n_mean)
 
     @contextlib.contextmanager
     def steady_residual(self):
@@ -719,21 +876,19 @@ class CompressibleEulerModel():
 
     def state_scale_expressions(self):
         """
-        Typical magnitudes of the state components: the free-stream
-        [rho, rho U (per direction), p/(gamma - 1) + rho U^2/2] of the mean
-        flow, then the extra_scales plug-in's values for the extra variables
-        (numbers or UFL expressions of Constants).
+        Typical magnitudes of the state components: the free-stream dynamic
+        pressure rho U^2, the speed U (per direction) and the temperature
+        of the mean flow -- all 1 in the solver's units -- then the
+        extra_scales plug-in's values for the extra variables (numbers or UFL
+        expressions of Constants).
         """
-        ff = self.farfield_conditions
-        rho, p = ff['rho'], ff['p']
-        speed = ff['M'] * ff['c']
-        scales = ([rho] + [rho * speed] * self.dimensions
-                  + [p / (self.gamma - 1.0) + 0.5 * rho * speed**2])
+        scales = [1.0] * self.n_mean
         if self.n_extra:
             if self.extra_scales is None:
                 raise RuntimeError("{} extra variables but no extra_scales plug-in".format(self.n_extra))
             scales += list(self.extra_scales())
-        return scales
+        # the auxiliary unknowns (the artificial viscosity sigma) are O(1)
+        return scales + [1.0] * self.n_aux
 
     def state_scales(self):
         """state_scale_expressions evaluated to floats, one per state
@@ -812,7 +967,7 @@ class CompressibleEulerModel():
         opts[f"{option_prefix}pc_type"] = "asm"
         opts[f"{option_prefix}pc_asm_overlap"] = "{}".format(self.asm_overlap)
 
-        opts[f"{option_prefix}sub_pc_type"] = "ilu"
+        opts[f"{option_prefix}sub_pc_type"] = self.subdomain_solver
         # opts[f"{option_prefix}sub_pc_factor_levels"] = "{}".format(int((self.poly_order + 1) ** self.dimensions))
         opts[f"{option_prefix}sub_pc_factor_levels"] = "{}".format(self.ilu_levels)
         # ILU(k)'s fill pattern is computed purely from the local
@@ -824,7 +979,8 @@ class CompressibleEulerModel():
         # terminal_output_3Dtest_ILU_fillin=3.txt) and "OOM" (k=
         # dimensions+2) in 3D. Was previously scaffolded but unused
         # ("natural", i.e. no reordering, per that log's ksp_view).
-        opts[f"{option_prefix}sub_pc_factor_mat_ordering_type"] = "rcm"
+        # (nested dissection for exact factorizations, which RCM would fill)
+        opts[f"{option_prefix}sub_pc_factor_mat_ordering_type"] = "rcm" if self.subdomain_solver == "ilu" else "nd"
 
         # the options database is global and the prefix is shared by every KSP of that name:
         # clear a setting an earlier KSP made (diagonal scaling cannot work on a matrix-free operator)
@@ -1053,13 +1209,12 @@ class CompressibleEulerModel():
             while theta_probe * 0.5 >= min_theta:
                 theta_probe *= 0.5
 
+        constraints = self.positivity_constraints()
+        names = ["pressure" if k == 0 else "temperature" if k == self.n_mean - 1
+                 else "x[{}]".format(k) for k, _ in constraints]
         local = locate_positivity_limiting_nodes(
-            x.array, dx.array, theta_probe, gamma=self.gamma,
-            block_size=self.n_state, n_mean=self.n_mean if self.n_extra else None)
-
-        n_density = comm.allreduce(local["n_density"], op=MPI.SUM)
-        n_pressure = comm.allreduce(local["n_pressure"], op=MPI.SUM)
-        n_nonfinite = comm.allreduce(local["n_nonfinite"], op=MPI.SUM)
+            x.array, dx.array, theta_probe, constraints, block_size=self.n_state, names=names)
+        counts = {name: comm.allreduce(c, op=MPI.SUM) for name, c in local["counts"].items()}
 
         # Same allgather-and-pick idiom as _report_max_residual_location. The
         # payload is a handful of floats, mpi4py returns it in rank order, and
@@ -1073,9 +1228,9 @@ class CompressibleEulerModel():
 
         PETSc.Sys.Print(
             "[theta-limit] theta {:.6e} (step-length cap {:.6e}); {} node(s) block "
-            "the step at theta = {:.6e} -- {} density, {} pressure, {} non-finite".format(
-                theta, initial_theta, n_density + n_pressure + n_nonfinite,
-                theta_probe, n_density, n_pressure, n_nonfinite))
+            "the step at theta = {:.6e} -- {}".format(
+                theta, initial_theta, sum(counts.values()), theta_probe,
+                ", ".join("{} {}".format(c, name) for name, c in counts.items())))
 
         if not gathered:
             # theta was cut, yet nothing violates at twice the accepted value.
@@ -1091,13 +1246,8 @@ class CompressibleEulerModel():
             "[theta-limit]   worst: rank {}, local block {}, coord {}, binding "
             "constraint: {}".format(rank, info["block"], coord, info["constraint"]))
         PETSc.Sys.Print(
-            "[theta-limit]   state rho = {:.6e}, p = {:.6e}  ->  trial rho = {:.6e}, "
-            "p = {:.6e}".format(
-                info["rho"], info["p"], info["rho_trial"], info["p_trial"]))
-        PETSc.Sys.Print(
-            "[theta-limit]   update d_rho = {:.6e}, |d_rhou| = {:.6e}, "
-            "d_rhoE = {:.6e}".format(
-                info["d_rho"], info["d_rhou_norm"], info["d_rhoE"]))
+            "[theta-limit]   value {:.6e} -> trial {:.6e} (update {:.6e})".format(
+                info["value"], info["trial"], info["update"]))
 
     def incoming_state_converged(self):
         """

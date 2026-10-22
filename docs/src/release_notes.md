@@ -1,6 +1,21 @@
 # Release notes
 
 ## 0.2.0 (unreleased)
+- Primitive unknowns and fluid materials: every flow model now solves for $(p', \mathbf{u}, T, \phi)$ with the
+  conservative residual $\nabla\cdot\mathbf{F}(U(V))$, and the fluid is a material (`core/materials.py`:
+  `IdealGas`, the default, and `ConstantDensity` for water), the only fluid-specific code. Quantities are scaled
+  with the free stream ($\rho_\infty = |\mathbf{u}_\infty| = T_\infty = 1$, pressure in $\rho_\infty u_\infty^2$)
+  and the energy row is weighted by $1/(c_p T_\infty)$, so the residual is the same discrete scheme as before
+  (checked against the stored reference to 12 digits) with rows of one size at every Mach number. Optional local
+  low-Mach (Weiss-Smith) preconditioning (`preconditioning=True`, with the free stream as a ghost far field) and
+  the Barter-Darmofal artificial viscosity in its p = 0 form (`shock_capturing=True`). Breaking changes: the
+  solution fields are `pressure` ($p'$), `velocity`, `temperature`, the turbulence variables (`nu_tilde`),
+  `density` and `mach`; `farfield_conditions` is in the solver's units; `Euler_utils.pressure`,
+  `energy_density`, `NS_utils.extended_*`, `primitive_gradients`, `sutherland_viscosity` and
+  `utils/farfield_utils.py` are gone (the Riemann far field is `IdealGas.farfield_state`); the turbulence-closure
+  methods take `(V, th, ...)`; `compute_positivity_preserving_theta` takes linear constraints; checkpoints carry
+  their state layout and older (conservative) ones are refused; physical time steps are in chords per free-stream
+  speed; the far-field Mach number must be positive.
 - Output-sensitivity weights on the `local_weighted` POD snapshot distance: `utils/dv_sensitivity.py` reads the
   total derivatives of the objective and constraints from the optimizer (`attach_total_derivative_probe`) and
   `ReducedOrderModel(distance_weighting=...)` weights the distance with them. Unweighted unless a probe supplies

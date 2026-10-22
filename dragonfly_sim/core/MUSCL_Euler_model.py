@@ -35,8 +35,11 @@ class MUSCLEulerModel(CompressibleEulerModel):
     """
 
     def __init__(self, mesh, poly_order=0, gamma=1.4, limiter=None, limiter_eps=1e-2,
-                 jacobian_mode="compact_pc", use_ptc=True, cfl0=5.0):
-        super().__init__(mesh, poly_order=poly_order, gamma=gamma, flux_function=hll_flux)
+                 jacobian_mode="compact_pc", use_ptc=True, cfl0=5.0, material=None,
+                 preconditioning=None, preconditioning_floor=1.0, shock_capturing=None):
+        super().__init__(mesh, poly_order=poly_order, gamma=gamma, flux_function=hll_flux,
+                         material=material, preconditioning=preconditioning,
+                         preconditioning_floor=preconditioning_floor, shock_capturing=shock_capturing)
         self.limiter = limiter
         self.limiter_eps = limiter_eps
         self.jacobian_mode = jacobian_mode
@@ -55,15 +58,7 @@ class MUSCLEulerModel(CompressibleEulerModel):
         if self.reconstruction is None:
             GreenGaussReconstruction(self, muscl=True, limiter=self.limiter,
                                      limiter_eps=self.limiter_eps,
-                                     limiter_scales=self._limiter_scales).install()
-
-    def _limiter_scales(self):
-        """Free-stream magnitude of each state component (van Albada limiter)."""
-        ff = self.farfield_conditions
-        rho, p = ff['rho'], ff['p']
-        speed = ff['M'] * ff['c']
-        return ([rho] + [rho * speed] * self.dimensions
-                + [p / (self.gamma - 1.0) + 0.5 * rho * speed**2])
+                                     limiter_scales=self.state_scale_expressions).install()
 
     def set_up_solver(self):
         was_set_up = self.solver_is_set_up

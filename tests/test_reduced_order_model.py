@@ -82,9 +82,8 @@ def global_array(comm, local):
 def test_state_scales(in_tmp_dir):
     wt = make_windtunnel("euler")
     m = wt.sim_model
-    inlet = m.farfield_conditions
-    U = inlet['M'] * inlet['c']
-    assert m.state_scales() == pytest.approx([1.0, U, U, 1.0 / 0.4 + 0.5 * U**2], rel=1e-14)
+    # (p', u, v, T) scaled with the free stream: dynamic pressure, speed and temperature are 1
+    assert m.state_scales() == pytest.approx([1.0, 1.0, 1.0, 1.0], rel=1e-14)
 
 
 @pytest.mark.unit_test
@@ -94,7 +93,7 @@ def test_rans_state_scales_match_the_limiter_scales(in_tmp_dir):
     tm = m.turbulence_model
     scales = m.state_scales()
     assert len(scales) == m.n_state == 5
-    expected_extra = 1e3 * tm.chi_inf * float(m.mu_inf_const.value)
+    expected_extra = 1e3 * tm.chi_inf * float(m.mu_inf_const.value) / m.farfield_conditions['rho']
     assert scales[4] == pytest.approx(expected_extra, rel=1e-12)
     # the MUSCL limiter reads the same expressions
     lim = m._limiter_scales()
@@ -111,7 +110,7 @@ def test_steady_residual_switches_the_pseudo_time_term_off(in_tmp_dir):
     term.set_cfl(3.0)
     U_old = term.U_old
     U_old.x.array[:] = m.u_vec.x.array
-    U_old.x.array[0::m.n_state] *= 1.01        # make the pseudo term nonzero
+    U_old.x.array[m.n_mean - 1::m.n_state] *= 1.01        # make the pseudo term nonzero (T)
     U_old.x.scatter_forward()
 
     b_ptc = m.problem._b.duplicate()
@@ -140,8 +139,9 @@ def test_positivity_step_length_caps_and_limits(in_tmp_dir):
     dx.set(0.0)
     theta, cap = m.positivity_step_length(x, dx)
     assert cap == 0.0
-    # a step that empties the density everywhere at theta = 1
-    dx.array[0::m.n_state] = x.array[0::m.n_state]
+    # a step that takes the temperature to zero everywhere at theta = 1
+    T = m.n_mean - 1
+    dx.array[T::m.n_state] = x.array[T::m.n_state]
     theta, cap = m.positivity_step_length(x, dx)
     assert 0.0 < theta < 1.0 and theta <= cap
     dx.destroy()
@@ -284,12 +284,15 @@ def test_lspg_recovers_a_solution_in_the_basis(in_tmp_dir, kind):
 # DG_windtunnel_model
 # ----------------------------------------------------------------------
 # alpha close to the first snapshot's (2 degrees). The
-# ROM interpolating between two snapshots reaches eta ~3e-7 (Euler) and is
-# rejected; with three it reaches 1e-10 (Euler) / 5e-9 (RANS at Re 200)
+# ROM interpolating between two snapshots reaches eta ~9e-7 (Euler) / 1.3e-6
+# (RANS at Re 200) and is rejected; with three it reaches 4e-10 (Euler) /
+# 2e-7 (RANS). (eta = ||r|| / ||u|| in the primitive unknowns scaled with the
+# free stream; with the former conservative ones the RANS ROM reached 3e-10
+# at the same force-coefficient accuracy.)
 ALPHAS = (2.0, 2.6, 2.3, 2.1, 2.45)
 
 
-@pytest.mark.parametrize("kind, eta_threshold, run_fom", [("euler", 1e-9, False), ("rans", 1e-7, True)])
+@pytest.mark.parametrize("kind, eta_threshold, run_fom", [("euler", 1e-9, False), ("rans", 5e-7, True)])
 @pytest.mark.unit_test
 def test_windtunnel_accepts_the_rom_between_snapshots(in_tmp_dir, kind, eta_threshold, run_fom):
     """Two FOM snapshots, a rejected ROM (third snapshot), then two accepted

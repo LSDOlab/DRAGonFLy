@@ -4,11 +4,14 @@ transcription of the published formulas (Allmaras, Johnson & Spalart 2012;
 NASA TMR), and the closure interface's modularity -- a different closure
 with two transported scalars plugs into CompressibleRANSModel unchanged.
 """
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import ufl
 
 from dragonfly_sim.core.turbulence_models import TurbulenceModel, Laminar, SpalartAllmarasNeg
+from dragonfly_sim.utils.NS_utils import gradient_rows
 
 from cases import rans_square_model
 from test_fluxes_and_states import evaluate, const
@@ -56,11 +59,14 @@ def test_sa_neg_production_destruction(nu_t, nu, Omega, d, ft2):
 @pytest.mark.verification
 def test_sa_neg_eddy_viscosity_vanishes_for_negative_nu_tilde():
     sa = SpalartAllmarasNeg()
-    U = const([1.0, 0.5, 0.0, 2.5, -1e-5])
-    assert evaluate(sa.eddy_viscosity(U, const(1e-5), 4))[0] == 0.0
-    U = const([1.2, 0.5, 0.0, 2.5, 3.6e-5])
+    V = const([0.0, 0.5, 0.0, 1.0, -1e-5])
+    th = SimpleNamespace(rho=const(1.0))
+    assert evaluate(sa.eddy_viscosity(V, th, const(1e-5), 4))[0] == 0.0
+    # rho nu~ = 1.2 * 3e-5 = 3.6e-5
+    V = const([0.0, 0.5, 0.0, 1.0, 3e-5])
+    th = SimpleNamespace(rho=const(1.2))
     chi = 3.6e-5 / 1e-5
-    np.testing.assert_allclose(evaluate(sa.eddy_viscosity(U, const(1e-5), 4))[0],
+    np.testing.assert_allclose(evaluate(sa.eddy_viscosity(V, th, const(1e-5), 4))[0],
                                3.6e-5 * chi**3 / (chi**3 + 7.1**3), rtol=1e-13)
 
 
@@ -68,23 +74,23 @@ class TwoPassiveScalars(TurbulenceModel):
     """A toy closure: two transported scalars, a constant eddy viscosity and a
     linear relaxation source -- only there to exercise the interface."""
     n_vars = 2
-    names = ("rho_a", "rho_b")
+    names = ("a", "b")
     needs_wall_distance = False
 
-    def eddy_viscosity(self, U, mu, n_mean):
+    def eddy_viscosity(self, V, th, mu, n_mean):
         return 2.0 * mu
 
-    def diffusive_fluxes(self, U, mu, n_mean):
-        return lambda grad_phi, grad_rho: [mu * grad_phi[0], 0.5 * mu * grad_phi[1]]
+    def diffusive_fluxes(self, V, th, mu, n_mean):
+        return lambda G: [mu * gradient_rows(G, n_mean), 0.5 * mu * gradient_rows(G, n_mean + 1)]
 
-    def sources(self, U, grad_U, mu, d, n_mean, gamma):
-        return [-(U[n_mean] - 0.2 * U[0]), -(U[n_mean + 1] - 0.4 * U[0])]
+    def sources(self, V, th, G, mu, d, n_mean):
+        return [-th.rho * (V[n_mean] - 0.2), -th.rho * (V[n_mean + 1] - 0.4)]
 
     def freestream_values(self, fs):
-        return [0.2 * fs["rho"], 0.4 * fs["rho"]]
+        return [0.2, 0.4]
 
-    def wall_values(self, U, n_mean):
-        return [0.2 * U[0], 0.4 * U[0]]
+    def wall_values(self, V, n_mean):
+        return [0.2, 0.4]
 
 
 @pytest.mark.parametrize("closure", [Laminar(), TwoPassiveScalars()], ids=["laminar", "two-scalar"])

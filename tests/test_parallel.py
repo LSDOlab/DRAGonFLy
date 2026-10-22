@@ -22,7 +22,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 LAUNCHES = {
     "regression_and_models": ["test_euler_regression.py", "test_turbulence_models.py", "test_reconstruction.py",
                               "test_derivatives.py", "test_time_integration.py", "test_windtunnel_forward.py",
-                              "test_pod.py", "test_reduced_order_model.py"],
+                              "test_pod.py", "test_reduced_order_model.py", "test_materials.py",
+                              "test_shock_capturing.py"],
     "caches_and_moments": ["test_mesh_deformation_cache.py", "test_incoming_state_converged.py",
                            "test_meshwarping_cache.py", "test_moments.py", "test_adjoint_reuse.py",
                            "test_boundary_tags.py"],

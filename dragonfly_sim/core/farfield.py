@@ -14,7 +14,6 @@ import basix
 import dolfinx
 import dolfinx.fem.petsc
 
-from dragonfly_sim.utils.Euler_utils import pressure
 
 
 class TransverseFarfield:
@@ -86,9 +85,12 @@ class TransverseFarfield:
     def __init__(self, model, farfield_tag, beta=0.5, K=None, relax_length=50.0, relax_sigma=0.25):
         if model.dimensions != 2:
             raise NotImplementedError("the transverse far field (riemann2) is 2D only")
+        if not hasattr(model.material, "incoming_invariant"):
+            raise NotImplementedError("the transverse far field (riemann2) needs a material with "
+                                      "Riemann invariants (an IdealGas)")
         mesh_obj = model.mesh_obj
         self.mesh = mesh_obj.mesh
-        self.gamma = gamma = model.gamma
+        self.gamma = model.material.gamma
         self.n = mesh_obj.n
         self.farfield_tag = farfield_tag
         ff_bc = model.farfield_conditions
@@ -98,8 +100,7 @@ class TransverseFarfield:
         self.delta_next = dolfinx.fem.Function(V_s, name="ff_delta_next")
         self.functions = [self.delta_n, self.delta_nm1]
         if K is None:
-            K = relax_sigma * (gamma * ff_bc['p'] / ff_bc['rho']) ** 0.5 \
-                * (1.0 - ff_bc['M'] ** 2) / relax_length
+            K = relax_sigma * ff_bc['c'] * (1.0 - ff_bc['M'] ** 2) / relax_length
         self.beta, self.K = float(beta), float(K)
         # this boundary equation's own copies of the step size and BDF
         # coefficients, set in prepare()
@@ -121,28 +122,25 @@ class TransverseFarfield:
             self.G_nm1 = dolfinx.fem.Function(V_G, name="ff_grad_nm1")
             self.functions += [self.G_n, self.G_nm1]
 
-        c_inf = (gamma * ff_bc['p'] / ff_bc['rho']) ** 0.5
-        self.R_in = ufl.dot(ff_bc['u'], self.n) - 2.0 * c_inf / (gamma - 1.0) \
-            + self.delta_next
+        self.R_in = model.material.incoming_invariant(self.n, ff_bc['u']) + self.delta_next
         self._exprs = None
         self._setup_projection(mesh_obj, V_s)
 
     def transverse_term(self, U, G=None):
-        """T = u_t dR-/dtau - c du_t/dtau of state U on the far field (UFL),
-        with grad U from the field G (n_state x 2) when given, else ufl.grad."""
+        """T = u_t dR-/dtau - c du_t/dtau of state U = (p', u, T, ...) on the
+        far field (UFL), with grad U from the field G (n_state x 2) when
+        given, else ufl.grad."""
         gamma, n = self.gamma, self.n
-        n_state = U.ufl_shape[0]
-        Um = ufl.as_vector([U[i] for i in range(4)]) if n_state > 4 else U  # mean flow
-        rho = Um[0]
-        vel = ufl.as_vector([Um[1] / rho, Um[2] / rho])
-        c = ufl.sqrt(gamma * pressure(Um, gamma) / rho)
+        R = self.model.material.R
+        vel = ufl.as_vector([U[1], U[2]])
+        c = ufl.sqrt(gamma * R * U[3])
         tau = ufl.as_vector([-n[1], n[0]])
         if G is None:
             grad_vel, grad_c = ufl.grad(vel), ufl.grad(c)
         else:
-            from dragonfly_sim.utils.NS_utils import primitive_gradients
-            grad_vel, grad_T, _, _ = primitive_gradients(U, G, gamma, 4)   # grad u, grad(p/rho)
-            grad_c = gamma / (2.0 * c) * grad_T
+            from dragonfly_sim.utils.NS_utils import gradient_rows, velocity_gradient
+            grad_vel = velocity_gradient(G, 4)
+            grad_c = gamma * R / (2.0 * c) * gradient_rows(G, 3)
         dvel_dtau = ufl.dot(grad_vel, tau)   # grad(vel)[i, j] = d u_i / d x_j
         # R-_int = u.n - 2c/(g-1); n is constant along the straight far field
         dR_dtau = ufl.dot(dvel_dtau, n) - 2.0 / (gamma - 1.0) * ufl.dot(grad_c, tau)

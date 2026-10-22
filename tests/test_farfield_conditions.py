@@ -28,11 +28,17 @@ def test_flat_dictionary_defines_the_free_stream():
     model = bare_model()
     model.define_farfield_conditions(FREESTREAM)
     ff = model.farfield_conditions
-    c = (model.gamma * FREESTREAM['p'] / FREESTREAM['rho']) ** 0.5
-    assert ff['c'] == pytest.approx(c)
-    assert (ff['rho'], ff['p'], ff['M'], ff['alpha']) == (1.0, 1.0, 0.5, FREESTREAM['alpha'])
+    # the solver's units: free-stream density and speed 1, so c = 1/M and
+    # p_inf = 1/(gamma M^2); the dict's own units are kept for dimensional output
+    M, g = FREESTREAM['M'], model.gamma
+    assert ff['c'] == pytest.approx(1.0 / M)
+    assert ff['p'] == pytest.approx(1.0 / (g * M**2))
+    assert (ff['rho'], ff['M'], ff['alpha']) == (1.0, 0.5, FREESTREAM['alpha'])
     np.testing.assert_allclose(ff['flow_dir'].value, [np.cos(ff['alpha']), np.sin(ff['alpha'])])
-    assert ff['u_ref'].value == pytest.approx(0.5 * c)
+    assert ff['u_ref'].value == pytest.approx(1.0)
+    c = (g * FREESTREAM['p'] / FREESTREAM['rho']) ** 0.5
+    assert model.material.dimensional == pytest.approx(
+        {'rho': 1.0, 'p': 1.0, 'c': c, 'speed': M * c})
 
 
 @pytest.mark.parametrize("bad", [

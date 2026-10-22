@@ -4,12 +4,18 @@ Partition-independent checkpoints for time-dependent runs.
 A checkpoint is one .npz written on rank 0. Every DG field is stored per cell,
 keyed by the cell's index in the INPUT mesh (topology.original_cell_index)
 and the cell-local dof order, so a run may be restarted on any number of
-ranks. The dof coordinates are stored as well and checked on load.
+ranks. The dof coordinates are stored as well and checked on load, and the
+state layout (STATE_LAYOUT, the unknowns' variable set) is stored in the meta
+and checked too: a checkpoint of the former conservative unknowns would load
+silently into the primitive ones otherwise.
 """
 import json
 
 import numpy as np
 from mpi4py import MPI
+
+# the unknowns of the flow models: (p', u, T, phi), see core/materials.py
+STATE_LAYOUT = "primitive"
 
 
 def _owned_cell_dofs(V):
@@ -43,7 +49,7 @@ def save_checkpoint(path, functions, meta):
         order = np.argsort(orig_all)
         assert np.array_equal(orig_all[order], np.arange(orig_all.size)), \
             "owned cells do not tile the input mesh exactly once"
-        np.savez(path, meta=json.dumps(meta),
+        np.savez(path, meta=json.dumps(dict(meta, state_layout=STATE_LAYOUT)),
                  **{k: np.concatenate([g[k] for g in gathered])[order]
                     for k in local if k != "orig"})
     comm.Barrier()
@@ -58,6 +64,11 @@ def load_checkpoint(path, functions, coord_tol=1e-10, optional=False):
     """
     comm = functions[0].function_space.mesh.comm
     data = np.load(path)
+    meta = json.loads(str(data["meta"]))
+    layout = meta.get("state_layout", "conservative")
+    if layout != STATE_LAYOUT:
+        raise ValueError("{} holds {} unknowns; the flow models now solve for the {} ones "
+                         "(p', u, T, ...)".format(path, layout, STATE_LAYOUT))
     for f in functions:
         if f.name not in data.files:
             if optional:
@@ -74,4 +85,4 @@ def load_checkpoint(path, functions, coord_tol=1e-10, optional=False):
             raise ValueError("checkpoint dof coordinates of {} are off by {:.2e}".format(f.name, err))
         f.x.array.reshape(-1, V.dofmap.index_map_bs)[dofs] = data[f.name][orig]
         f.x.scatter_forward()
-    return json.loads(str(data["meta"]))
+    return meta
