@@ -312,10 +312,13 @@ class LSPGAdjoint:
         The design and this rank's owned entries of the accepted solution.
     """
 
-    def __init__(self, V, S, comm, parameter_vector, solution):
+    def __init__(self, V, S, comm, parameter_vector, solution, accepted=True):
         self.V = V
         self.S = S
         self.comm = comm
+        # whether the solve it belongs to was accepted: a rejected solve's adjoint is not used
+        # by the optimizer, only compared with the full-order one (compute_all_adjoint_errors)
+        self.accepted = accepted
         self.parameter_vector = np.array(parameter_vector, dtype=float).ravel()
         self.solution = np.array(solution, dtype=float)
         self._Q = None
@@ -333,6 +336,12 @@ class LSPGAdjoint:
         local = bool(np.array_equal(pv, self.parameter_vector)
                      and np.array_equal(np.asarray(u_local, dtype=float), self.solution))
         return self.comm.allreduce(local, op=MPI.LAND)
+
+    def matches_design(self, parameter_vector):
+        """Whether this adjoint's basis was built for design `parameter_vector`, whatever the
+        state: the reduced adjoint is defined at any state, which a rejected solve's is
+        evaluated at (the full-order solution)."""
+        return bool(np.array_equal(np.asarray(parameter_vector, dtype=float).ravel(), self.parameter_vector))
 
     def _factor(self, model):
         """Q, R of S A V, A the steady Jacobian at the model's current u_vec."""
@@ -466,8 +475,9 @@ class ReducedOrderModel:
                          also run the FOM when the ROM is accepted (benchmarking;
                          the accepted output stays the ROM's)
 
-    After an accepted solve, `adjoint` is its LSPGAdjoint (None otherwise),
-    valid until the next solve.
+    After a solve that built a basis, `adjoint` is its LSPGAdjoint (None before the first),
+    valid until the next solve; `adjoint.accepted` says whether the solve was accepted, and only
+    an accepted solve's adjoint is used for the derivative.
     """
 
     def __init__(self, rb_size=20, basis_mode='global', max_rank=None, qr_rank_tol=1e-10,
@@ -748,12 +758,13 @@ class ReducedOrderModel:
                            walltime=perf_counter() - t0)
         PETSc.Sys.Print("ROM relative residual norm eta: {} (||r||: {}); {} iterations, wall time {}".format(
             eta, residual_norm, iterations, result.walltime))
-        if result.accepted:
-            # the basis stays valid until the next solve rebuilds it, which
-            # discards this adjoint first
-            self.adjoint = LSPGAdjoint(self.pod.basis, S, comm, parameter_vector, result.solution)
-        elif S is not None:
-            S.destroy()
+        # Kept for every solve that built a basis, accepted or not: a rejected solve's is not used
+        # for the derivative, but can be evaluated at the full-order solution and compared with
+        # the full-order adjoint. The basis stays valid until the next solve rebuilds it, which
+        # discards this adjoint first (the windtunnel model also keeps it across the derivative
+        # re-run of a rejected design, which skips the ROM).
+        self.adjoint = LSPGAdjoint(self.pod.basis, S, comm, parameter_vector, result.solution,
+                                   accepted=result.accepted)
         return result
 
     def destroy(self):

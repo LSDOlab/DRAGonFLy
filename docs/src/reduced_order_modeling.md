@@ -214,6 +214,27 @@ from its own converged solution, so it takes no Newton steps, and the derivative
 then that solution is a snapshot, and the ROM would reproduce it and be accepted. A design the ROM solved keeps
 the ROM and its reduced adjoint.
 
+### Adjoint errors
+
+The reduced adjoint is kept (`ReducedOrderModel.adjoint`, with `adjoint.accepted`) for every ROM solve that
+built a basis, accepted or not. Only an accepted solve's adjoint is used for the derivative. With
+`DG_windtunnel_model(compute_all_adjoint_errors=True)` the error of the reduced adjoint against the full-order
+one is also recorded, for every output row of the derivative, in `data_store.adjoint_errors`. The adjoint that
+goes back to the optimizer is the same with and without the flag.
+
+- For an accepted solve the reduced adjoint is the optimizer's, and a full-order adjoint is solved at the same
+  state and right-hand side as the reference.
+- For a rejected solve the full-order adjoint is the optimizer's, and the reduced adjoint of the rejected solve
+  is evaluated at that full-order state: it needs the Jacobian there and the basis and weights of the rejected
+  solve. The basis predates the design's own snapshot, which the full-order solve adds afterwards, so the error
+  is that of a basis that has not seen the design. The adjoint of the rejected solve survives the re-run of the
+  design that CSDL does before the derivative.
+
+Both are therefore errors of the adjoint approximation alone: state and right-hand side are the same for the two
+adjoints. The extra solve costs about one adjoint per output row, so the flag is a diagnostic. With
+`profile_phases=True` the phases of these reference solves are recorded as `adjoint_fom_reference` and
+`adjoint_rom_reference`, apart from the `adjoint_fom` and `adjoint_rom` records of the adjoint the optimizer used.
+
 ## What to expect
 
 The ROM pays off when the solutions over the parameter range lie close to a low-dimensional linear subspace

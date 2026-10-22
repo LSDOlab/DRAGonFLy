@@ -169,7 +169,13 @@ if __name__ == '__main__':
                                           model_class=CompressibleRANSModel,
                                           model_kwargs={'Re': Re},
                                           reduced_order_model=rom,
-                                          compute_all_adjoint_errors=True)
+                                          # diagnostics, stored in the DataStore: the error of the ROM
+                                          # adjoint against the full-order one for every derivative (also
+                                          # where the ROM is rejected, evaluated at the full-order state;
+                                          # the optimizer's adjoint is unchanged), and the phase breakdown
+                                          # (assembly, linear solves, ROM) of every solve
+                                          compute_all_adjoint_errors=True,
+                                          profile_phases=True)
     # Pseudo-transient continuation from the free stream needs many more steps
     # than a plain Newton solve (~60 for a 2D airfoil at M 0.7; more for a
     # transonic wing).
@@ -225,6 +231,9 @@ if __name__ == '__main__':
 
     # D includes the wall friction (D_friction is its viscous part)
     csdl_coeff_model = DG_postprocessor(csdl_flow_model.mesh, csdl_flow_model.sim_model, csdl_flow_model.WALL_TAG, moments=moments, p_inf_dim=101325.)
+    # Record the outputs of the optimization (D, L and both moments) for every FOM and ROM solve in
+    # the DataStore: the moments are only known here, after set_up_sim has fitted the baseline
+    csdl_flow_model.use_postprocessor(csdl_coeff_model)
 
     # The moments of the undeformed wing at the initial flow conditions, from a forward solve on
     # the undeformed mesh: the limits of the moment constraints below (upper for root bending,

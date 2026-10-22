@@ -182,6 +182,7 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         # (eval_idx, number of adjoint solves so far at it): the output row of
         # the derivative evaluation that CSDL is on
         self._adjoint_row = (None, 0)
+        self._current_adjoint_row = 0
         # (parameter vector, converged) of the last evaluation if the FOM
         # solved it, else None: a re-evaluation of that design skips the ROM
         # (see _solve)
@@ -476,6 +477,19 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         Also the constructor's profile_phases=True. Collective."""
         return self.sim_model.enable_profiling(enabled=enabled, barriers=barriers, reset=reset)
 
+    def use_postprocessor(self, postprocessor):
+        """
+        Compute the outputs recorded in data_store (FOM_outputs, ROM_outputs, the
+        *_force_coefficients and their errors) and printed after every solve with
+        `postprocessor`, typically the DG_postprocessor whose outputs are the
+        objective and constraints, instead of the one set_up_sim builds from the
+        constructor's moments. Its moments are then the recorded ones. It must be
+        built on this model's mesh and flow model. Call after set_up_sim.
+        """
+        if postprocessor.sim_model is not self.sim_model or postprocessor.mesh_obj is not self.mesh:
+            raise ValueError("the postprocessor must be built on this windtunnel model's mesh and sim_model")
+        self.postprocessor = postprocessor
+
     def _record_phases(self, kind, eval_idx, before):
         # the phase times spent since the snapshot `before` (None: profiling off); collective
         if before is None:
@@ -587,16 +601,20 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         converged), so the design keeps the FOM solution and the full-order
         adjoint. CSDL re-runs the model before every derivative evaluation,
         and by then the ROM would reproduce that solution, now a snapshot, and
-        accept it.
+        accept it. The adjoint of the rejected ROM solve is kept through that
+        re-evaluation (its basis predates the design's snapshot), so that
+        apply_inverse_jacobian can compare it with the full-order adjoint when
+        compute_all_adjoint_errors is on.
         """
         # the forward solve needs the memory of the last design's adjoint operators
         self._release_adjoint_cache()
         rom = self.reduced_order_model
         if rom is None:
             return self._run_fom_solve()
-        rom.discard_adjoint()
-
         repeat = self._fom_design is not None and np.array_equal(parameter_vector, self._fom_design[0])
+        if not (repeat and rom.adjoint is not None and rom.adjoint.matches_design(parameter_vector)):
+            rom.discard_adjoint()
+        # else: the adjoint of the ROM solve that was rejected for this design (see below)
         rom_result = rom_forces = None
         if repeat:
             PETSc.Sys.Print("Re-evaluating the design the FOM solved last: skipping the ROM")
@@ -666,7 +684,11 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         """Every output of the postprocessor for a flow state: ({name: value},
         (c_d, c_l, c_m_1, ...)). The names are DG_postprocessor.evaluate's (L, D,
         c_l, c_d, M_<name>, c_m_<name>); the tuple is the layout of the
-        *_force_coefficients records, one moment per moment spec, in order."""
+        *_force_coefficients records, one moment per moment spec, in order.
+        Evaluated like DG_postprocessor.compute: at the current angle of attack
+        (the lift direction) and reference area and chord of the current mesh."""
+        self.postprocessor.set_angle_of_attack(self.sim_model.farfield_conditions['alpha'])
+        self.postprocessor.refresh_geometry_dependent_reference_quantities()
         L, c_l = self.postprocessor.compute_cl(solution)
         D, c_d = self.postprocessor.compute_cd(solution)
         outputs = {"L": L, "D": D, "c_l": c_l, "c_d": c_d}
@@ -775,21 +797,31 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
             self.sim_model.set_u_vec(u_vec)
 
             rom = self.reduced_order_model
-            if (rom is not None and rom.adjoint is not None
-                    and rom.adjoint.matches(self._parameter_vector(shape_parameters, alpha), u_vec)):
+            adjoint = None if rom is None else rom.adjoint
+            parameter_vector = self._parameter_vector(shape_parameters, alpha)
+            if adjoint is not None and adjoint.accepted and adjoint.matches(parameter_vector, u_vec):
                 # The accepted solution is the ROM's: the adjoint of its
                 # projected (LSPG) equations, lifted to the full state, which
                 # compute_jacvec_product then uses like the full-order one
-                d_residuals['u_vec'] = rom.adjoint.solve(self.sim_model, d_outputs['u_vec'])
+                rom_start = perf_counter()
+                with _PROF.phase("rom:adjoint"):
+                    d_residuals['u_vec'] = adjoint.solve(self.sim_model, d_outputs['u_vec'])
+                rom_walltime = perf_counter() - rom_start
                 self._log_adjoint("rom", pre_apply_inverse_jacobian_time)
                 if self.compute_all_adjoint_errors:
                     # after the ROM adjoint's own timing; d_residuals is not touched
                     self._log_adjoint_error(input_vals, u_vec, alpha, mesh_node_motions,
-                                            d_outputs, d_residuals['u_vec'])
+                                            d_outputs, d_residuals['u_vec'], rom_walltime)
                 return
 
+            # the full-order adjoint is the optimizer's, as without a ROM
             self._fom_adjoint(input_vals, u_vec, alpha, mesh_node_motions, d_outputs, d_residuals,
                               pre_apply_inverse_jacobian_time)
+            if (self.compute_all_adjoint_errors and adjoint is not None and not adjoint.accepted
+                    and adjoint.matches_design(parameter_vector)):
+                # a rejected ROM: its adjoint, evaluated at this (the full-order) state, against
+                # the full-order adjoint just computed; d_residuals is not touched
+                self._log_rejected_rom_adjoint_error(adjoint, d_outputs, d_residuals['u_vec'])
         else:
             raise ValueError("Reverse mode required")
 
@@ -808,7 +840,8 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
                 self._log_adjoint("fom", start_time)
             return
 
-        self._drdu_mat = self.sim_model.assemble_dRdu_mat()
+        with _PROF.phase("assemble:adjoint_jacobian"):
+            self._drdu_mat = self.sim_model.assemble_dRdu_mat()
         if not hasattr(self, '_d_output_petsc'):
             self._d_output_petsc = self._drdu_mat.createVecLeft()
             self._d_residual_petsc = self._drdu_mat.createVecLeft()
@@ -844,7 +877,8 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         set_petsc_vec_array(self._d_output_petsc, d_outputs['u_vec'])
 
         # solve the transposed linear system and output the solution
-        self._adj_solver.solveTranspose(self._d_output_petsc, self._d_residual_petsc)
+        with _PROF.phase("solve:adjoint"):
+            self._adj_solver.solveTranspose(self._d_output_petsc, self._d_residual_petsc)
 
         rnorm = self._adj_solver.getResidualNorm()
         PETSc.Sys.Print("adj_ solve: {} iterations, residual norm {} [{}]".format(
@@ -871,12 +905,13 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         if log:
             self._log_adjoint("fom", start_time)
 
-    def _log_adjoint_error(self, input_vals, u_vec, alpha, mesh_node_motions, d_outputs, psi_rom):
-        """Record the error of the ROM adjoint psi_rom against the full-order adjoint at the
-        same state, design and right-hand side: (eval_idx, output row, absolute 2-norm error,
-        relative error, ||psi_fom||) in data_store.adjoint_errors. The row is the order of the
-        adjoint solves within the evaluation, i.e. of CSDL's derivative rows. Collective."""
+    def _log_adjoint_error(self, input_vals, u_vec, alpha, mesh_node_motions, d_outputs, psi_rom,
+                           rom_walltime):
+        """The accepted ROM's adjoint psi_rom against the full-order adjoint at the same state,
+        design and right-hand side (the reference solve is not part of data_store.adjoint_solves;
+        its phases are recorded as 'adjoint_fom_reference'). Collective."""
         scratch = {}
+        phases_before = self._phase_snapshot()
         try:
             self._fom_adjoint(input_vals, u_vec, alpha, mesh_node_motions, d_outputs, scratch,
                               perf_counter(), log=False)
@@ -884,28 +919,55 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
             # a diagnostic must not stop the optimization
             PETSc.Sys.Print("adjoint error: the full-order reference adjoint failed: {}".format(exc))
             return
-        # copy: the plain path returns a view of a PETSc vector reused by the next solve
-        psi_fom = np.array(scratch['u_vec'], dtype=float)
+        self._record_phases("adjoint_fom_reference", self.eval_idx - 1, phases_before)
+        self._record_adjoint_error(psi_rom, scratch['u_vec'], True, rom_walltime)
+
+    def _log_rejected_rom_adjoint_error(self, adjoint, d_outputs, psi_fom):
+        """The adjoint of a rejected ROM solve against the full-order adjoint psi_fom that the
+        optimizer uses, both at the model's current state (the full-order solution). The reduced
+        adjoint only needs the Jacobian there and the basis and weights of the rejected solve
+        (built before this design's snapshot was added). Its phases are recorded as
+        'adjoint_rom_reference'. Collective."""
+        phases_before = self._phase_snapshot()
+        start = perf_counter()
+        try:
+            with _PROF.phase("rom:adjoint"):
+                psi_rom = adjoint.solve(self.sim_model, d_outputs['u_vec'])
+        except ValueError as exc:
+            PETSc.Sys.Print("adjoint error: the reduced adjoint of the rejected ROM solve failed: {}".format(exc))
+            return
+        walltime = perf_counter() - start
+        self._record_phases("adjoint_rom_reference", self.eval_idx - 1, phases_before)
+        self._record_adjoint_error(psi_rom, psi_fom, False, walltime)
+
+    def _record_adjoint_error(self, psi_rom, psi_fom, rom_accepted, rom_walltime):
+        """(eval_idx, output row, ||psi_rom - psi_fom||_2, that relative to ||psi_fom||_2,
+        ||psi_fom||_2, whether the ROM solve was accepted, wall time of the reduced adjoint
+        solve) in data_store.adjoint_errors. The row is the order of the adjoint solves within
+        the evaluation, i.e. of CSDL's derivative rows. Collective."""
+        # copy: the plain full-order path returns a view of a PETSc vector the next solve reuses
+        psi_fom = np.array(psi_fom, dtype=float)
         comm = self.mesh.mesh.comm
         diff = comm.allreduce(float(np.sum((np.asarray(psi_rom) - psi_fom)**2)), op=MPI.SUM)
         ref = comm.allreduce(float(psi_fom @ psi_fom), op=MPI.SUM)
         abs_err, fom_norm = np.sqrt(diff), np.sqrt(ref)
         rel_err = abs_err / fom_norm if fom_norm > 0.0 else np.nan
-
-        eval_idx = self.eval_idx - 1
-        row = self._adjoint_row[1] if self._adjoint_row[0] == eval_idx else 0
-        self._adjoint_row = (eval_idx, row + 1)
+        eval_idx, row = self.eval_idx - 1, self._current_adjoint_row
         if comm.Get_rank() == 0:
-            self.data_store.adjoint_errors += [(eval_idx, row, float(abs_err), float(rel_err), float(fom_norm))]
-        PETSc.Sys.Print("ROM adjoint error (output row {}): |psi_rom - psi_fom| = {:.3e}, relative {:.3e}".format(
-            row, abs_err, rel_err))
+            self.data_store.adjoint_errors += [(eval_idx, row, float(abs_err), float(rel_err), float(fom_norm),
+                                                bool(rom_accepted), float(rom_walltime))]
+        PETSc.Sys.Print("{} ROM adjoint error (output row {}): |psi_rom - psi_fom| = {:.3e}, relative {:.3e}".format(
+            "accepted" if rom_accepted else "rejected", row, abs_err, rel_err))
 
     def _log_adjoint(self, kind, start_time):
         # which adjoint ('rom' or 'fom') the derivative of the last evaluation
         # used, and its wall time
         walltime = perf_counter() - start_time
+        eval_idx = self.eval_idx - 1
+        self._current_adjoint_row = self._adjoint_row[1] if self._adjoint_row[0] == eval_idx else 0
+        self._adjoint_row = (eval_idx, self._current_adjoint_row + 1)
         if self.mesh.mesh.comm.Get_rank() == 0:
-            self.data_store.adjoint_solves += [(self.eval_idx - 1, kind, walltime)]
+            self.data_store.adjoint_solves += [(eval_idx, kind, walltime)]
         self._record_phases("adjoint_" + kind, self.eval_idx - 1, self._adjoint_phases_before)
         PETSc.Sys.Print("apply_inverse_jacobian total time ({} adjoint): {}".format(kind, walltime))
 
@@ -924,11 +986,12 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
                 gc.collect()
                 PETSc.garbage_cleanup(self.mesh.mesh.comm)
             # the condensed dR/dU is freed once its transposes exist: only they are used from then on
-            ksp = self.sim_model.linearized_solver(
-                transpose=True, prefix="adj_", rtol=self.linear_solver_rtol,
-                atol=self.linear_solver_atol, max_it=self.linear_solver_max_it,
-                release_operands=True, matrix_free=self.adjoint_matrix_free,
-                ksp_options=self.adjoint_ksp_options)
+            with _PROF.phase("setup:adjoint_solver"):
+                ksp = self.sim_model.linearized_solver(
+                    transpose=True, prefix="adj_", rtol=self.linear_solver_rtol,
+                    atol=self.linear_solver_atol, max_it=self.linear_solver_max_it,
+                    release_operands=True, matrix_free=self.adjoint_matrix_free,
+                    ksp_options=self.adjoint_ksp_options)
             self._adjoint_cache = {'key': state_key, 'ksp': ksp}
         ksp = self._adjoint_cache['ksp']
         A = ksp.getOperators()[0]
@@ -936,7 +999,8 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         set_petsc_vec_array(rhs, d_outputs['u_vec'])
         guess_used = self.adjoint_first_order_guess and self._first_order_adjoint_guess(ksp, A, rhs, sol)
         ksp.setInitialGuessNonzero(bool(guess_used))
-        ksp.solve(rhs, sol)
+        with _PROF.phase("solve:adjoint"):
+            ksp.solve(rhs, sol)
         rnorm = ksp.getResidualNorm()
         PETSc.Sys.Print("adj_ solve: {} iterations, residual norm {} [{}]".format(
             ksp.getIterationNumber(), rnorm, ksp_converged_reason_name(ksp.getConvergedReason())))

@@ -60,7 +60,7 @@ def in_tmp_dir(tmp_path):
 def make_windtunnel(kind, rom=None, Re=200.0, suffix="rom", **extra):
     kw = dict(extra)
     if kind == "rans":
-        kw = dict(model_class=CompressibleRANSModel, model_kwargs={"Re": Re})
+        kw.update(model_class=CompressibleRANSModel, model_kwargs={"Re": Re})
     wt = DG_windtunnel_model(jittered_square(8), BC, moments=[("pitch", (0.25, 0.), "pitch")],
                              mesh_inner_bdry_function=lambda x: x[1] < 1e-8,
                              poly_order=0, filename_suffix="{}_{}".format(suffix, kind),
@@ -371,9 +371,11 @@ def test_windtunnel_rom_adjoint(in_tmp_dir, kind, eta_threshold):
     for a in ALPHAS[:3]:
         sim[alpha] = np.array([np.radians(a)])
         sim.run()
-    assert rom.n_snapshots == 3 and rom.adjoint is None
+    # the rejected third solve: its adjoint is kept (for the comparison with the full-order one),
+    # but is not the one the derivative uses
+    assert rom.n_snapshots == 3 and rom.adjoint is not None and not rom.adjoint.accepted
     sim.compute_totals()
-    assert rom.n_snapshots == 3 and rom.adjoint is None
+    assert rom.n_snapshots == 3 and rom.adjoint is not None and not rom.adjoint.accepted
     if root:
         assert [acc for _, acc in ds.ROM_meets_threshold] == [False]
         fom_kinds = [k for _, k, _ in ds.adjoint_solves]
@@ -383,7 +385,7 @@ def test_windtunnel_rom_adjoint(in_tmp_dir, kind, eta_threshold):
     sim[alpha] = np.array([a])
     sim.run()
     dD = float(np.asarray(sim.compute_totals()[out.D, alpha]).ravel()[0])
-    assert rom.adjoint is not None
+    assert rom.adjoint is not None and rom.adjoint.accepted
     h = 1e-5
     fd = (wt.solve_forward(a + h)[2]["D"] - wt.solve_forward(a - h)[2]["D"]) / (2 * h)
     PETSc.Sys.Print("ROM-ADJOINT-CHECK {}: dD/dalpha {:.12f}, FD of the ROM solves {:.12f}".format(
@@ -421,7 +423,8 @@ def test_windtunnel_adjoint_errors(in_tmp_dir, kind, eta_threshold):
     for a in ALPHAS[:3]:
         sim[alpha] = np.array([np.radians(a)])
         sim.run()
-    sim.compute_totals()                 # the rejected design: full-order adjoint, nothing to compare
+    sim.compute_totals()                 # the rejected design: full-order adjoint, and with the flag off
+                                         # nothing is compared
     sim[alpha] = np.array([np.radians(ALPHAS[4])])
     sim.run()
     dD_off = float(np.asarray(sim.compute_totals()[out.D, alpha]).ravel()[0])
@@ -437,11 +440,60 @@ def test_windtunnel_adjoint_errors(in_tmp_dir, kind, eta_threshold):
     assert dD_on == pytest.approx(dD_off, rel=1e-9)
     if root:
         assert [k for _, k, _ in ds.adjoint_solves[n_solves:]] == ["rom"]
-        (eval_idx, row, absolute, relative, fom_norm), = ds.adjoint_errors
-        assert eval_idx == ds.adjoint_solves[-1][0] and row == 0
-        assert fom_norm > 0.0 and absolute > 0.0
+        (eval_idx, row, absolute, relative, fom_norm, accepted, rom_walltime), = ds.adjoint_errors
+        assert eval_idx == ds.adjoint_solves[-1][0] and row == 0 and accepted is True
+        assert fom_norm > 0.0 and absolute > 0.0 and rom_walltime > 0.0
         assert relative == pytest.approx(absolute / fom_norm, rel=1e-12)
         assert relative < 1.0
+
+
+@pytest.mark.parametrize("kind, eta_threshold", [("euler", 1e-9), ("rans", 1e-7)])
+@pytest.mark.verification
+def test_windtunnel_adjoint_errors_of_a_rejected_rom(in_tmp_dir, request, kind, eta_threshold):
+    """At a design whose ROM solve was rejected the optimizer uses the full-order adjoint, and
+    compute_all_adjoint_errors compares the reduced adjoint of the rejected solve, evaluated at
+    the full-order state, with it: the derivative is unchanged, the adjoint solve record shows
+    only the full-order adjoint, and the error is recorded for every output row."""
+    import csdl_alpha as csdl
+    recorder = csdl.Recorder(inline=False)
+    recorder.start()
+    rom = ReducedOrderModel(rb_size=5, eta_threshold=eta_threshold)
+    from dragonfly_sim.utils.solver_profiling import PROFILER
+    request.addfinalizer(lambda: (PROFILER.configure(enabled=False), PROFILER.reset()))
+    wt = make_windtunnel(kind, rom=rom, suffix="adjoint_errors_rejected", profile_phases=True)
+    alpha = csdl.Variable(name='alpha', value=np.array([np.radians(ALPHAS[0])]))
+    alpha.set_as_design_variable()
+    u_vec = wt.evaluate(alpha=alpha)
+    out = wt.postprocessor.evaluate(u_vec, alpha=alpha)
+    out.D.set_as_objective()
+    recorder.stop()
+    sim = csdl.experimental.JaxSimulator(recorder, gpu=False)
+    root = MPI.COMM_WORLD.rank == 0
+    ds = wt.data_store
+
+    for a in ALPHAS[:3]:                 # the third solve: two snapshots, the ROM is rejected
+        sim[alpha] = np.array([np.radians(a)])
+        sim.run()
+    assert rom.adjoint is not None and not rom.adjoint.accepted
+    dD_off = float(np.asarray(sim.compute_totals()[out.D, alpha]).ravel()[0])
+    n_solves = len(ds.adjoint_solves)
+    assert ds.adjoint_errors == []       # flag off: nothing compared
+
+    wt.compute_all_adjoint_errors = True
+    sim.run()                            # the same design: skips the ROM, keeps its adjoint
+    assert rom.adjoint is not None and not rom.adjoint.accepted
+    dD_on = float(np.asarray(sim.compute_totals()[out.D, alpha]).ravel()[0])
+    assert dD_on == pytest.approx(dD_off, rel=1e-9)
+    if root:
+        assert [k for _, k, _ in ds.adjoint_solves[n_solves:]] == ["fom"]
+        (eval_idx, row, absolute, relative, fom_norm, accepted, rom_walltime), = ds.adjoint_errors
+        assert eval_idx == ds.adjoint_solves[-1][0] and row == 0 and accepted is False
+        assert fom_norm > 0.0 and absolute > 0.0 and rom_walltime > 0.0
+        assert relative == pytest.approx(absolute / fom_norm, rel=1e-12)
+        # the phases of the adjoint the optimizer used, and of the reference solve, are separate
+        kinds = [k for _, k, _ in ds.phase_times if k.startswith("adjoint")]
+        assert kinds.count("adjoint_fom") == 2 and kinds.count("adjoint_rom_reference") == 1
+        assert "adjoint_rom" not in kinds
 
 
 @pytest.mark.verification
@@ -483,6 +535,42 @@ def test_windtunnel_records_phase_times(in_tmp_dir):
     finally:
         PROFILER.configure(enabled=False)
         PROFILER.reset()
+
+
+@pytest.mark.verification
+def test_recorded_outputs_are_the_optimizers(in_tmp_dir):
+    """With use_postprocessor, the outputs recorded for every solve are those of the
+    postprocessor the optimizer evaluates, including a moment the windtunnel model was not
+    built with, at the evaluation's own angle of attack (the lift direction follows alpha)."""
+    import csdl_alpha as csdl
+    from dragonfly_sim.core.postprocessor import DG_postprocessor
+    recorder = csdl.Recorder(inline=False)
+    recorder.start()
+    wt = make_windtunnel("euler", suffix="outputs")
+    pp = DG_postprocessor(wt.mesh, wt.sim_model, wt.WALL_TAG, p_inf_dim=101325.,
+                          moments=[("pitch", (0.25, 0.), "pitch"), ("nose", (0., 0.), "pitch")])
+    wt.use_postprocessor(pp)
+    alpha = csdl.Variable(name='alpha', value=np.array([np.radians(ALPHAS[0])]))
+    alpha.set_as_design_variable()
+    out = pp.evaluate(wt.evaluate(alpha=alpha), alpha=alpha)
+    out.D.set_as_objective()
+    recorder.stop()
+    compared = ("L", "D", "M_pitch", "M_nose", "c_l")
+    sim = csdl.experimental.JaxSimulator(recorder, gpu=False,
+                                         additional_outputs=[getattr(out, n) for n in compared])
+    root = MPI.COMM_WORLD.rank == 0
+    for a in ALPHAS[:3]:
+        sim[alpha] = np.array([np.radians(a)])
+        sim.run()
+        if root:
+            recorded = {n: v[-1][1] for n, v in wt.data_store.FOM_outputs.items()}
+            assert set(recorded) == {"L", "D", "c_l", "c_d", "M_pitch", "c_m_pitch", "M_nose", "c_m_nose"}
+            for n in compared:
+                assert recorded[n] == pytest.approx(float(np.asarray(sim[getattr(out, n)]).ravel()[0]),
+                                                    rel=1e-12, abs=1e-14), n
+    with pytest.raises(ValueError, match="mesh and sim_model"):
+        wt.use_postprocessor(DG_postprocessor(wt.mesh, make_windtunnel("euler", suffix="other").sim_model,
+                                              wt.WALL_TAG))
 
 
 @pytest.mark.unit_test

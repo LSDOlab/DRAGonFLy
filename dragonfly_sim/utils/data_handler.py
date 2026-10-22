@@ -60,17 +60,22 @@ class DataStore():
         # of an accepted ROM solution, 'fom' the full-order adjoint.
         self.adjoint_solves = []
 
-        # Per ROM adjoint, when DG_windtunnel_model's compute_all_adjoint_errors
-        # is on: (eval_idx, output row, ||psi_rom - psi_fom||_2, relative to
-        # ||psi_fom||_2, ||psi_fom||_2), psi_fom being the full-order adjoint at the
-        # same state and right-hand side. The row numbers the adjoint solves of
-        # one evaluation in CSDL's order (objective and constraint rows).
+        # Per ROM adjoint, when DG_windtunnel_model's compute_all_adjoint_errors is on:
+        # (eval_idx, output row, ||psi_rom - psi_fom||_2, relative to ||psi_fom||_2,
+        # ||psi_fom||_2, whether the ROM solve was accepted, wall time of the reduced
+        # adjoint solve), psi_fom being the full-order adjoint at the same state and
+        # right-hand side. For an accepted solve the reduced adjoint is the one the optimizer
+        # used; for a rejected one the full-order adjoint is used, and the reduced adjoint of
+        # the rejected solve is evaluated at that full-order state. The row numbers the adjoint
+        # solves of one evaluation in CSDL's order (objective and constraint rows).
         self.adjoint_errors = []
 
         # Phase timing (utils/solver_profiling.py), when profiling is on: per
         # forward evaluation ('forward': all of solve_residual_equations,
         # containing the 'rom' and 'fom' flow solves, which are also recorded
-        # on their own) and per adjoint solve ('adjoint_rom' / 'adjoint_fom'),
+        # on their own) and per adjoint solve ('adjoint_rom' / 'adjoint_fom': the
+        # one the optimizer used; with compute_all_adjoint_errors also the reference
+        # solve of the other kind, 'adjoint_fom_reference' / 'adjoint_rom_reference'),
         # (eval_idx, kind, {phase: (self time, total time, calls)}), the
         # slowest rank's times in seconds. Phases are named "group:name";
         # self times partition a record, totals include nested phases.
