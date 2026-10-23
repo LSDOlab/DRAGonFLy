@@ -367,6 +367,9 @@ class PODBasis:
         self.mean = None
         # ||u0 - U U^T W u0||_W / ||u0||_W of the last warm-start centring
         self.warm_start_span_residual = None
+        # the local_weighted weights of the last basis, one per accepted snapshot
+        # (column of VT), summing to 1; None after a global (or one-snapshot) basis
+        self.snapshot_weights = None
 
     @property
     def subtract_mean(self):
@@ -503,7 +506,8 @@ class PODBasis:
 
     def construct_basis(self, rb_size=10, local_parametervector=None, parameter_weights=None,
                         weightfunction='Cubic', n_nonzero_weights=None, cubic_cutoff=None,
-                        return_distance_norms=False, layout_vec=None, warm_start=None):
+                        return_distance_norms=False, layout_vec=None, warm_start=None,
+                        snapshot_weights=None):
         """
         (Re)build self.basis from the current snapshot SVD; with no snapshots
         self.basis becomes None.
@@ -527,6 +531,11 @@ class PODBasis:
                                  of the solve the basis is for (a Vec in the
                                  state layout); the offset is its projection
                                  onto the snapshot span
+          snapshot_weights       instead of the distance weighting above, the
+                                 weights of the accepted snapshots themselves
+                                 (one per column of VT, nonnegative): e.g. those
+                                 of another basis over the same designs
+                                 (core/hyper_reduction.py)
 
         `layout_vec` (the state vector) guards the one invariant the reduced
         solve depends on: the basis rows are distributed exactly like it.
@@ -554,16 +563,25 @@ class PODBasis:
             self.mean.destroy()
             self.mean = None
         parameter_distnorm = None
+        self.snapshot_weights = None
         if self.basis_mode == 'global' or n_snapshots < 2:
             # bounded by the rank, not n_snapshots: a rank-deficient snapshot
             # adds a column to R/VT but none to U
             self._set_basis_from_local_block(U.getDenseArray()[:, :min(basis_rank, rb_size)])
         else:
-            if local_parametervector is None:
-                raise ValueError("the local_weighted basis needs local_parametervector")
-            weights, parameter_distnorm = self._local_weighted_snapshot_weights(
-                local_parametervector, weightfunction, parameter_weights, n_nonzero_weights, rb_size,
-                cubic_cutoff=cubic_cutoff)
+            if snapshot_weights is not None:
+                weights = np.asarray(snapshot_weights, dtype=float).ravel()
+                if weights.shape != (VT.getSize()[1],) or np.any(weights < 0.) or not np.any(weights > 0.):
+                    raise ValueError("snapshot_weights needs one nonnegative weight per accepted snapshot "
+                                     "({}), not all zero; got {}".format(VT.getSize()[1], weights))
+                weights = weights / weights.sum()
+            else:
+                if local_parametervector is None:
+                    raise ValueError("the local_weighted basis needs local_parametervector")
+                weights, parameter_distnorm = self._local_weighted_snapshot_weights(
+                    local_parametervector, weightfunction, parameter_weights, n_nonzero_weights, rb_size,
+                    cubic_cutoff=cubic_cutoff)
+            self.snapshot_weights = weights.copy()
             PETSc.Sys.Print("snapshot weights: {}".format(weights))
 
             # diagonal weight matrix restricted to the columns above 1e-10

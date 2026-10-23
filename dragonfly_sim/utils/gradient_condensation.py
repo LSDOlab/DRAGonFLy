@@ -180,9 +180,11 @@ class CondensedGradientProblem(NonlinearProblem_mod):
         super().F(x, b)
 
     def J(self, x, A):
-        with _PROF.phase("assemble:jacobian"):
-            self.update_G()
-            self._condensed.assemble()
+        # the observer is NonlinearProblem_mod's (see there)
+        if self.jacobian_observer is None or not self.jacobian_observer(x):
+            with _PROF.phase("assemble:jacobian"):
+                self.update_G()
+                self._condensed.assemble()
         if A.handle != self._A.handle:
             A.assemble()
             self._A.copy(A)

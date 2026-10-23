@@ -3,6 +3,7 @@ from mpi4py import MPI
 from petsc4py import PETSc
 import dolfinx
 
+import contextlib
 import datetime
 import resource
 import os
@@ -38,7 +39,8 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
                  filename_suffix="test",
                  asm_overlap=None, ilu_levels=None,
                  model_class=CompressibleEulerModel, model_kwargs=None,
-                 reduced_order_model=None, compute_all_adjoint_errors=False, profile_phases=False):
+                 reduced_order_model=None, compute_all_adjoint_errors=False, profile_phases=False,
+                 hyper_reduction=None):
         """
         boundary_dict: the free-stream state {'rho', 'p', 'M', 'alpha'} (density,
         pressure, Mach number, angle of attack in rad). The whole outer boundary
@@ -100,6 +102,13 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         profile_phases: time the phases of the flow solves, mesh motion, ROM and adjoint
         (see enable_profiling) and record them per evaluation in data_store.phase_times;
         default False.
+
+        hyper_reduction: a core.hyper_reduction.HyperReductionComparison, or None. Needs
+        reduced_order_model. DEIM and/or MDEIM, trained on the Jacobians of the FOM solves,
+        then solve every design the ROM solves and the adjoint of every derivative, beside
+        the ROM and FOM, and are recorded against them in data_store (the DEIM_* / MDEIM_*
+        records); the optimizer's solutions and adjoints are unchanged. A diagnostic: it adds
+        their solves and harvesting to every evaluation (and to its 'forward' phase record).
         """
         super().__init__()
 
@@ -176,6 +185,9 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
 
         # POD reduced-order model (None: full-order solves only)
         self.reduced_order_model = reduced_order_model
+        if hyper_reduction is not None and reduced_order_model is None:
+            raise ValueError("hyper_reduction compares with a reduced-order model: pass reduced_order_model")
+        self.hyper_reduction = hyper_reduction
         self.compute_all_adjoint_errors = compute_all_adjoint_errors
         if profile_phases:
             self.enable_profiling()
@@ -364,6 +376,8 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
 
         if self.reduced_order_model is not None:
             self.reduced_order_model.set_up(self.sim_model)
+        if self.hyper_reduction is not None:
+            self.hyper_reduction.set_up(self.sim_model, self.reduced_order_model)
 
     def _log_memory(self, stage):
         # We write a log file for each MPI rank that documents the peak local memory usage
@@ -501,6 +515,13 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
     def _phase_snapshot(self):
         return _PROF.snapshot() if _PROF.enabled else None
 
+    @contextlib.contextmanager
+    def _phase_record(self, kind, eval_idx=None):
+        # the phases of the block as a record of `kind` (eval_idx: the current evaluation's)
+        before = self._phase_snapshot()
+        yield
+        self._record_phases(kind, self.eval_idx if eval_idx is None else eval_idx, before)
+
     def solve_residual_equations(self, input_vals, output_vals):
         phases_before = self._phase_snapshot()
         # Define inputs
@@ -628,21 +649,39 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         accept_rom = rom_result is not None and rom_result.accepted
         if accept_rom and not rom.run_fom_every_evaluation:
             PETSc.Sys.Print("Accepting ROM solution")
+            self._compare_hyper_reduced(parameter_vector, rom_result, rom_forces, None, None)
             self._fom_design = None
             return rom_result.solution, True
 
-        solution_fom, fom_converged = self._run_fom_solve()
+        # the hyper-reduction comparison trains on the Jacobians of a FOM solve of a new design
+        harvest = self.hyper_reduction is not None and not repeat
+        solution_fom, fom_converged = self._run_fom_solve(
+            harvest_basis=(rom.pod.basis if rom_result is not None else None) if harvest else False)
         if rom_forces is not None and fom_converged:
             self._log_rom_error(rom_forces)
             self._log_rom_state_error(rom_result.solution, solution_fom)
+        if not repeat:
+            self._compare_hyper_reduced(parameter_vector, rom_result, rom_forces,
+                                        solution_fom if fom_converged else None,
+                                        self._last_fom_coefficients if fom_converged else None)
         if accept_rom:
             PETSc.Sys.Print("Accepting ROM solution (FOM run for comparison)")
+            if harvest:
+                # the ROM keeps no snapshot of this design, so neither does the comparison
+                self.hyper_reduction.discard_buffers()
             self._fom_design = None
             return rom_result.solution, True
 
         PETSc.Sys.Print("Accepting FOM solution")
         finite = self.mesh.mesh.comm.allreduce(bool(np.all(np.isfinite(solution_fom))), op=MPI.LAND)
         converged = fom_converged and finite
+        if harvest:
+            # after the comparison of this design: its snapshots are out of sample there
+            if converged:
+                counts = self.hyper_reduction.flush(parameter_vector)
+                self._log_hyper_reduction_snapshots(counts)
+            else:
+                self.hyper_reduction.discard_buffers()
         if converged and repeat and self._fom_design[1]:
             PETSc.Sys.Print("The snapshot of this design is already stored")
         elif converged:
@@ -699,15 +738,25 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
             cms.append(c_m)
         return outputs, (c_d, c_l, *cms)
 
+    def _state_errors(self, solution, reference):
+        """(|u - u_ref|, relative to |u_ref|, the same over the wall, relative), the L2
+        norms of compute_L2_norm, of the owned entries `solution` against `reference`; None
+        if `solution` is not finite. Collective."""
+        if not self.mesh.mesh.comm.allreduce(bool(np.all(np.isfinite(solution))), op=MPI.LAND):
+            return None
+        diff = np.subtract(reference, solution)
+        l2, l2_rel = self.sim_model.compute_L2_norm(diff, normalization_vec=reference)
+        l2_wall, l2_wall_rel = self.sim_model.compute_L2_norm(
+            diff, normalization_vec=reference, wall_tag=self.WALL_TAG)
+        return l2, l2_rel, l2_wall, l2_wall_rel
+
     def _log_rom_state_error(self, solution_rom, solution_fom):
         # absolute and relative L2 errors of the ROM state against the FOM state just
         # run, over the domain and over the wall. Both are this rank's owned entries.
-        if not self.mesh.mesh.comm.allreduce(bool(np.all(np.isfinite(solution_rom))), op=MPI.LAND):
+        errors = self._state_errors(solution_rom, solution_fom)
+        if errors is None:
             return
-        diff = np.subtract(solution_fom, solution_rom)
-        l2, l2_rel = self.sim_model.compute_L2_norm(diff, normalization_vec=solution_fom)
-        l2_wall, l2_wall_rel = self.sim_model.compute_L2_norm(
-            diff, normalization_vec=solution_fom, wall_tag=self.WALL_TAG)
+        l2, l2_rel, l2_wall, l2_wall_rel = errors
         if self.mesh.mesh.comm.Get_rank() == 0:
             ds = self.data_store
             ds.absolute_l2_errors_per_iteration += [(self.eval_idx, l2)]
@@ -716,17 +765,82 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
             ds.relative_l2_bdry_errors_per_iteration += [(self.eval_idx, l2_wall_rel)]
         PETSc.Sys.Print("ROM L2 error relative to the FOM: domain {:.3e}, wall {:.3e}".format(l2_rel, l2_wall_rel))
 
+    def _compare_hyper_reduced(self, parameter_vector, rom_result, rom_forces, solution_fom, fom_forces):
+        """
+        The hyper-reduction comparison of this design, if there is one and the ROM solved
+        it: DEIM/MDEIM solves on the basis of the ROM solve just run, recorded against it
+        and against the FOM solution and coefficients (None: the FOM did not run or did not
+        converge). The model's u_vec keeps the optimizer's solution. Collective.
+        """
+        hr = self.hyper_reduction
+        if hr is None or rom_result is None:
+            return
+        model = self.sim_model
+        model.u_vec.x.scatter_forward()
+        state = model.u_vec.x.petsc_vec.getArray().copy()
+        try:
+            results = hr.compare(model, self.reduced_order_model, parameter_vector, self.previous_solution,
+                                 self._phase_record)
+        finally:
+            model.set_u_vec(state)
+        for res in results:
+            self._log_hyper_reduced_solve(res, rom_result, rom_forces, solution_fom, fom_forces)
+
+    def _log_hyper_reduced_solve(self, res, rom_result, rom_forces, solution_fom, fom_forces):
+        # a DEIM/MDEIM solve, logged like the ROM's, with its errors against the FOM and the ROM
+        result, m = res.result, res.method
+        M = m.upper()
+        with _PROF.phase("post:coefficients"):
+            outputs, forces = self._evaluate_outputs(result.solution)
+        forces = tuple(float(f) for f in forces)
+        vs_fom = None if fom_forces is None else tuple(float(a - b) for a, b in zip(forces, fom_forces))
+        vs_rom = tuple(float(a - b) for a, b in zip(forces, rom_forces))
+        fom_errors = None if solution_fom is None else self._state_errors(result.solution, solution_fom)
+        rom_errors = self._state_errors(result.solution, rom_result.solution)
+        l2 = (fom_errors or (np.nan,) * 4) + ((rom_errors or (np.nan,) * 4)[1],)
+        e = self.eval_idx
+        if self.mesh.mesh.comm.Get_rank() == 0:
+            ds = self.data_store
+            ds.record_outputs(M, e, outputs)
+            getattr(ds, M + "_walltime").append((e, result.walltime, res.offline_walltime))
+            getattr(ds, m + "_relative_residuals").append((e, result.eta))
+            getattr(ds, M + "_force_coefficients").append((e,) + forces)
+            getattr(ds, M + "_meets_threshold").append((e, result.accepted))
+            getattr(ds, M + "_lspg_converged").append((e, result.converged))
+            getattr(ds, m + "_iterations").append((e, result.iterations))
+            getattr(ds, m + "_coefficient_errors").append((e, vs_fom, vs_rom))
+            getattr(ds, m + "_l2_errors").append((e,) + tuple(float(x) for x in l2))
+            getattr(ds, m + "_operator_info").append((e, dict(res.info)))
+            if res.validation is not None:
+                getattr(ds, m + "_validation").append((e, dict(res.validation)))
+        PETSc.Sys.Print("{} coefficients: c_d: {}, c_l: {}{}; eta {:.3e}, {} iterations, online {:.3f} s, "
+                        "offline {:.3f} s".format(M, forces[0], forces[1], self._moment_log_string(forces[2:]),
+                                                  result.eta, result.iterations, result.walltime,
+                                                  res.offline_walltime))
+        PETSc.Sys.Print("{} L2 error relative to the FOM: domain {:.3e}, wall {:.3e}; to the ROM: {:.3e}".format(
+            M, l2[1], l2[3], l2[4]))
+        if res.validation is not None:
+            PETSc.Sys.Print("{} validation: {}".format(M, res.validation))
+
+    def _log_hyper_reduction_snapshots(self, counts):
+        if self.mesh.mesh.comm.Get_rank() == 0:
+            for m, (offered, added) in counts.items():
+                getattr(self.data_store, m + "_snapshots").append(
+                    (self.eval_idx, offered, added, self.hyper_reduction.models[m].n_snapshots))
+
     def _moment_log_string(self, coefficients):
         return "".join(", c_m_{}: {}".format(spec.name, c)
                        for spec, c in zip(self.postprocessor.moment_specs, coefficients))
 
-    def _run_fom_solve(self):
+    def _run_fom_solve(self, harvest_basis=False):
         phases_before = self._phase_snapshot()
-        out = self._run_fom_solve_untimed()
+        out = self._run_fom_solve_untimed(harvest_basis)
         self._record_phases("fom", self.eval_idx, phases_before)
         return out
 
-    def _run_fom_solve_untimed(self):
+    def _run_fom_solve_untimed(self, harvest_basis=False):
+        # harvest_basis: False, or harvest the Jacobians of the solve for the hyper-reduction
+        # comparison, with the POD basis of this evaluation (None: none)
         # Run the FOM model and output its solution
 
         # store pre-FOM time stamp for performance profiling
@@ -739,12 +853,23 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         # solve the FOM
         # an incoming state that already meets the convergence criterion
         # needs no solver (SNES, KSP/PC, matrices): skip building it
+        harvest = harvest_basis is not False
         if self.sim_model.incoming_state_converged():
             residual_norm = self.sim_model.residual_vec_physical.norm()
+            if harvest:
+                # no Newton iterates, and the comparison learns nothing from this solve
+                self.hyper_reduction.discard_buffers()
+                harvest = False
         else:
             self.sim_model.set_up_solver()
-            residual_norm = self.sim_model.solve_system().norm()
+            harvesting = self.hyper_reduction.harvesting(self.sim_model, self.reduced_order_model, harvest_basis) \
+                if harvest else contextlib.nullcontext()
+            with harvesting:
+                residual_norm = self.sim_model.solve_system().norm()
         fom_converged = self.sim_model.solver_converged
+        if harvest and fom_converged:
+            # the steady Jacobian at the solution, before release_solver_memory frees the solver
+            self.hyper_reduction.harvest_converged_state(self.sim_model)
         eta = self.sim_model.relative_residual_norm(residual_norm)
         solution_fom = self.sim_model.u_vec.x.petsc_vec.getArray().copy()
         if self.release_solver_memory:
@@ -795,35 +920,53 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
             self.sim_model.set_angle_of_attack(alpha)
             self.sim_model.compute_weakform()
             self.sim_model.set_u_vec(u_vec)
-
-            rom = self.reduced_order_model
-            adjoint = None if rom is None else rom.adjoint
-            parameter_vector = self._parameter_vector(shape_parameters, alpha)
-            if adjoint is not None and adjoint.accepted and adjoint.matches(parameter_vector, u_vec):
-                # The accepted solution is the ROM's: the adjoint of its
-                # projected (LSPG) equations, lifted to the full state, which
-                # compute_jacvec_product then uses like the full-order one
-                rom_start = perf_counter()
-                with _PROF.phase("rom:adjoint"):
-                    d_residuals['u_vec'] = adjoint.solve(self.sim_model, d_outputs['u_vec'])
-                rom_walltime = perf_counter() - rom_start
-                self._log_adjoint("rom", pre_apply_inverse_jacobian_time)
-                if self.compute_all_adjoint_errors:
-                    # after the ROM adjoint's own timing; d_residuals is not touched
-                    self._log_adjoint_error(input_vals, u_vec, alpha, mesh_node_motions,
-                                            d_outputs, d_residuals['u_vec'], rom_walltime)
-                return
-
-            # the full-order adjoint is the optimizer's, as without a ROM
-            self._fom_adjoint(input_vals, u_vec, alpha, mesh_node_motions, d_outputs, d_residuals,
-                              pre_apply_inverse_jacobian_time)
-            if (self.compute_all_adjoint_errors and adjoint is not None and not adjoint.accepted
-                    and adjoint.matches_design(parameter_vector)):
-                # a rejected ROM: its adjoint, evaluated at this (the full-order) state, against
-                # the full-order adjoint just computed; d_residuals is not touched
-                self._log_rejected_rom_adjoint_error(adjoint, d_outputs, d_residuals['u_vec'])
+            # for the derivative contributions of the adjoint comparisons; the full-order
+            # adjoint's contribution is computed once per output row
+            self._adjoint_point = (u_vec, alpha, mesh_node_motions)
+            self._fom_contribution = None
+            self._contribution_operators = None
+            try:
+                self._apply_inverse_jacobian_rev(input_vals, u_vec, alpha, mesh_node_motions, shape_parameters,
+                                                 d_outputs, d_residuals, pre_apply_inverse_jacobian_time)
+            finally:
+                self._release_contribution_operators()
         else:
             raise ValueError("Reverse mode required")
+
+    def _apply_inverse_jacobian_rev(self, input_vals, u_vec, alpha, mesh_node_motions, shape_parameters,
+                                    d_outputs, d_residuals, pre_apply_inverse_jacobian_time):
+        rom = self.reduced_order_model
+        adjoint = None if rom is None else rom.adjoint
+        parameter_vector = self._parameter_vector(shape_parameters, alpha)
+        if adjoint is not None and adjoint.accepted and adjoint.matches(parameter_vector, u_vec):
+            # The accepted solution is the ROM's: the adjoint of its
+            # projected (LSPG) equations, lifted to the full state, which
+            # compute_jacvec_product then uses like the full-order one
+            rom_start = perf_counter()
+            with _PROF.phase("rom:adjoint"):
+                d_residuals['u_vec'] = adjoint.solve(self.sim_model, d_outputs['u_vec'])
+            rom_walltime = perf_counter() - rom_start
+            self._log_adjoint("rom", pre_apply_inverse_jacobian_time)
+            psi_fom = None
+            if self.compute_all_adjoint_errors:
+                # after the ROM adjoint's own timing; d_residuals is not touched
+                psi_fom = self._log_adjoint_error(input_vals, u_vec, alpha, mesh_node_motions,
+                                                  d_outputs, d_residuals['u_vec'], rom_walltime)
+            self._hyper_reduced_adjoints(input_vals, u_vec, alpha, mesh_node_motions, d_outputs,
+                                         parameter_vector, psi_fom, d_residuals['u_vec'])
+            return
+
+        # the full-order adjoint is the optimizer's, as without a ROM
+        self._fom_adjoint(input_vals, u_vec, alpha, mesh_node_motions, d_outputs, d_residuals,
+                          pre_apply_inverse_jacobian_time)
+        psi_rom = None
+        if (self.compute_all_adjoint_errors and adjoint is not None and not adjoint.accepted
+                and adjoint.matches_design(parameter_vector)):
+            # a rejected ROM: its adjoint, evaluated at this (the full-order) state, against
+            # the full-order adjoint just computed; d_residuals is not touched
+            psi_rom = self._log_rejected_rom_adjoint_error(adjoint, d_outputs, d_residuals['u_vec'])
+        self._hyper_reduced_adjoints(input_vals, u_vec, alpha, mesh_node_motions, d_outputs,
+                                     parameter_vector, d_residuals['u_vec'], psi_rom)
 
     def _fom_adjoint(self, input_vals, u_vec, alpha, mesh_node_motions, d_outputs, d_residuals,
                      start_time, log=True):
@@ -918,9 +1061,12 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         except ValueError as exc:
             # a diagnostic must not stop the optimization
             PETSc.Sys.Print("adjoint error: the full-order reference adjoint failed: {}".format(exc))
-            return
+            return None
         self._record_phases("adjoint_fom_reference", self.eval_idx - 1, phases_before)
-        self._record_adjoint_error(psi_rom, scratch['u_vec'], True, rom_walltime)
+        # copy: the plain full-order path returns a view of a PETSc vector the next solve reuses
+        psi_fom = np.array(scratch['u_vec'], dtype=float)
+        self._record_adjoint_error(psi_rom, psi_fom, True, rom_walltime)
+        return psi_fom
 
     def _log_rejected_rom_adjoint_error(self, adjoint, d_outputs, psi_fom):
         """The adjoint of a rejected ROM solve against the full-order adjoint psi_fom that the
@@ -935,10 +1081,63 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
                 psi_rom = adjoint.solve(self.sim_model, d_outputs['u_vec'])
         except ValueError as exc:
             PETSc.Sys.Print("adjoint error: the reduced adjoint of the rejected ROM solve failed: {}".format(exc))
-            return
+            return None
         walltime = perf_counter() - start
         self._record_phases("adjoint_rom_reference", self.eval_idx - 1, phases_before)
         self._record_adjoint_error(psi_rom, psi_fom, False, walltime)
+        return psi_rom
+
+    def _hyper_reduced_adjoints(self, input_vals, u_vec, alpha, mesh_node_motions, d_outputs,
+                                parameter_vector, psi_fom, psi_rom):
+        """
+        The hyper-reduced adjoints of the comparison (if it solved this design), at the
+        optimizer's state and right-hand side, recorded against the full-order adjoint
+        psi_fom (solved here, as 'adjoint_fom_reference', when None) and the ROM adjoint
+        psi_rom (None: there is none to compare with) in data_store.<m>_adjoint_errors.
+        d_residuals is not touched. Collective.
+        """
+        hr = self.hyper_reduction
+        if hr is None or not hr.has_operators(parameter_vector) or not hr.prepared_methods:
+            return
+        comm = self.mesh.mesh.comm
+        if psi_fom is None:
+            scratch = {}
+            try:
+                with self._phase_record("adjoint_fom_reference", self.eval_idx - 1):
+                    self._fom_adjoint(input_vals, u_vec, alpha, mesh_node_motions, d_outputs, scratch,
+                                      perf_counter(), log=False)
+            except ValueError as exc:
+                PETSc.Sys.Print("hyper-reduced adjoint errors: the full-order reference adjoint failed: {}".format(exc))
+                return
+            psi_fom = scratch['u_vec']
+        psi_fom = np.array(psi_fom, dtype=float)
+        psi_rom = None if psi_rom is None else np.array(psi_rom, dtype=float)
+
+        def norm(x):
+            return np.sqrt(comm.allreduce(float(x @ x), op=MPI.SUM))
+
+        fom_norm = norm(psi_fom)
+        rom_norm = None if psi_rom is None else norm(psi_rom)
+        eval_idx, row = self.eval_idx - 1, self._current_adjoint_row
+        for m in hr.prepared_methods:
+            try:
+                with self._phase_record("adjoint_" + m, eval_idx):
+                    psi, walltime = hr.adjoint(m, self.sim_model, parameter_vector, d_outputs['u_vec'])
+            except ValueError as exc:
+                PETSc.Sys.Print("{} adjoint failed: {}".format(m.upper(), exc))
+                continue
+            abs_err = norm(psi - psi_fom)
+            rel_err = abs_err / fom_norm if fom_norm > 0.0 else np.nan
+            rel_rom = np.nan if psi_rom is None or not rom_norm > 0.0 else norm(psi - psi_rom) / rom_norm
+            contribution = self._contribution_errors(psi, psi_fom, psi_rom)
+            if comm.Get_rank() == 0:
+                getattr(self.data_store, m + "_adjoint_errors").append(
+                    (eval_idx, row, float(abs_err), float(rel_err), float(rel_rom), float(walltime)))
+                getattr(self.data_store, m + "_adjoint_derivative_errors").append((eval_idx, row, contribution))
+            PETSc.Sys.Print("{} adjoint error (output row {}): |psi - psi_fom| = {:.3e}, relative {:.3e}; "
+                            "relative to the ROM adjoint {:.3e}; {:.3f} s; derivative contributions: {}".format(
+                                m.upper(), row, abs_err, rel_err, rel_rom, walltime,
+                                self._contribution_string(contribution)))
 
     def _record_adjoint_error(self, psi_rom, psi_fom, rom_accepted, rom_walltime):
         """(eval_idx, output row, ||psi_rom - psi_fom||_2, that relative to ||psi_fom||_2,
@@ -953,11 +1152,94 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         abs_err, fom_norm = np.sqrt(diff), np.sqrt(ref)
         rel_err = abs_err / fom_norm if fom_norm > 0.0 else np.nan
         eval_idx, row = self.eval_idx - 1, self._current_adjoint_row
+        contribution = self._contribution_errors(psi_rom, psi_fom)
         if comm.Get_rank() == 0:
             self.data_store.adjoint_errors += [(eval_idx, row, float(abs_err), float(rel_err), float(fom_norm),
                                                 bool(rom_accepted), float(rom_walltime))]
-        PETSc.Sys.Print("{} ROM adjoint error (output row {}): |psi_rom - psi_fom| = {:.3e}, relative {:.3e}".format(
-            "accepted" if rom_accepted else "rejected", row, abs_err, rel_err))
+            self.data_store.adjoint_derivative_errors += [(eval_idx, row, bool(rom_accepted), contribution)]
+        PETSc.Sys.Print("{} ROM adjoint error (output row {}): |psi_rom - psi_fom| = {:.3e}, relative {:.3e}; "
+                        "derivative contributions: {}".format(
+                            "accepted" if rom_accepted else "rejected", row, abs_err, rel_err,
+                            self._contribution_string(contribution)))
+
+    def _derivative_contributions(self, psis):
+        """
+        The contributions of the adjoints `psis` (owned entries) to the derivative of an
+        output: (dR/dinput)^T psi for every input of the model at the linearization point of
+        the current adjoint call, as compute_jacvec_product forms them: {'alpha': float,
+        'mesh_node_motions': this rank's owned entries in the mesh coordinate space} (the
+        latter with mesh node motions). dR/dalpha and dR/dx are built once for all of them.
+        Collective.
+        """
+        u_vec, alpha, mesh_node_motions = self._adjoint_point
+        m = self.sim_model
+        comm = self.mesh.mesh.comm
+        if self._contribution_operators is None:
+            # dR/dalpha and dR/dx at the adjoint's linearization point, kept for the rest of the
+            # adjoint call (released at its end)
+            local_size = m.u_vec.x.petsc_vec.local_size
+            dr_dalpha = np.array(m.assemble_dRdalpha_vec(u_vec).getArray()[:local_size], copy=True)
+            dr_dxmesh = None if mesh_node_motions is None else \
+                m.compute_dRdxmesh_mat(u_vec, self.mesh.coordinate_space)
+            self._contribution_operators = (dr_dalpha, dr_dxmesh)
+        dr_dalpha, dr_dxmesh = self._contribution_operators
+        out = [{'alpha': comm.allreduce(float(np.dot(dr_dalpha, psi)), op=MPI.SUM)} for psi in psis]
+        if dr_dxmesh is not None:
+            x, y = dr_dxmesh.createVecLeft(), dr_dxmesh.createVecRight()
+            for o, psi in zip(out, psis):
+                set_petsc_vec_array(x, psi)
+                y.set(0.0)
+                dr_dxmesh.multTranspose(x, y)
+                o['mesh_node_motions'] = y.getArray().copy()
+            x.destroy()
+            y.destroy()
+        return out
+
+    def _release_contribution_operators(self):
+        ops, self._contribution_operators = getattr(self, "_contribution_operators", None), None
+        if ops is not None and ops[1] is not None and self.sim_model.derived_fields:
+            # a fresh chained operator (as compute_jacvec_product's uncached one)
+            destroy_chained_operator(ops[1])
+
+    def _contribution_errors(self, psi, psi_fom, psi_rom=None):
+        """
+        {input: (|c - c_fom|, relative to |c_fom|, |c_fom|, |c - c_rom| / |c_rom|)} with c,
+        c_fom and c_rom the derivative contributions (_derivative_contributions) of the
+        adjoint psi, of the full-order adjoint psi_fom (computed once per output row) and of
+        the ROM adjoint psi_rom (None: nan). Norms are 2-norms over the input (for alpha, the
+        absolute value). This, not the distance between the adjoint vectors, is the error a
+        reduced adjoint puts into the derivative. Collective.
+        """
+        comm = self.mesh.mesh.comm
+        with self._phase_record("adjoint_contributions", self.eval_idx - 1):
+            row = self._current_adjoint_row
+            if self._fom_contribution is None or self._fom_contribution[0] != row:
+                self._fom_contribution = (row, self._derivative_contributions([np.asarray(psi_fom, dtype=float)])[0])
+            c_fom = self._fom_contribution[1]
+            cands = [np.asarray(psi, dtype=float)] + ([] if psi_rom is None else [np.asarray(psi_rom, dtype=float)])
+            contributions = self._derivative_contributions(cands)
+        c, c_rom = contributions[0], (None if psi_rom is None else contributions[1])
+
+        def norm(key, v):
+            v = np.atleast_1d(v)
+            return float(abs(v[0])) if key == 'alpha' else float(np.sqrt(comm.allreduce(float(v @ v), op=MPI.SUM)))
+
+        errors = {}
+        for key in c_fom:
+            ref = norm(key, c_fom[key])
+            diff = norm(key, np.atleast_1d(c[key]) - np.atleast_1d(c_fom[key]))
+            if c_rom is None:
+                vs_rom = np.nan
+            else:
+                rom_norm = norm(key, c_rom[key])
+                vs_rom = norm(key, np.atleast_1d(c[key]) - np.atleast_1d(c_rom[key])) / rom_norm \
+                    if rom_norm > 0.0 else np.nan
+            errors[key] = (diff, diff / ref if ref > 0.0 else np.nan, ref, float(vs_rom))
+        return errors
+
+    @staticmethod
+    def _contribution_string(errors):
+        return ", ".join("{} relative {:.3e}".format(k, e[1]) for k, e in errors.items())
 
     def _log_adjoint(self, kind, start_time):
         # which adjoint ('rom' or 'fom') the derivative of the last evaluation

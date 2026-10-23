@@ -445,6 +445,10 @@ def test_windtunnel_adjoint_errors(in_tmp_dir, kind, eta_threshold):
         assert fom_norm > 0.0 and absolute > 0.0 and rom_walltime > 0.0
         assert relative == pytest.approx(absolute / fom_norm, rel=1e-12)
         assert relative < 1.0
+        # the error of the ROM adjoint's contribution to dD/dalpha, small where the vectors are far apart
+        (d_eval, d_row, d_accepted, contribution), = ds.adjoint_derivative_errors
+        assert (d_eval, d_row, d_accepted) == (eval_idx, row, True) and set(contribution) == {"alpha"}
+        assert contribution["alpha"][1] < 1e-4
 
 
 @pytest.mark.parametrize("kind, eta_threshold", [("euler", 1e-9), ("rans", 1e-7)])

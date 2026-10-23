@@ -18,6 +18,9 @@ The main entry points:
 - `dragonfly_sim.core.farfield.TransverseFarfield`: the transverse (riemann2) far field
 - `dragonfly_sim.core.reduced_order_model`: `ReducedOrderModel`, `LSPGSolver` and `dragonfly_sim.core.pod`:
   `SnapshotMatrix`, `PODBasis` (see [Reduced-order modeling](reduced_order_modeling.md))
+- `dragonfly_sim.core.hyper_reduction`: `HyperReductionComparison`, `DEIM`, `MDEIM`, `RestrictedJacobian`,
+  `HyperReducedLSPG`, the DEIM/MDEIM comparison beside the ROM (see
+  [Reduced-order modeling](reduced_order_modeling.md#hyper-reduction-comparison))
 - `dragonfly_sim.utils.mesh_io_utils`: mesh input (and boundary tags) from XDMF, gmsh or structured CGNS grids (`load_dolfinx_mesh`,
   `cgns_to_dolfinx_mesh`, `read_cgns_planar`, `read_cgns_volume`)
 - `dragonfly_sim.utils.filewriter.FileWriter`: VTX output for ParaView

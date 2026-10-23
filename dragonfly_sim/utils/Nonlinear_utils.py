@@ -79,6 +79,13 @@ class NonlinearProblem_mod:
         self._A = create_matrix(self.a, kind=self.mat_type)
         self._b = create_vector(extract_function_spaces(self.L))
 
+        # observer(x) -> bool, called by J with the iterate x before the
+        # Jacobian is assembled (CompressibleEulerModel.record_fom_jacobians):
+        # it may assemble self._A at x itself, e.g. to read the steady Jacobian
+        # of a pseudo-time step, and returns True when self._A then holds the
+        # Newton Jacobian at x, so that J skips its own assembly.
+        self.jacobian_observer = None
+
     @property
     def L(self) -> Form:
         """Compiled linear form (the residual form)"""
@@ -139,10 +146,11 @@ class NonlinearProblem_mod:
         # print("Call J in NonlinearProblem_mod")
         # print("A shape in J: {}".format(A.getSize()))
 
-        with _PROF.phase("assemble:jacobian"):
-            self._A.zeroEntries()
-            assemble_matrix(self._A, self._a, self.bcs)
-            self._A.assemble()
+        if self.jacobian_observer is None or not self.jacobian_observer(x):
+            with _PROF.phase("assemble:jacobian"):
+                self._A.zeroEntries()
+                assemble_matrix(self._A, self._a, self.bcs)
+                self._A.assemble()
 
         # SNESNewtonSolver hands in self._A itself; any other matrix gets a
         # copy.

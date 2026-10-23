@@ -1,6 +1,11 @@
 # Release notes
 
 ## 0.2.0 (unreleased)
+- Hyper-reduction comparison (`core/hyper_reduction.py`): `DG_windtunnel_model(hyper_reduction=
+  HyperReductionComparison(...))` runs DEIM and/or MDEIM of the LSPG Jacobian beside the POD ROM, forward and
+  adjoint, for every model including the condensed-gradient ones, and records their accuracy, timing and phases
+  in the DataStore. The optimizer's solutions and adjoints are unchanged. Restricted (sampled-entity) assembly in
+  `FormManager` (`restrict`, `entity_set_for_cells`, `cell_neighbours`).
 - Output-sensitivity weights on the `local_weighted` POD snapshot distance: `utils/dv_sensitivity.py` reads the
   total derivatives of the objective and constraints from the optimizer (`attach_total_derivative_probe`) and
   `ReducedOrderModel(distance_weighting=...)` weights the distance with them. Unweighted unless a probe supplies

@@ -1,8 +1,9 @@
 """
-Re-run the RANS / time-integration / far-field / regression / POD modules under
-mpirun, so a serial pytest invocation also covers the distributed path
+Re-run the RANS / time-integration / far-field / regression / POD / hyper-reduction
+modules under mpirun, so a serial pytest invocation also covers the distributed path
 (ghost cells in the Green-Gauss sums, the gathered wall geometry, the
-partition-independent checkpoints, the shell dR/dx operator).
+partition-independent checkpoints, the shell dR/dx operator, the facets of sampled
+cells owned by another rank).
 """
 import os
 import shutil
@@ -26,6 +27,7 @@ LAUNCHES = {
     "caches_and_moments": ["test_mesh_deformation_cache.py", "test_incoming_state_converged.py",
                            "test_meshwarping_cache.py", "test_moments.py", "test_adjoint_reuse.py",
                            "test_boundary_tags.py"],
+    "hyper_reduction": ["test_hyper_reduction.py"],
 }
 TIMEOUT = 900
 

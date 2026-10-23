@@ -534,6 +534,8 @@ class ReducedOrderModel:
         self.scales = None
         self.last_solver = None
         self.adjoint = None
+        # how the basis of the last solve was built (basis_settings)
+        self._basis_settings = None
 
     # ------------------------------------------------------------------
     # Set-up and weights
@@ -701,13 +703,51 @@ class ReducedOrderModel:
             PETSc.Sys.Print("ROM: empty POD basis; skipping the ROM solve")
             return None
 
+        self._basis_settings = self._settings_of_last_basis()
+
         model.set_up_solver()
         with _PROF.phase("rom:weights"):
-            S = self._diagonal(model, mass_power=-0.5, scale_power=-1.0)
-        solver = LSPGSolver(self.pod.basis, comm, W=None if self.W is None else self.W.w, S=S,
-                            mean=self.pod.mean, rtol=self.newton_rtol, atol=self.newton_atol,
-                            max_it=self.newton_max_it, stall_window=self.stall_window,
-                            stall_rtol=self.stall_rtol, line_search=self.line_search)
+            S = self.residual_weight(model)
+        solver = self.make_solver(LSPGSolver, self.pod.basis, S, self.pod.mean, comm)
+        try:
+            result = self.run_passes(model, solver, t0)
+        except BaseException:
+            if S is not None:
+                S.destroy()
+            raise
+        self.last_solver = solver
+        # Kept for every solve that built a basis, accepted or not: a rejected solve's is not used
+        # for the derivative, but can be evaluated at the full-order solution and compared with
+        # the full-order adjoint. The basis stays valid until the next solve rebuilds it, which
+        # discards this adjoint first (the windtunnel model also keeps it across the derivative
+        # re-run of a rejected design, which skips the ROM).
+        self.adjoint = LSPGAdjoint(self.pod.basis, S, comm, parameter_vector, result.solution,
+                                   accepted=result.accepted)
+        return result
+
+    def residual_weight(self, model):
+        """S, the diagonal weight of the LSPG residual norm ||S r|| on the
+        model's current mesh, as a new Vec (None: unweighted)."""
+        return self._diagonal(model, mass_power=-0.5, scale_power=-1.0)
+
+    def make_solver(self, solver_class, V, S, mean, comm, **kwargs):
+        """A `solver_class` (LSPGSolver or a subclass) on basis V with this
+        ROM's inner product, residual weight S, offset `mean` and Newton
+        settings; `kwargs` go to the subclass."""
+        return solver_class(V, comm, W=None if self.W is None else self.W.w, S=S, mean=mean,
+                            rtol=self.newton_rtol, atol=self.newton_atol, max_it=self.newton_max_it,
+                            stall_window=self.stall_window, stall_rtol=self.stall_rtol,
+                            line_search=self.line_search, **kwargs)
+
+    def run_passes(self, model, solver, t0):
+        """
+        The LSPG passes of a solve with `solver` (make_solver), from the
+        model's current u_vec, and the verdict: a ROMResult (walltime from
+        t0). The model's u_vec holds the solution afterwards. The solver is
+        destroyed; its counters stay readable. Shared by solve() and the
+        hyper-reduced comparison solves (core/hyper_reduction.py), which
+        therefore stop and are accepted by the same rules. Collective.
+        """
         # Up to max_outer_iterations passes, each restarted from the current
         # state; converged when the pass's last |g| is below
         # max(newton_atol, g_conv_limit g0), g0 the solver's first |g| (the
@@ -735,13 +775,8 @@ class ReducedOrderModel:
             else:
                 PETSc.Sys.Print("ROM: {} LSPG passes without |g| < {:.1e} |g0| (last |g| {:.6e}, g0 {})".format(
                     self.max_outer_iterations, self.g_conv_limit, solver.last_g_norm, solver.g0))
-        except BaseException:
-            if S is not None:
-                S.destroy()
-            raise
         finally:
             solver.destroy()
-        self.last_solver = solver
         solver.n_iterations = iterations
 
         # one verdict line for every way out of the loop
@@ -758,14 +793,27 @@ class ReducedOrderModel:
                            walltime=perf_counter() - t0)
         PETSc.Sys.Print("ROM relative residual norm eta: {} (||r||: {}); {} iterations, wall time {}".format(
             eta, residual_norm, iterations, result.walltime))
-        # Kept for every solve that built a basis, accepted or not: a rejected solve's is not used
-        # for the derivative, but can be evaluated at the full-order solution and compared with
-        # the full-order adjoint. The basis stays valid until the next solve rebuilds it, which
-        # discards this adjoint first (the windtunnel model also keeps it across the derivative
-        # re-run of a rejected design, which skips the ROM).
-        self.adjoint = LSPGAdjoint(self.pod.basis, S, comm, parameter_vector, result.solution,
-                                   accepted=result.accepted)
         return result
+
+    def _settings_of_last_basis(self):
+        if self.pod.snapshot_weights is None:
+            return {'basis_mode': 'global'}
+        return {'basis_mode': 'local_weighted',
+                'design_parameters': np.vstack(self.pod.snapshot_matrix.snapshot_list_parameters).copy(),
+                'design_weights': self.pod.snapshot_weights.copy()}
+
+    def basis_settings(self):
+        """
+        How the basis of the last solve was built, for the bases of
+        hyper-reduction over the same designs, which follow it
+        (core/hyper_reduction.py): {'basis_mode': 'global'}, or for a
+        local_weighted basis {'basis_mode': 'local_weighted',
+        'design_parameters': the accepted snapshots' parameter vectors (rows),
+        'design_weights': their weights}. A local_weighted ROM with a single
+        snapshot builds its basis like 'global'. None before the first solve
+        that built a basis.
+        """
+        return self._basis_settings
 
     def destroy(self):
         self.discard_adjoint()

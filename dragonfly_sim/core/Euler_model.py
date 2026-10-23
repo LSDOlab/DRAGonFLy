@@ -746,6 +746,47 @@ class CompressibleEulerModel():
         finally:
             term.inv_cfl.value, term.inv_dt.value = saved
 
+    @contextlib.contextmanager
+    def record_fom_jacobians(self, sink, max_jacobians=None):
+        """
+        Within this block, the steady Jacobian at each of the first
+        `max_jacobians` (None: all) Newton iterates of the solver is handed to
+        sink(A), A the Newton problem's matrix (problem._A; the condensed dR/dU
+        for a reconstructed gradient), valid during the call only. These are
+        the training snapshots of hyper-reduction (core/hyper_reduction.py).
+
+        Without time terms the Newton Jacobian is the steady one and costs
+        nothing extra. With pseudo-time continuation the steady Jacobian (time
+        terms off, steady_residual) is assembled first and the Newton Jacobian
+        after it, so a recorded iterate costs two assemblies. Needs the solver
+        (set_up_solver). Collective.
+        """
+        problem = getattr(self, "problem", None)
+        if problem is None:
+            raise RuntimeError("record_fom_jacobians needs the Newton problem: call set_up_solver() first")
+        count = [0]
+
+        def observe(x):
+            if max_jacobians is not None and count[0] >= max_jacobians:
+                return False
+            count[0] += 1
+            problem.jacobian_observer = None
+            try:
+                with _PROF.phase("rom:hr_harvest"):
+                    with self.steady_residual():
+                        problem.J(x, problem._A)
+                    sink(problem._A)
+            finally:
+                problem.jacobian_observer = observe
+            # problem._A holds the Newton Jacobian at x only without time terms
+            return self.time_integrator is None
+
+        problem.jacobian_observer = observe
+        try:
+            yield
+        finally:
+            problem.jacobian_observer = None
+
     def state_scale_expressions(self):
         """
         Typical magnitudes of the state components: the free-stream

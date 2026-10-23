@@ -33,7 +33,7 @@ from mpi4py import MPI
 from dragonfly_sim.core.mesh_manager import Mesh
 from dragonfly_sim.core.Euler_model import CompressibleEulerModel
 from dragonfly_sim.utils.Euler_utils import flux
-from dragonfly_sim.core.form_manager import CELL_TAG, INTERIOR_FACET_TAG
+from dragonfly_sim.core.form_manager import CELL_TAG, INTERIOR_FACET_TAG, EntitySet
 
 _MPI_CHILD_ENV = "FORM_MANAGER_TEST_MPI_CHILD"
 
@@ -199,6 +199,149 @@ class TestMeasures:
         j_ref = global_sum(comm, np.abs(assemble_mat(
             ufl.derivative(reference, model.u_vec)).to_scipy().data).sum())
         assert j_tagged == j_ref
+
+
+class TestRestriction:
+    """The restricted twin (FormManager.restrict) of hyper-reduction: the same compiled
+    form, bound over a subset of the entities."""
+
+    def test_restricted_all_entities_matches_fom(self):
+        """restrict() over every entity reproduces dolfinx.fem.form exactly."""
+        model = build_model()
+        comm = model.mesh_obj.mesh.comm
+        forms = model.forms
+        forms.compiled("J", lambda: ufl.derivative(forms.build_residual(), model.u_vec))
+        twin = forms.restrict(entity_set=forms.entity_set_all(boundary_tags=[WALL_TAG]))
+        fom = global_sum(comm, np.abs(assemble_mat(forms.compiled("J")).to_scipy().data).sum())
+        restricted = global_sum(comm, np.abs(assemble_mat(twin.compiled("J")).to_scipy().data).sum())
+        assert restricted == fom
+
+    def test_restricted_twin_shares_the_parent_kernel(self):
+        """No re-JIT: the twin binds the parent's UFL expression and kernel."""
+        model = build_model()
+        forms = model.forms
+        forms.compiled("F_physical", lambda: forms.build_residual())
+        twin = forms.restrict(entity_set=forms.entity_set_all(boundary_tags=[WALL_TAG]))
+        twin.compiled("F_physical")
+        assert twin._kernels is forms._kernels
+        assert twin.ufl_form("F_physical") is forms.ufl_form("F_physical")
+
+    def test_restricted_subset_touches_only_sampled_rows(self):
+        """
+        The guard against ignored entity lists (create_form applies them only to
+        integrals with a non-default subdomain id): with the integrals over a subset of
+        the interior facets alone, only the rows of the cells next to them are written.
+        (Facets: at p = 0 the cell integral of the residual vanishes, grad v = 0.)
+        """
+        model = build_model()
+        forms = model.forms
+        msh = model.mesh_obj.mesh
+        tdim = msh.topology.dim
+        forms.compiled("F_physical", lambda: forms.build_residual())
+        facets = _owned_interior_facets(msh)[::5]
+        twin = forms.restrict(entity_set=EntitySet(
+            msh, cells=np.zeros(0, dtype=np.int32), interior_facets=facets, exterior_facets_by_tag={}))
+        b = assemble_vec(twin.compiled("F_physical")).array
+        touched = np.nonzero(np.abs(owned_slice(model, b)) > 0.0)[0]
+        # the owned cells next to a sampled facet of any rank (a facet owned by another rank
+        # reaches this rank's rows through the ghost accumulation)
+        f_to_c = msh.topology.connectivity(tdim - 1, tdim)
+        marker = dolfinx.la.vector(msh.topology.index_map(tdim), 1, dtype=np.int32)
+        marker.array[:] = 0
+        for f in facets:
+            marker.array[f_to_c.links(int(f))] = 1
+        marker.scatter_reverse(dolfinx.la.InsertMode.add)
+        cells = np.flatnonzero(marker.array[:msh.topology.index_map(tdim).size_local]).astype(np.int32)
+        assert np.all(np.isin(touched, forms.dofs_for_cells(cells)))
+        comm = msh.comm
+        assert 0 < global_sum(comm, touched.size) < global_sum(comm, owned_slice(model, b).size)
+
+    def test_rebind_changes_the_sample_set(self):
+        model = build_model()
+        forms = model.forms
+        msh = model.mesh_obj.mesh
+        forms.compiled("F_physical", lambda: forms.build_residual())
+        facets = _owned_interior_facets(msh)
+        no_cells = np.zeros(0, dtype=np.int32)
+        twin = forms.restrict(entity_set=EntitySet(
+            msh, cells=no_cells, interior_facets=facets[::5], exterior_facets_by_tag={}))
+        few = np.count_nonzero(owned_slice(model, assemble_vec(twin.compiled("F_physical")).array))
+        twin.rebind(EntitySet(msh, cells=no_cells, interior_facets=facets, exterior_facets_by_tag={}))
+        many = np.count_nonzero(owned_slice(model, assemble_vec(twin.compiled("F_physical")).array))
+        assert 0 < global_sum(msh.comm, few) < global_sum(msh.comm, many)
+
+
+def _owned_interior_facets(msh):
+    tdim = msh.topology.dim
+    msh.topology.create_connectivity(tdim - 1, tdim)
+    f_to_c = msh.topology.connectivity(tdim - 1, tdim)
+    n_owned = msh.topology.index_map(tdim - 1).size_local
+    return np.array([f for f in range(n_owned) if len(f_to_c.links(f)) == 2], dtype=np.int32)
+
+
+class TestDofEntityBridge:
+
+    def test_cells_for_dofs_inverts_dofs_for_cells(self):
+        model = build_model()
+        forms = model.forms
+        msh = model.mesh_obj.mesh
+        n_owned_cells = msh.topology.index_map(msh.topology.dim).size_local
+        cells = np.arange(0, n_owned_cells, 3, dtype=np.int32)
+        assert np.array_equal(np.sort(forms.cells_for_dofs(forms.dofs_for_cells(cells))), np.sort(cells))
+
+    def test_restricted_assembly_reproduces_sampled_rows_exactly(self):
+        """
+        entity_set_for_cells names every entity contributing to the sampled cells' rows
+        (their volume integral and every facet they touch, also facets owned by another
+        rank), so the restricted assembly's sampled rows equal the full ones exactly.
+        """
+        model = build_model()
+        forms = model.forms
+        msh = model.mesh_obj.mesh
+        n_owned_cells = msh.topology.index_map(msh.topology.dim).size_local
+        forms.compiled("F_physical", lambda: forms.build_residual())
+        fom = assemble_vec(forms.compiled("F_physical")).array
+        cells = np.arange(0, n_owned_cells, 4, dtype=np.int32)
+        twin = forms.restrict(entity_set=forms.entity_set_for_cells(cells))
+        restricted = assemble_vec(twin.compiled("F_physical")).array
+        rows = forms.dofs_for_cells(cells)
+        rows = rows[rows < owned_slice(model, fom).size]
+        assert np.array_equal(fom[rows], restricted[rows])
+        # a restriction, not a full assembly: fewer rows touched
+        comm = msh.comm
+        assert global_sum(comm, np.count_nonzero(owned_slice(model, restricted))) < \
+            global_sum(comm, np.count_nonzero(owned_slice(model, fom)))
+
+    def test_cell_neighbours_is_the_facet_ring(self):
+        """cell_neighbours adds every facet neighbour, also across ranks: the global count
+        matches a serial computation on the global cell indices."""
+        model = build_model()
+        forms = model.forms
+        msh = model.mesh_obj.mesh
+        tdim = msh.topology.dim
+        imap = msh.topology.index_map(tdim)
+        comm = msh.comm
+        # the owned cells whose global index is a multiple of 7, and their ring
+        globals_owned = imap.local_to_global(np.arange(imap.size_local, dtype=np.int32))
+        cells = np.flatnonzero(globals_owned % 7 == 0).astype(np.int32)
+        ring = forms.cell_neighbours(cells)
+        assert np.all(np.isin(cells, ring))
+        ring_global = np.sort(np.concatenate(comm.allgather(globals_owned[ring])))
+        # serial reference over the facet adjacency of all (owned and ghost) cells
+        msh.topology.create_connectivity(tdim, tdim - 1)
+        msh.topology.create_connectivity(tdim - 1, tdim)
+        c_to_f, f_to_c = msh.topology.connectivity(tdim, tdim - 1), msh.topology.connectivity(tdim - 1, tdim)
+        n_all = imap.size_local + imap.num_ghosts
+        globals_all = imap.local_to_global(np.arange(n_all, dtype=np.int32))
+        pairs = set()
+        for c in range(n_all):
+            for f in c_to_f.links(c):
+                for d in f_to_c.links(int(f)):
+                    pairs.add((int(globals_all[c]), int(globals_all[d])))
+        pairs = set().union(*comm.allgather(pairs))
+        sampled = {g for g in range(imap.size_global) if g % 7 == 0}
+        expected = sampled | {d for c, d in pairs if c in sampled}
+        assert ring_global.tolist() == sorted(expected)
 
 
 @pytest.mark.skipif(shutil.which("mpirun") is None,

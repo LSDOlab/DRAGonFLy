@@ -26,8 +26,22 @@ derivatives of the drag and of the constraints that the optimizer computes anywa
 in that distance by ||dF/dp_j||. The weights come from the previous design point. Before the first gradient
 there are none, and the distance is unweighted (as it is without the probe).
 
-    OMP_NUM_THREADS=1 mpirun -n 8 python wing_opt_rans_pod.py
+    OMP_NUM_THREADS=1 mpirun -n 8 python wing_opt_rans_pod.py [--hyper-reduction {both,deim,mdeim,none}]
+
+DEIM and MDEIM (core/hyper_reduction.py) run beside the ROM for comparison (--hyper-reduction, default both):
+trained on the Jacobians of the full-order solves, they solve every design the ROM solves, and the adjoint of
+every derivative, on its basis. Their accuracy, timing and phase profiles (records 'deim', 'deim_offline',
+'adjoint_deim' and the MDEIM ones) are stored in the DataStore (DEIM_* / MDEIM_*). The optimization itself is
+unchanged. examples/hyperreduction_comparison.py summarizes the saved DataStore.
+
+Memory. An MDEIM snapshot is the whole Jacobian, vec(S A): the condensed RANS Jacobian couples every cell to the
+cells two facets away (25 for an interior hex), ~900 nonzeros per cell, ~1.6e8 on the L3 grid (estimated), so
+~1.3 GB per snapshot over all ranks. The stored basis holds mdeim_max_rank of them (twice that while a snapshot
+is added), the harvest buffer mdeim_max_snapshots_per_solve + 1, and building the operators one more (plus its
+sparsity), hence the small values below: ~6 * 1.3 GB stored, ~16 GB at peak. DEIM's snapshots are state-sized
+(1.1e6 entries): 200 stored and 11 * rb_size buffered, ~3 GB.
 """
+import argparse
 import os
 
 import numpy as np
@@ -44,6 +58,7 @@ from dragonfly_sim.utils.mesh_io_utils import load_dolfinx_mesh
 from dragonfly_sim.core.windtunnel_model import DG_windtunnel_model
 from dragonfly_sim.core.RANS_model import CompressibleRANSModel
 from dragonfly_sim.core.reduced_order_model import ReducedOrderModel
+from dragonfly_sim.core.hyper_reduction import HyperReductionComparison
 from dragonfly_sim.utils.dv_sensitivity import attach_total_derivative_probe
 from dragonfly_sim.core.postprocessor import DG_postprocessor
 
@@ -57,6 +72,11 @@ MESH_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "
 
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="RANS wing drag minimization with the POD ROM")
+    parser.add_argument("--hyper-reduction", choices=["both", "deim", "mdeim", "none"], default="both",
+                        help="run DEIM and/or MDEIM beside the ROM for comparison (default both)")
+    args = parser.parse_args()
+
     # The Simple Transonic Wing's L3 grid: 12 structured blocks in CGNS, read with PyVista and merged
     # into one hexahedral dolfinx mesh in memory (181,152 cells). The boundary conditions in the file
     # are not used; the wall is found geometrically. wing_vol_L2.cgns and wing_vol_L1.cgns are the
@@ -161,6 +181,16 @@ if __name__ == '__main__':
     rom = ReducedOrderModel(rb_size=10, basis_mode='local_weighted', eta_threshold=1e-15,
                             distance_weighting='total_derivative', cubic_cutoff=0.8)
 
+    # DEIM and MDEIM beside the ROM, for comparison only (their bases follow the ROM's local_weighted one).
+    # DEIM: deim_n_modes >= rb_size (its basis spans S A V), the sandbox's 100 modes; MDEIM: the memory
+    # of its Jacobian-sized snapshots sets n_modes, max_rank and the harvest (module docstring)
+    hr_methods = {"none": (), "deim": ("deim",), "mdeim": ("mdeim",), "both": ("deim", "mdeim")}[
+        args.hyper_reduction]
+    hyper_reduction = HyperReductionComparison(methods=hr_methods, deim_n_modes=100,
+                                               deim_max_snapshots_per_solve=10, mdeim_n_modes=4,
+                                               mdeim_max_rank=6, mdeim_max_snapshots_per_solve=1) \
+        if hr_methods else None
+
     csdl_flow_model = DG_windtunnel_model(mesh_from_file, boundary_dict, shape,
                                           mesh_inner_bdry_function=wing_inner_bdry_function,
                                           poly_order=poly_o, gamma=1.4,
@@ -173,9 +203,11 @@ if __name__ == '__main__':
                                           # adjoint against the full-order one for every derivative (also
                                           # where the ROM is rejected, evaluated at the full-order state;
                                           # the optimizer's adjoint is unchanged), and the phase breakdown
-                                          # (assembly, linear solves, ROM) of every solve
+                                          # (assembly, linear solves, ROM, and the DEIM/MDEIM solves and
+                                          # adjoints of the comparison) of every solve
                                           compute_all_adjoint_errors=True,
-                                          profile_phases=True)
+                                          profile_phases=True,
+                                          hyper_reduction=hyper_reduction)
     # Pseudo-transient continuation from the free stream needs many more steps
     # than a plain Newton solve (~60 for a 2D airfoil at M 0.7; more for a
     # transonic wing).

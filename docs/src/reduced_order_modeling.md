@@ -231,9 +231,82 @@ goes back to the optimizer is the same with and without the flag.
   design that CSDL does before the derivative.
 
 Both are therefore errors of the adjoint approximation alone: state and right-hand side are the same for the two
-adjoints. The extra solve costs about one adjoint per output row, so the flag is a diagnostic. With
+adjoints. The distance between the vectors overstates what reaches the derivative: the reduced adjoint
+lives in span($S^2 A V$), a few directions built from state snapshots, which cannot hold the full-order adjoint
+field (on the test cases the best vector in that span is ~98 % away from it), while its contribution to the
+derivative, $(\partial R/\partial x)^T \psi$, is accurate to ~$10^{-6}$. `data_store.adjoint_derivative_errors`
+records that contribution's error for every input of the model (`alpha`, and `mesh_node_motions` in the mesh
+coordinate space, before the mesh warping and shape parameterization), next to each `adjoint_errors` entry; with
+`profile_phases=True` its cost is the `adjoint_contributions` record. The extra solve costs about one adjoint per output row, so the flag is a diagnostic. With
 `profile_phases=True` the phases of these reference solves are recorded as `adjoint_fom_reference` and
 `adjoint_rom_reference`, apart from the `adjoint_fom` and `adjoint_rom` records of the adjoint the optimizer used.
+
+## Hyper-reduction (comparison)
+
+The LSPG solve above assembles the full residual and the full Jacobian $A$ at every iteration, so its cost per
+iteration scales with the mesh. Hyper-reduction approximates those operators from a few sampled rows or
+entries. `DG_windtunnel_model(hyper_reduction=...)` runs DEIM {cite:p}`chaturantabut2010nonlinear` and/or MDEIM
+{cite:p}`negri2015efficient` **beside** the ROM, to measure how they would perform in an optimization. They solve
+every design the ROM solves, and the adjoint of every derivative, and are recorded against the ROM and the FOM.
+The optimizer's solutions and adjoints are those without them.
+
+```python
+from dragonfly_sim.core.hyper_reduction import HyperReductionComparison
+
+rom = ReducedOrderModel(rb_size=10, basis_mode='local_weighted')
+hr = HyperReductionComparison(methods=('deim', 'mdeim'), deim_n_modes=100, mdeim_n_modes=10)
+model = DG_windtunnel_model(mesh, boundary_dict, ..., reduced_order_model=rom, hyper_reduction=hr)
+```
+
+**What is approximated.** The residual stays exact; residual DEIM was measured in the project sandbox and does
+not work on these problems. The residual hardly compresses, and interpolating it moved the solution by
+5–15 %. Only $S A V$, the weighted Jacobian on the POD basis, is approximated:
+
+- **DEIM**: a POD basis $U$ of Jacobian actions $S A v_j$ along the POD basis, with greedy points $P$ (rows).
+  $S A V \approx U C$, with $C = (P^T U)^+ P^T S A V$, which needs only the rows $P$ of $A$.
+- **MDEIM**: a POD basis $\{\Phi_l\}$ of the scaled Jacobians $\mathrm{vec}(S A)$, with points $P$ (entries).
+  $S A \approx \sum_l c_l \Phi_l$, with $c = (P^T \Phi)^+ P^T \mathrm{vec}(S A)$. The products $\Phi_l V$ and
+  their Gram matrices are formed once per design, so the reduced system costs no product with $A$.
+
+The snapshots are scaled by the LSPG residual weight $S$ (rows). Without it, the basis would neglect the rows of
+small components, such as the SA variable. The sampling stays exact, since $(SA)_{ij} = S_i A_{ij}$.
+
+$S A V$ is also LSPG's test basis. The hyper-reduced solve therefore stops where $\widetilde{(SAV)}^T S r = 0$,
+which differs from the ROM's solution by as much as the approximation tilts the test space. On the test cases
+MDEIM tracks the ROM to $10^{-9}$–$10^{-12}$ and DEIM is far less accurate, in line with the sandbox's
+measurements. The adjoint is the LSPG adjoint above, with $S A V$ replaced by its approximation at the
+optimizer's state.
+
+**Sampled assembly.** A sampled row belongs to a cell. Its row is exact when that cell and every facet of it are
+integrated, including facets shared with unsampled cells and facets owned by another rank.
+`FormManager.restrict` binds the full-order kernels over such an entity set; `entity_set_for_cells` builds it.
+With a reconstructed gradient (MUSCL, RANS), $A = A_{UU} + A_{UG} M^{-1} B_{GU}$. The sampled rows then read the
+gradient of the sampled cells and of their facet neighbours. $A_{UU}$ and $A_{UG}$ are integrated over the
+sampled cells $C_1$, and $B_{GU}$ over $C_2 = C_1$ plus one facet ring (`cell_neighbours`), so the product's
+rows on $C_1$ are exact too.
+
+**Training.** During every FOM solve of a new design, the steady Jacobian at up to
+`*_max_snapshots_per_solve` Newton iterates is harvested (`CompressibleEulerModel.record_fom_jacobians`), along
+with the Jacobian at the converged state. With pseudo-time continuation that costs one extra assembly per
+harvested iterate. The snapshots are added after the comparison of their own design, so that comparison stays
+out of sample, and only where the ROM keeps a snapshot of the design.
+
+**Bases follow the ROM.** The DEIM and MDEIM bases use the ROM's `basis_mode`. For a `local_weighted` ROM, every
+snapshot of a design carries the weight that design has in the ROM's basis
+(`ReducedOrderModel.basis_settings`).
+
+**Records** (`data_store`, per method `<M>` = DEIM/MDEIM): `<M>_walltime` (online and offline), the relative
+residual, iterations, coefficients and outputs (`<M>_outputs`, with
+`output_errors(name, kind='MDEIM', reference='ROM')`), the coefficient and L2 state errors against the FOM and
+the ROM, the operator sizes and conditioning (`<m>_operator_info`), the adjoint errors (`<m>_adjoint_errors`)
+and those of the adjoints' contributions to the derivative (`<m>_adjoint_derivative_errors`), and the snapshot
+counts. With `profile_phases=True` the phases are recorded as `<m>_offline`, `<m>` and
+`adjoint_<m>`; the sampled assembly appears as `assemble:jacobian_sampled`. `validate=True` adds, at the
+optimizer's solution, the sampled assembly's exactness and the Jacobian approximation error, at the cost of
+full assemblies. `examples/hyperreduction_comparison.py` summarizes a saved DataStore, and
+`examples/wing_opt_rans_pod.py --hyper-reduction both` runs the comparison in the RANS wing optimization.
+
+Note that the `forward` phase record of an evaluation then includes the comparison's solves and harvesting.
 
 ## What to expect
 

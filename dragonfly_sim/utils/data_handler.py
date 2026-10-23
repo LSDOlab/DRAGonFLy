@@ -70,6 +70,15 @@ class DataStore():
         # solves of one evaluation in CSDL's order (objective and constraint rows).
         self.adjoint_errors = []
 
+        # With every adjoint_errors entry, the error the ROM adjoint puts into the derivative,
+        # which the distance between the adjoint vectors does not measure (a reduced adjoint can
+        # be far from the full-order one and still give its derivative): (eval_idx, output row,
+        # whether the ROM solve was accepted, {input: (|c - c_fom|, relative to |c_fom|, |c_fom|,
+        # nan)}), c = (dR/dinput)^T psi the adjoint's contribution to the derivative with respect
+        # to the model input ('alpha'; 'mesh_node_motions' in the mesh coordinate space, before
+        # the mesh warping and shape parameterization), the 2-norm over the input.
+        self.adjoint_derivative_errors = []
+
         # Phase timing (utils/solver_profiling.py), when profiling is on: per
         # forward evaluation ('forward': all of solve_residual_equations,
         # containing the 'rom' and 'fom' flow solves, which are also recorded
@@ -96,14 +105,59 @@ class DataStore():
         self.FOM_outputs = {}
         self.ROM_outputs = {}
 
+        # Hyper-reduction comparison (core/hyper_reduction.py, DG_windtunnel_model's
+        # hyper_reduction): DEIM and MDEIM solve every design the ROM solves, on its basis
+        # and from its warm start, beside it; the optimizer never uses them. Per method
+        # (<M> = DEIM / MDEIM, <m> its lower case), per solve:
+        #   <M>_walltime            (eval_idx, online solve s, offline s: basis, points,
+        #                           sampled assembly set-up and operators)
+        #   <m>_relative_residuals  (eval_idx, eta)
+        #   <M>_force_coefficients  (eval_idx, c_d, c_l, c_m_1, ...)
+        #   <M>_meets_threshold, <M>_lspg_converged
+        #                           (eval_idx, bool), the ROM's criteria
+        #   <m>_iterations          (eval_idx, LSPG iterations)
+        #   <m>_coefficient_errors  (eval_idx, (dc_d, dc_l, dc_m...) against the FOM or None
+        #                           where the FOM did not run, (...) against the ROM)
+        #   <m>_l2_errors           (eval_idx, |u - u_FOM|, relative, the same on the wall,
+        #                           relative, and |u - u_ROM| relative to |u_ROM|), the L2
+        #                           norms of compute_L2_norm; nan where the FOM did not run
+        #   <m>_operator_info       (eval_idx, {n_modes, n_points, sampled_cells,
+        #                           assembled_cells, total_cells, conditioning, n_snapshots})
+        #   <m>_validation          (eval_idx, {...}) with validate=True
+        #                           (utils/hyper_reduction_validation.py)
+        #   <M>_outputs             {name: [(eval_idx, value)]} like ROM_outputs
+        # per adjoint solve (output row) of a design it solved:
+        #   <m>_adjoint_errors      (eval_idx, row, |psi - psi_FOM|, relative to |psi_FOM|,
+        #                           |psi - psi_ROM| / |psi_ROM| or nan, wall time), at the
+        #                           optimizer's state
+        #   <m>_adjoint_derivative_errors
+        #                           (eval_idx, row, {input: (|c - c_FOM|, relative to |c_FOM|,
+        #                           |c_FOM|, |c - c_ROM| / |c_ROM| or nan)}), the errors of its
+        #                           contribution c to the derivative, as adjoint_derivative_errors
+        # and per FOM solve it harvested Jacobians from:
+        #   <m>_snapshots           (eval_idx, offered, added, stored)
+        # Their phases are in phase_times as '<m>_offline', '<m>' and 'adjoint_<m>'; the
+        # derivative contributions of every compared adjoint as 'adjoint_contributions'.
+        for m in ("deim", "mdeim"):
+            M = m.upper()
+            for name in (M + "_walltime", m + "_relative_residuals", M + "_force_coefficients",
+                         M + "_meets_threshold", M + "_lspg_converged", m + "_iterations",
+                         m + "_coefficient_errors", m + "_l2_errors", m + "_operator_info",
+                         m + "_validation", m + "_adjoint_errors", m + "_adjoint_derivative_errors",
+                         m + "_snapshots"):
+                setattr(self, name, [])
+        self.DEIM_outputs = {}
+        self.MDEIM_outputs = {}
+
         # Number of DoFs in simulation
         self.fe_dofs = 0
         # Number of design parameters in optimization
         self.num_var = 0
 
     def record_outputs(self, kind, eval_idx, values):
-        """Append the named output values of one evaluation; kind is 'FOM' or 'ROM'."""
-        store = {"FOM": self.FOM_outputs, "ROM": self.ROM_outputs}[kind]
+        """Append the named output values of one evaluation; kind is 'FOM', 'ROM',
+        'DEIM' or 'MDEIM'."""
+        store = getattr(self, kind + "_outputs")
         for name, value in values.items():
             store.setdefault(name, []).append((eval_idx, float(value)))
 
@@ -128,12 +182,15 @@ class DataStore():
     def output_names(self):
         return list(self.ROM_outputs) if self.ROM_outputs else list(self.FOM_outputs)
 
-    def output_errors(self, name, relative=True):
-        """(eval_idx, error) arrays of ROM - FOM (divided by |FOM| if relative)
-        of the output `name`, for the evaluations that have both. A repeated
-        eval_idx in the FOM record (the baseline solve) keeps its last entry."""
-        fom = {int(i): v for i, v in self.FOM_outputs.get(name, [])}
-        pairs = [(int(i), v, fom[int(i)]) for i, v in self.ROM_outputs.get(name, []) if int(i) in fom]
+    def output_errors(self, name, relative=True, kind="ROM", reference="FOM"):
+        """(eval_idx, error) arrays of kind - reference (divided by |reference| if
+        relative; ROM - FOM by default, kind and reference among 'FOM', 'ROM',
+        'DEIM', 'MDEIM') of the output `name`, for the evaluations that have both.
+        A repeated eval_idx in the reference record (the baseline solve) keeps its
+        last entry."""
+        fom = {int(i): v for i, v in getattr(self, reference + "_outputs").get(name, [])}
+        pairs = [(int(i), v, fom[int(i)]) for i, v in getattr(self, kind + "_outputs").get(name, [])
+                 if int(i) in fom]
         if not pairs:
             return np.zeros(0, dtype=int), np.zeros(0)
         idx, rom, fom_vals = (np.array(c) for c in zip(*pairs))
