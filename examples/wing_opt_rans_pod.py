@@ -28,9 +28,14 @@ there are none, and the distance is unweighted (as it is without the probe).
 
     OMP_NUM_THREADS=1 mpirun -n 8 python wing_opt_rans_pod.py [--hyper-reduction {both,deim,mdeim,none}]
 
+The ROM's basis concatenates a state and an adjoint basis (the optimizer's full-order adjoints are snapshots),
+and its reduced solve uses a hybrid test space (LSPG for the states, the adjoint basis for the adjoints), with
+the adjoint of those same equations.
+
 DEIM and MDEIM (core/hyper_reduction.py) run beside the ROM for comparison (--hyper-reduction, default both):
-trained on the Jacobians of the full-order solves, they solve every design the ROM solves, and the adjoint of
-every derivative, on its basis. Their accuracy, timing and phase profiles (records 'deim', 'deim_offline',
+trained on the Jacobians of the full-order solves, they solve every design the ROM solves, with its basis and
+hybrid test space, and the adjoint of every derivative, consistent with their own solves (linearized about their
+solutions, through the true Jacobian, which costs one full assembly per design). Their accuracy, timing and phase profiles (records 'deim', 'deim_offline',
 'adjoint_deim' and the MDEIM ones) are stored in the DataStore (DEIM_* / MDEIM_*). The optimization itself is
 unchanged. examples/hyperreduction_comparison.py summarizes the saved DataStore.
 
@@ -178,8 +183,16 @@ if __name__ == '__main__':
     # ||R||/||u|| below which the reduced solution replaces the full-order solve; the optimizer's ftol is 1e-6,
     # so 1e-8 leaves the reduced solution's error well below it. distance_weighting='total_derivative' is the
     # default and is spelled out for clarity: it only acts once the probe below has supplied weights.
+    #
+    # The full-order adjoints the optimizer solves (four output rows: drag and the three constraints) are
+    # snapshots too (adjoint_snapshots='concatenate'): every basis is a state basis of 5 vectors followed by an
+    # adjoint basis of 5, orthogonalized against it, and the test space of the reduced solve is hybrid: LSPG's
+    # S^2 A V for the state part, the adjoint basis itself for the adjoint part (test_space='hybrid'). The reduced
+    # adjoint is that of the same equations, so the derivative stays consistent with the reduced solve, and it
+    # holds the adjoint basis, which the state basis alone does not (core/reduced_order_model.py).
     rom = ReducedOrderModel(rb_size=10, basis_mode='local_weighted', eta_threshold=1e-15,
-                            distance_weighting='total_derivative', cubic_cutoff=0.8)
+                            distance_weighting='total_derivative', cubic_cutoff=0.8,
+                            adjoint_snapshots='concatenate', test_space='hybrid')
 
     # DEIM and MDEIM beside the ROM, for comparison only (their bases follow the ROM's local_weighted one).
     # DEIM: deim_n_modes >= rb_size (its basis spans S A V), the sandbox's 100 modes; MDEIM: the memory

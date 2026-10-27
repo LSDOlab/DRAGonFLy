@@ -79,6 +79,10 @@ class DataStore():
         # the mesh warping and shape parameterization), the 2-norm over the input.
         self.adjoint_derivative_errors = []
 
+        # Per full-order adjoint added as a ROM snapshot (ReducedOrderModel adjoint_snapshots):
+        # (eval_idx, output row, whether it added a basis direction, adjoint snapshots stored)
+        self.adjoint_snapshots = []
+
         # Phase timing (utils/solver_profiling.py), when profiling is on: per
         # forward evaluation ('forward': all of solve_residual_equations,
         # containing the 'rom' and 'fom' flow solves, which are also recorded
@@ -128,8 +132,9 @@ class DataStore():
         #   <M>_outputs             {name: [(eval_idx, value)]} like ROM_outputs
         # per adjoint solve (output row) of a design it solved:
         #   <m>_adjoint_errors      (eval_idx, row, |psi - psi_FOM|, relative to |psi_FOM|,
-        #                           |psi - psi_ROM| / |psi_ROM| or nan, wall time), at the
-        #                           optimizer's state
+        #                           |psi - psi_ROM| / |psi_ROM| or nan, wall time), psi the
+        #                           adjoint of its own solve (linearized about its solution),
+        #                           psi_FOM and psi_ROM the optimizer's state's
         #   <m>_adjoint_derivative_errors
         #                           (eval_idx, row, {input: (|c - c_FOM|, relative to |c_FOM|,
         #                           |c_FOM|, |c - c_ROM| / |c_ROM| or nan)}), the errors of its

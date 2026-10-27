@@ -1,6 +1,16 @@
 # Release notes
 
 ## 0.2.0 (unreleased)
+- ROM adjoint snapshots: `ReducedOrderModel(adjoint_snapshots='augment'|'separate'|'concatenate')` adds the
+  optimizer's full-order adjoints to the snapshots: in the state snapshot matrix, in a separate adjoint basis, or
+  (recommended) in an adjoint basis concatenated with the state basis, half of `rb_size` each. The reduced adjoint
+  is selectable (`adjoint_solve='lspg'|'galerkin'|'least_squares'`, LSPG by default, consistent with the
+  forward solve), and so is the test space of the forward solve (`test_space='hybrid'`: LSPG for the states,
+  the adjoint basis itself for the adjoint directions, with its consistent adjoint), which gave derivatives
+  100-10^4x closer to the full-order ones on the test cases. Snapshots can be tagged (`SnapshotMatrix`); centring uses state snapshots only.
+  Derivative-contribution errors of the reduced adjoints (`data_store.adjoint_derivative_errors`).
+- The incremental snapshot SVD rotates its basis in place (or straight into the new one): the transient memory of a
+  snapshot update is a few vectors instead of three copies of the stored basis.
 - Hyper-reduction comparison (`core/hyper_reduction.py`): `DG_windtunnel_model(hyper_reduction=
   HyperReductionComparison(...))` runs DEIM and/or MDEIM of the LSPG Jacobian beside the POD ROM, forward and
   adjoint, for every model including the condensed-gradient ones, and records their accuracy, timing and phases

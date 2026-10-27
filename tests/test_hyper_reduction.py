@@ -411,3 +411,68 @@ def test_derivative_contributions(in_tmp_dir):
             assert vs_rom == pytest.approx(0.1 / 1.2, rel=1e-10)
     finally:
         wt._release_contribution_operators()
+
+
+@pytest.mark.parametrize("kind, rb_size", [("euler", 5), ("rans", 8)])
+@pytest.mark.verification
+def test_hyper_reduced_adjoint_is_the_derivative_of_its_solve(in_tmp_dir, kind, rb_size):
+    """
+    With the ROM's concatenated basis and hybrid test space, the comparison solves the same
+    hybrid equations (with its approximate S A V), and its adjoint, linearized about its own
+    solution, is the derivative of that solve: g . du/dalpha from central differences of
+    the hyper-reduced solves (operators frozen) equals -psi . dR/dalpha, for every method
+    whose solves converge.
+    """
+    import csdl_alpha as csdl
+    from time import perf_counter
+    from dragonfly_sim.core.hyper_reduction import HyperReducedHybridLSPG
+    recorder = csdl.Recorder(inline=False)
+    recorder.start()
+    eta = 1e-9 if kind == "euler" else 1e-7
+    rom = ReducedOrderModel(rb_size=rb_size, eta_threshold=eta, adjoint_snapshots='concatenate', test_space='hybrid')
+    hr = HyperReductionComparison(deim_n_modes=12, mdeim_n_modes=4)
+    wt = _windtunnel(kind, rom=rom, hyper_reduction=hr)
+    alpha = csdl.Variable(name='alpha', value=np.array([np.radians(ALPHAS[0])]))
+    alpha.set_as_design_variable()
+    u_vec = wt.evaluate(alpha=alpha)
+    out = wt.postprocessor.evaluate(u_vec, alpha=alpha)
+    out.D.set_as_objective()
+    out.M_pitch.set_as_constraint()
+    recorder.stop()
+    sim = csdl.experimental.JaxSimulator(recorder, gpu=False)
+    for a in ALPHAS:
+        sim[alpha] = np.array([np.radians(a)])
+        sim.run()
+        sim.compute_totals()
+    assert hr._hybrid is not None                       # the comparison mirrors the hybrid test space
+    m = wt.sim_model
+    comm = m.mesh_obj.mesh.comm
+    a = np.radians(ALPHAS[4])
+    pv = wt._parameter_vector(None, a)
+    g = np.random.default_rng(comm.rank + 1).standard_normal(m.u_vec.x.petsc_vec.getLocalSize())
+    h = 1e-5
+    checked = []
+    for name in hr.prepared_methods:
+        u0 = hr.solution(name)
+
+        def solve_at(alpha_):
+            m.set_angle_of_attack(alpha_)
+            m.set_u_vec(u0)
+            solver = rom.make_solver(HyperReducedHybridLSPG, hr._V, hr._S, hr._mean, comm, operator=hr.models[name],
+                                     n_state=hr._hybrid[0], Psi=hr._hybrid[1])
+            result = rom.run_passes(m, solver, perf_counter())
+            return result.solution, result.converged
+
+        (u_plus, ok_plus), (u_minus, ok_minus) = solve_at(a + h), solve_at(a - h)
+        m.set_angle_of_attack(a)
+        if not (ok_plus and ok_minus):
+            continue
+        fd = comm.allreduce(float(g @ (u_plus - u_minus)) / (2 * h), op=MPI.SUM)
+        m.set_u_vec(u0)
+        psi, _ = hr.adjoint(name, m, pv, g)
+        dr_dalpha = m.assemble_dRdalpha_vec(u0).getArray()[:g.size]
+        adjoint = -comm.allreduce(float(psi @ dr_dalpha), op=MPI.SUM)
+        PETSc.Sys.Print("HR-ADJOINT-CHECK {} {}: g.du/dalpha FD {:.10e}, adjoint {:.10e}".format(kind, name, fd, adjoint))
+        assert abs(fd - adjoint) < 1e-5 * abs(fd), (name, fd, adjoint)
+        checked.append(name)
+    assert "mdeim" in checked

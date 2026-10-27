@@ -50,8 +50,15 @@ The bases follow the POD ROM's: global when it is, and for a local_weighted
 ROM weighted per design with the weights the ROM's basis used (every snapshot
 of a design gets that design's weight), see ReducedOrderModel.basis_settings.
 
-The adjoint (HyperReducedLSPGAdjoint) is the LSPG adjoint with S A V replaced
-by its approximation at the state it is evaluated at.
+With the ROM's hybrid test space (ReducedOrderModel test_space='hybrid') the
+solves are those of the same hybrid equations, the state part of the test basis
+from the approximate S A V (HyperReducedHybridLSPG).
+
+The adjoint (HyperReducedLSPGAdjoint) is consistent with the forward solve: that
+solve's residual is exact, so its solution follows the design through the true
+Jacobian A, and with its test basis Phi~ frozen the adjoint is
+(Phi~^T A V)^T lam = V^T g, psi = Phi~ lam, linearized about the method's own
+solution. Forming Phi~^T A V costs one full Jacobian assembly per design.
 """
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -65,8 +72,8 @@ from petsc4py import PETSc
 from scipy.spatial.distance import cdist
 
 from dragonfly_sim.core.pod import PODBasis
-from dragonfly_sim.core.reduced_order_model import LSPGSolver, LSPGAdjoint
-from dragonfly_sim.utils.pod_utils import tsqr
+from dragonfly_sim.core.reduced_order_model import (LSPGSolver, HybridLSPGSolver, HybridLSPGAdjoint,
+                                                     hybrid_test_basis, scaled_jacobian_basis)
 from dragonfly_sim.utils.petsc_utils import set_petsc_vec_array
 from dragonfly_sim.utils.solver_profiling import PROFILER as _PROF
 
@@ -380,12 +387,14 @@ class DEIM:
         return (sel[(sel >= rstart) & (sel < rend)] - rstart).astype(np.int32)
 
     # -- one solve's operators -----------------------------------------------
-    def prepare(self, model, V, S):
+    def prepare(self, model, V, S, hybrid=None):
         """
         Bind the sampled Jacobian to the points and build the operators of a
-        solve on POD basis V with residual weight S (Vec or None). Needs at
-        least as many DEIM basis vectors as V has columns, else the reduced
-        Jacobian is singular (ValueError). Collective.
+        solve on POD basis V with residual weight S (Vec or None), and with
+        `hybrid` = (n_state, Psi) (ReducedOrderModel.hybrid_test_space) those of the
+        hybrid test basis [S^2 A V_s, Psi]. Needs at least as many DEIM basis vectors
+        as V has columns, else the reduced Jacobian is singular (ValueError).
+        Collective.
         """
         k = V.getSize()[1]
         if self.n_basis_modes < k:
@@ -402,6 +411,10 @@ class DEIM:
             gather_rows(self.comm, self._S_local, rstart, self._indices)
         U_local = self.basis.getDenseArray()
         self._gram = self.comm.allreduce(U_local.T @ U_local, op=MPI.SUM)
+        self._set_hybrid(hybrid)
+        if self._hybrid is not None:
+            # Psi^T S^-1 U: the adjoint rows of the hybrid Phi^T A V ~ Psi^T S^-1 U C
+            self._Psi_U = self.comm.allreduce(self._Psi_S.T @ U_local, op=MPI.SUM)
         if getattr(self, "_AV", None) is not None:
             # a product of the previous binding's matrix
             self._AV.destroy()
@@ -427,6 +440,25 @@ class DEIM:
         with _PROF.phase("rom:hr_project"):
             g = C.T @ self.comm.allreduce(self.basis.getDenseArray().T @ Sr_local, op=MPI.SUM)
             return C.T @ self._gram @ C, g
+
+    def hybrid_reduced_system(self, Sr_local):
+        """(Phi^T A V, Phi^T r, (S A V)^T S r) of the hybrid test basis Phi =
+        [S^2 A V_s, Psi] (prepare), S A V ~ U C. Collective."""
+        C = self.jacobian_coefficients()
+        n_state = self._hybrid
+        with _PROF.phase("rom:hr_project"):
+            merit = C.T @ self.comm.allreduce(self.basis.getDenseArray().T @ Sr_local, op=MPI.SUM)
+            H = np.vstack([C[:, :n_state].T @ self._gram @ C, self._Psi_U @ C])
+            g = np.concatenate([merit[:n_state], self.comm.allreduce(self._Psi_S.T @ Sr_local, op=MPI.SUM)])
+            return H, g, merit
+
+    def _set_hybrid(self, hybrid):
+        # n_state, and Psi S^-1 (this rank's rows) for the adjoint rows of the hybrid system
+        if hybrid is None:
+            self._hybrid = self._Psi = self._Psi_S = None
+            return
+        self._hybrid, self._Psi = hybrid
+        self._Psi_S = self._Psi if self._S_local is None else self._Psi / self._S_local[:, None]
 
     def scaled_jacobian_basis(self):
         """This rank's rows of the approximation of S A V at the current
@@ -507,9 +539,10 @@ class MDEIM(DEIM):
         return (sel[order] - start).astype(np.int64), order
 
     # -- one solve's operators -----------------------------------------------
-    def prepare(self, model, V, S):
+    def prepare(self, model, V, S, hybrid=None):
         """Bind the sampled Jacobian to the rows of the points and build the
-        affine operators Phi_l V and H_lp on POD basis V. Collective."""
+        affine operators Phi_l V and H_lp on POD basis V (and, with `hybrid`, those
+        of the hybrid test basis, see DEIM.prepare). Collective."""
         k = V.getSize()[1]
         m = self.n_basis_modes
         if m < 1:
@@ -540,6 +573,10 @@ class MDEIM(DEIM):
 
         with _PROF.phase("rom:mdeim_offline"):
             self._build_affine_operators(V, layout)
+            self._set_hybrid(hybrid)
+            if self._hybrid is not None:
+                # Psi^T S^-1 (S A_l V): the adjoint rows of the hybrid Phi^T A V
+                self._Psi_SAV = self.comm.allreduce(np.einsum('ia,lik->lak', self._Psi_S, self._SAV), op=MPI.SUM)
         self._V = V
 
     def _build_affine_operators(self, V, layout):
@@ -584,11 +621,24 @@ class MDEIM(DEIM):
             parts = self.comm.allreduce(np.einsum('lik,i->lk', self._SAV, Sr_local), op=MPI.SUM)
             return np.einsum('l,p,lpkj->kj', c, c, self._H), c @ parts
 
+    def hybrid_reduced_system(self, Sr_local):
+        """(Phi^T A V, Phi^T r, (S A V)^T S r) of the hybrid test basis, S A V ~
+        sum_l c_l S A_l V. Collective."""
+        c = self.coefficients()
+        n_state = self._hybrid
+        with _PROF.phase("rom:hr_project"):
+            merit = c @ self.comm.allreduce(np.einsum('lik,i->lk', self._SAV, Sr_local), op=MPI.SUM)
+            H_state = np.einsum('l,p,lpkj->kj', c, c, self._H)[:n_state]
+            H = np.vstack([H_state, np.einsum('l,lak->ak', c, self._Psi_SAV)])
+            g = np.concatenate([merit[:n_state], self.comm.allreduce(self._Psi_S.T @ Sr_local, op=MPI.SUM)])
+            return H, g, merit
+
     def scaled_jacobian_basis(self):
         return np.einsum('l,lik->ik', self.coefficients(), self._SAV)
 
     def release(self):
         self._SAV = self._H = None
+        self._Psi_SAV = None
         self._V = None
 
     def destroy(self):
@@ -616,28 +666,56 @@ class HyperReducedLSPG(LSPGSolver):
         return H, g, r_norm
 
 
-class HyperReducedLSPGAdjoint(LSPGAdjoint):
-    """LSPGAdjoint with S A V replaced by the hyper-reduced approximation at
-    the state it is evaluated at (the first solve()). Owns S, not V. The
-    Petrov-Galerkin residual it logs holds by construction, so it is not
-    computed (nan)."""
+class HyperReducedHybridLSPG(HybridLSPGSolver):
+    """HybridLSPGSolver (the ROM's test_space='hybrid') whose system comes from a
+    prepared DEIM or MDEIM (`operator`, prepared with the hybrid test basis): the
+    same equations Phi^T R(V a) = 0 with Phi = [S^2 A V_s, Psi], S A V approximated."""
 
-    def __init__(self, operator, V, S, comm, parameter_vector, solution):
-        super().__init__(V, S, comm, parameter_vector, solution, accepted=False)
+    def __init__(self, V, comm, operator=None, **kwargs):
+        super().__init__(V, comm, **kwargs)
+        self.operator = operator
+
+    def _reduced_system(self, model):
+        Sr, r_norm = self._weighted_residual(model)
+        H, g, self._merit_gradient = self.operator.hybrid_reduced_system(Sr)
+        return H, g, r_norm
+
+
+class HyperReducedLSPGAdjoint(HybridLSPGAdjoint):
+    """
+    The adjoint consistent with a hyper-reduced forward solve: that solve converges to
+    Phi~^T R(V a) = 0, Phi~ its test basis from the hyper-reduced S A V (S^2 A~ V, or
+    [S^2 A~ V_s, Psi] in the hybrid case), with the residual R exact. Its solution therefore
+    follows the design through the TRUE Jacobian: with Phi~ frozen (the terms proportional to
+    R dropped, as in LSPGAdjoint), (Phi~^T A V)^T lam = V^T g, psi = Phi~ lam. Forming
+    Phi~^T A V costs one full Jacobian assembly per state (shared by all right-hand sides).
+    Evaluate it at the hyper-reduced solution, the state the forward solve linearizes about.
+    Owns S, not V or Psi.
+    """
+
+    def __init__(self, operator, V, S, comm, parameter_vector, solution, hybrid=None):
+        n_state, Psi = (V.getSize()[1], None) if hybrid is None else hybrid
+        super().__init__(V, S, comm, parameter_vector, solution, accepted=False, n_state=n_state, Psi=Psi)
         self.operator = operator
 
     def _factor(self, model):
         # the reconstructed gradient at this state, which the sampled assembly reads
         model.update_derived_fields()
-        SAV = self.operator.scaled_jacobian_basis()
-        self._Q, self._R = tsqr(self.comm, SAV)
-        diag = np.abs(np.diag(self._R))
-        if not np.all(np.isfinite(self._R)) or diag.min() <= np.finfo(float).eps * diag.max():
-            raise ValueError("hyper-reduced adjoint: S A V is singular to working precision "
-                             "(|R_ii| from {:.3e} to {:.3e})".format(diag.min(), diag.max()))
-
-    def _galerkin_residual(self, model, psi, rhs, b):
-        return np.nan
+        SAV_hr = self.operator.scaled_jacobian_basis()
+        S = None if self.S is None else self.S.getArray(readonly=True)
+        Psi = np.zeros((SAV_hr.shape[0], 0)) if self.Psi is None else self.Psi
+        self._Phi = hybrid_test_basis(SAV_hr, S, self.n_state, Psi)
+        model.set_up_solver()
+        with model.steady_residual():
+            _, AV = scaled_jacobian_basis(model, self.V, self.S)       # the true Jacobian
+            H = self.comm.allreduce(self._Phi.T @ AV.getDenseArray(), op=MPI.SUM)
+        AV.destroy()
+        self._lu = sp_la.lu_factor(H)
+        self._R = np.diag(np.abs(np.diag(self._lu[0])))
+        diag = np.diag(self._R)
+        if not np.all(np.isfinite(self._lu[0])) or diag.min() <= np.finfo(float).eps * diag.max():
+            raise ValueError("hyper-reduced adjoint: Phi^T A V is singular to working precision "
+                             "(|U_ii| from {:.3e} to {:.3e})".format(diag.min(), diag.max()))
 
 
 # ----------------------------------------------------------------------
@@ -706,6 +784,8 @@ class HyperReductionComparison:
         self.design = None
         self._compared_key = None
         self._V = self._mean = self._S = None
+        self._hybrid = None
+        self._solutions = {}
         self._adjoints = {}
 
     def set_up(self, model, rom):
@@ -819,7 +899,8 @@ class HyperReductionComparison:
         HyperReducedResult. Collective.
         """
         pv = np.asarray(parameter_vector, dtype=float).ravel()
-        key = (pv.tobytes(), rom.n_snapshots) + tuple(h.n_snapshots for h in self.models.values())
+        key = (pv.tobytes(), rom.n_snapshots, rom.n_adjoint_snapshots) + \
+            tuple(h.n_snapshots for h in self.models.values())
         if key == self._compared_key:
             PETSc.Sys.Print("Hyper-reduction: design already compared; keeping its operators")
             return []
@@ -830,9 +911,11 @@ class HyperReductionComparison:
         model.set_up_solver()
         # copies: the ROM rebuilds its basis and offset at its next solve, and the adjoint
         # of this design is taken later
-        self._V = rom.pod.basis.duplicate(copy=True)
+        self._V = rom.basis.duplicate(copy=True)
         self._mean = None if rom.pod.mean is None else rom.pod.mean.copy()
         self._S = rom.residual_weight(model)
+        # the ROM's hybrid test basis (test_space='hybrid'), which the hyper-reduced solves mirror
+        self._hybrid = rom.hybrid_test_space()
         settings = rom.basis_settings()
         layout = model.u_vec.x.petsc_vec
         reference = layout.getArray(readonly=True).copy()
@@ -854,7 +937,7 @@ class HyperReductionComparison:
                     with _PROF.phase("rom:" + name + "_select"):
                         hr.select_indices()
                     model.update_derived_fields()
-                    hr.prepare(model, self._V, self._S)
+                    hr.prepare(model, self._V, self._S, hybrid=self._hybrid)
                     validation = None
                     if self.validate:
                         from dragonfly_sim.utils.hyper_reduction_validation import validate
@@ -876,10 +959,17 @@ class HyperReductionComparison:
             with phase_record(name):
                 model.interpolate_solution_vector(warm_start)
                 t0 = perf_counter()
-                solver = rom.make_solver(HyperReducedLSPG, self._V, self._S, self._mean, comm, operator=hr)
-                PETSc.Sys.Print("{} hyper-reduced LSPG solve".format(name.upper()))
+                if self._hybrid is None:
+                    solver = rom.make_solver(HyperReducedLSPG, self._V, self._S, self._mean, comm, operator=hr)
+                else:
+                    solver = rom.make_solver(HyperReducedHybridLSPG, self._V, self._S, self._mean, comm, operator=hr,
+                                             n_state=self._hybrid[0], Psi=self._hybrid[1])
+                PETSc.Sys.Print("{} hyper-reduced {} solve".format(name.upper(),
+                                                                 "LSPG" if self._hybrid is None else "hybrid"))
                 result = rom.run_passes(model, solver, t0)
             results.append(HyperReducedResult(name, result, offline, info, validation))
+            # the state its adjoint linearizes about
+            self._solutions[name] = result.solution
         self.design = pv
         self._compared_key = key
         return results
@@ -893,10 +983,19 @@ class HyperReductionComparison:
     def prepared_methods(self):
         return [n for n, h in self.models.items() if h._V is not None]
 
+    def solution(self, name):
+        """The solution of method `name` at the design compared last (owned entries),
+        the state its adjoint linearizes about; None if it was not solved."""
+        return self._solutions.get(name)
+
     def adjoint(self, name, model, parameter_vector, rhs_local):
-        """The hyper-reduced adjoint of method `name` for the right-hand side
-        rhs_local at the model's current state (the optimizer's solution of the
-        design compared last). Returns (psi, wall time). Collective."""
+        """
+        The adjoint of method `name`'s forward solve (HyperReducedLSPGAdjoint, consistent
+        with it, in the hybrid case with the ROM's hybrid test basis) for the right-hand
+        side rhs_local, at the model's current state, which must be that method's solution
+        (`solution(name)`) for the adjoint to be the derivative of its solve. Returns
+        (psi, wall time). Collective.
+        """
         hr = self.models[name]
         u_local = model.u_vec.x.petsc_vec.getArray(readonly=True)
         adj = self._adjoints.get(name)
@@ -904,7 +1003,7 @@ class HyperReductionComparison:
             if adj is not None:
                 adj.destroy()
             S = None if self._S is None else self._S.copy()
-            adj = HyperReducedLSPGAdjoint(hr, self._V, S, self.comm, parameter_vector, u_local)
+            adj = HyperReducedLSPGAdjoint(hr, self._V, S, self.comm, parameter_vector, u_local, hybrid=self._hybrid)
             self._adjoints[name] = adj
         t0 = perf_counter()
         psi = adj.solve(model, rhs_local)
@@ -921,6 +1020,8 @@ class HyperReductionComparison:
             if obj is not None:
                 obj.destroy()
         self._V = self._mean = self._S = None
+        self._hybrid = None
+        self._solutions = {}
         self.design = None
         self._compared_key = None
 

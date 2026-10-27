@@ -61,6 +61,50 @@ place of the full-order adjoint A^-T g. It is the Petrov-Galerkin solution of
 A^T psi = g in the span of Phi, tested with V: V^T (A^T psi - g) = 0. psi is
 computed as S Q y with S A V = Q R (a distributed thin QR) and R^T y = V^T g,
 without forming the normal matrix, whose condition number is squared.
+
+Adjoint snapshots (adjoint_snapshots). psi lies in span(S^2 A V), directions
+built from state snapshots, which need not hold the adjoint field. The
+full-order adjoints the optimizer solves (at the designs the FOM solved) can be
+added as snapshots (add_adjoint_snapshot), one per output row:
+
+  'augment'   into the state snapshot matrix (tagged, see core/pod.py, and scaled
+              to the W-norm of the design's state snapshot, as adjoints have other
+              units): the one basis V then holds them, for the primal solve and the
+              LSPG adjoint above alike. Not centred.
+  'separate'  into a snapshot matrix of their own (inner product W^-1, the dual of
+              the state's, and normalized in it), from which every solve builds an
+              adjoint basis Psi (adjoint_rb_size, the design weights of the state
+              basis). The adjoint is then the least-squares solution of the adjoint
+              equations over span[S^2 A V, Psi], which contains the LSPG adjoint's:
+                  min || W^-1/2 (A^T psi - g) ||,
+              no longer the exact derivative of the ROM's outputs, but closer to the
+              full-order one where Psi holds the adjoint.
+  'concatenate'
+              into a snapshot matrix of their own, as 'separate'; the basis of every
+              solve is then the concatenation of a state basis of ceil(rb_size / 2)
+              vectors and an adjoint basis Psi of floor(rb_size / 2) (slots Psi cannot
+              fill, e.g. before there are adjoint snapshots, go to the state basis), Psi
+              orthogonalized against the state basis so that the two blocks are W-
+              orthonormal and mutually W-orthogonal: the states keep their own SVD, so the
+              adjoints do not crowd them out of the basis as with 'augment', and the primal
+              solve and its adjoint both use the concatenated V.
+
+adjoint_solve chooses the reduced adjoint: 'lspg' (the adjoint of the LSPG equations
+above, the exact derivative of the ROM's outputs), 'galerkin' (psi = V z in the span of the
+basis itself, V^T A^T V z = V^T g: with 'concatenate' the adjoint basis is then in its trial
+space, which the LSPG adjoint's span(S^2 A V) does not contain) or 'least_squares' (the
+least-squares adjoint over span[S^2 A V, Psi], 'separate' and 'concatenate' only); the
+default is 'least_squares' for 'separate' and 'lspg' otherwise. Only 'lspg' is the exact
+derivative of the ROM's outputs, consistent with the forward (LSPG) solve.
+
+test_space='hybrid' ('concatenate' only) changes the forward solve itself: Petrov-Galerkin with
+the concatenated basis V = [V_s, Psi_perp] as trial basis and Phi = [S^2 A V_s, Psi] as test
+basis, the state part LSPG's and the adjoint part the adjoint basis itself (HybridLSPGSolver).
+Its adjoint, (Phi^T A V)^T lam = V^T g, psi = Phi lam (HybridLSPGAdjoint), is the derivative of
+those equations (as LSPGAdjoint's of LSPG, Phi frozen) and lies in a space that holds Psi, which
+the LSPG adjoint's span(S^2 A V) does not: on the test cases its derivatives were 100-10^4 times
+closer to the full-order ones than the state basis gave, at a slightly larger ||R|| (the forward
+solve no longer minimizes ||S R||).
 """
 from dataclasses import dataclass
 from time import perf_counter
@@ -71,7 +115,7 @@ from mpi4py import MPI
 from petsc4py import PETSc
 
 from dragonfly_sim.core.pod import PODBasis, resolve_centering
-from dragonfly_sim.utils.pod_utils import DiagonalWeight, tsqr
+from dragonfly_sim.utils.pod_utils import DiagonalWeight, tsqr, petsc_dense_from_local_block
 from dragonfly_sim.utils.derived_fields import diagonal_mass_inverse
 from dragonfly_sim.utils.solver_profiling import PROFILER as _PROF
 
@@ -94,6 +138,17 @@ def scaled_jacobian_basis(model, V, S, AV=None):
     if S is not None:
         SAV = S.getArray(readonly=True)[:, None] * SAV
     return SAV, AV
+
+
+def orthonormal_columns(comm, X_local, rtol=1e-10, atol=0.0):
+    """An orthonormal basis (this rank's rows) of the span of the row-distributed
+    columns X, dropping directions with singular values below max(rtol times the
+    largest, atol) (dependent columns). Collective."""
+    Q1, R = tsqr(comm, X_local)
+    U, sigma, _ = np.linalg.svd(R)
+    keep = sigma > max(rtol * sigma.max(), atol) if sigma.size and sigma.max() > 0.0 \
+        else np.zeros(0, dtype=bool)
+    return Q1 @ U[:, keep]
 
 
 class LSPGSolver:
@@ -312,10 +367,18 @@ class LSPGAdjoint:
         The design and this rank's owned entries of the accepted solution.
     """
 
-    def __init__(self, V, S, comm, parameter_vector, solution, accepted=True):
+    def __init__(self, V, S, comm, parameter_vector, solution, accepted=True, adjoint_basis=None,
+                 dual_weight=None, galerkin=False):
         self.V = V
         self.S = S
         self.comm = comm
+        # adjoint_snapshots='separate': the adjoint basis Psi (a Mat, owned by the ROM) and the
+        # weight W^-1/2 (this rank's entries, None: 1) of the least-squares adjoint
+        self.adjoint_basis = adjoint_basis
+        self.dual_weight = dual_weight
+        # adjoint_solve='galerkin': psi = V z with V^T A^T V z = V^T g (LU of the k x k matrix)
+        self.galerkin = galerkin
+        self._T = None
         # whether the solve it belongs to was accepted: a rejected solve's adjoint is not used
         # by the optimizer, only compared with the full-order one (compute_all_adjoint_errors)
         self.accepted = accepted
@@ -344,16 +407,58 @@ class LSPGAdjoint:
         return bool(np.array_equal(np.asarray(parameter_vector, dtype=float).ravel(), self.parameter_vector))
 
     def _factor(self, model):
-        """Q, R of S A V, A the steady Jacobian at the model's current u_vec."""
+        """Q, R of S A V, A the steady Jacobian at the model's current u_vec; with
+        an adjoint basis, those of W^-1/2 A^T over the trial space (see solve)."""
         model.set_up_solver()
         with model.steady_residual():
             SAV, AV = scaled_jacobian_basis(model, self.V, self.S)
-            self._Q, self._R = tsqr(self.comm, SAV)
+            if self.galerkin:
+                AV_local = AV.getDenseArray()
+                self._lu = sp_la.lu_factor(self.comm.allreduce(self.V.getDenseArray().T @ AV_local, op=MPI.SUM))
+                self._Q, self._R = None, np.diag(np.abs(np.diag(self._lu[0])))
+            elif self.adjoint_basis is None:
+                self._Q, self._R = tsqr(self.comm, SAV)
+            else:
+                self._factor_least_squares(model, SAV)
         AV.destroy()
         diag = np.abs(np.diag(self._R))
         if not np.all(np.isfinite(self._R)) or diag.min() <= np.finfo(float).eps * diag.max():
             raise ValueError("reduced adjoint: S A V is singular to working precision "
                              "(|R_ii| from {:.3e} to {:.3e})".format(diag.min(), diag.max()))
+
+    def _factor_least_squares(self, model, SAV):
+        """The adjoint basis variant: T = an orthonormal basis of span[S^2 A V, Psi]
+        (self._T) and Q, R of W^-1/2 A^T T, A the Jacobian scaled_jacobian_basis
+        just assembled."""
+        S = None if self.S is None else self.S.getArray(readonly=True)
+        lspg_space = SAV if S is None else S[:, None] * SAV
+        self._T = orthonormal_columns(self.comm, np.column_stack([lspg_space, self.adjoint_basis.getDenseArray()]))
+        A = model.problem._A
+        x, y = A.createVecLeft(), A.createVecRight()
+        ATT = np.empty_like(self._T)
+        for j in range(self._T.shape[1]):
+            x.array[:] = self._T[:, j]
+            A.multTranspose(x, y)
+            ATT[:, j] = y.array
+        x.destroy()
+        y.destroy()
+        if self.dual_weight is not None:
+            ATT *= self.dual_weight[:, None]
+        self._Q, self._R = tsqr(self.comm, ATT)
+
+    def _solve_least_squares(self, model, rhs, first):
+        """psi = T z, z minimizing ||W^-1/2 (A^T T z - g)||."""
+        Tg = rhs if self.dual_weight is None else self.dual_weight * rhs
+        z = sp_la.solve_triangular(self._R, self.comm.allreduce(self._Q.T @ Tg, op=MPI.SUM), lower=False)
+        psi = self._T @ z
+        if first:
+            res = self._Q @ (self._R @ z) - Tg
+            PETSc.Sys.Print("least-squares adjoint over span[S^2 A V, Psi] ({} directions, {} adjoint basis "
+                            "vectors): |W^-1/2 (A^T psi - g)| / |W^-1/2 g| = {:.3e}".format(
+                                self._T.shape[1], self.adjoint_basis.getSize()[1],
+                                np.sqrt(self.comm.allreduce(float(res @ res), op=MPI.SUM)
+                                        / max(self.comm.allreduce(float(Tg @ Tg), op=MPI.SUM), 1e-300))))
+        return psi
 
     def solve(self, model, rhs_local):
         """
@@ -362,10 +467,16 @@ class LSPGAdjoint:
         must be those of the accepted solution (the first call assembles the
         Jacobian there). Collective.
         """
-        first = self._Q is None
+        first = self._R is None
         if first:
             self._factor(model)
         rhs = np.asarray(rhs_local, dtype=float)
+        if self.galerkin:
+            # (V^T A V)^T z = V^T g
+            z = sp_la.lu_solve(self._lu, self.comm.allreduce(self.V.getDenseArray().T @ rhs, op=MPI.SUM), trans=1)
+            return self.V.getDenseArray() @ z
+        if self.adjoint_basis is not None:
+            return self._solve_least_squares(model, rhs, first)
         b = self.comm.allreduce(self.V.getDenseArray().T @ rhs, op=MPI.SUM)
         y = sp_la.solve_triangular(self._R, b, trans='T', lower=False)
         psi = self._Q @ y
@@ -401,6 +512,103 @@ class LSPGAdjoint:
             self.S.destroy()
             self.S = None
         self._Q = self._R = None
+        self._T = None
+
+
+class HybridLSPGSolver(LSPGSolver):
+    """
+    The reduced Newton loop of test_space='hybrid' (adjoint_snapshots='concatenate'):
+    Petrov-Galerkin with the concatenated basis V = [V_s, Psi_perp] as trial basis and
+    Phi = [S^2 A V_s, Psi] as test basis, Psi the adjoint POD basis as it is (only its
+    first k - n_state columns, k the width of V). The state part of Phi is LSPG's, frozen
+    per iteration like it; the reduced equations Phi^T R(V a) = 0 give the step
+    (Phi^T A V) da = -Phi^T r. The line search keeps LSPG's merit ||S r||^2 / 2, with its
+    own slope.
+    """
+
+    def __init__(self, V, comm, n_state=None, Psi=None, **kwargs):
+        super().__init__(V, comm, **kwargs)
+        self.n_state = n_state
+        self.Psi = Psi                        # this rank's rows of the adjoint basis
+        self._merit_gradient = None
+
+    def _reduced_system(self, model):
+        Sr, r_norm = self._weighted_residual(model)
+        if self._AV is not None and self._AV.getSize()[1] != self.V.getSize()[1]:
+            self._AV.destroy()
+            self._AV = None
+        with _PROF.phase("rom:project"):
+            SAV, self._AV = scaled_jacobian_basis(model, self.V, self.S, self._AV)
+            H, g, self._merit_gradient = hybrid_reduced_system(self.comm, SAV, Sr, self.S, self.n_state, self.Psi)
+        return H, g, r_norm
+
+    def _backtrack(self, model, a, da, theta, phi, slope):
+        # the slope of the merit ||S r||^2 / 2, not of the hybrid right-hand side
+        return super()._backtrack(model, a, da, theta, phi, float(self._merit_gradient @ da))
+
+
+def hybrid_test_basis(SAV, S, n_state, Psi):
+    """This rank's rows of Phi = [S^2 A V_s, Psi[:, :k - n_state]], from S A V."""
+    k = SAV.shape[1]
+    state = SAV[:, :n_state] if S is None else S[:, None] * SAV[:, :n_state]
+    return np.column_stack([state, Psi[:, :k - n_state]])
+
+
+def hybrid_reduced_system(comm, SAV, Sr, S_vec, n_state, Psi):
+    """(Phi^T A V, Phi^T r, (S A V)^T S r) of the hybrid test basis, from S A V and S r."""
+    S = None if S_vec is None else S_vec.getArray(readonly=True)
+    Phi = hybrid_test_basis(SAV, S, n_state, Psi)
+    AV = SAV if S is None else SAV / S[:, None]
+    r = Sr if S is None else Sr / S
+    H = comm.allreduce(Phi.T @ AV, op=MPI.SUM)
+    g = comm.allreduce(Phi.T @ r, op=MPI.SUM)
+    merit = comm.allreduce(SAV.T @ Sr, op=MPI.SUM)
+    return H, g, merit
+
+
+class HybridLSPGAdjoint(LSPGAdjoint):
+    """
+    The adjoint of the hybrid reduced equations Phi^T R(V a) = 0 (HybridLSPGSolver), with
+    Phi frozen as in LSPGAdjoint (the terms proportional to R are dropped):
+    (Phi^T A V)^T lam = V^T g, psi = Phi lam. psi lies in span[S^2 A V_s, Psi], so it holds the
+    adjoint basis itself; for Phi = S^2 A V this is LSPGAdjoint. Owns S, not V or Psi.
+    """
+
+    def __init__(self, V, S, comm, parameter_vector, solution, accepted=True, n_state=None, Psi=None):
+        super().__init__(V, S, comm, parameter_vector, solution, accepted=accepted)
+        self.n_state = n_state
+        self.Psi = Psi
+
+    def _factor(self, model):
+        model.set_up_solver()
+        with model.steady_residual():
+            SAV, AV = scaled_jacobian_basis(model, self.V, self.S)
+            S = None if self.S is None else self.S.getArray(readonly=True)
+            self._Phi = hybrid_test_basis(SAV, S, self.n_state, self.Psi)
+            H = self.comm.allreduce(self._Phi.T @ AV.getDenseArray(), op=MPI.SUM)
+        AV.destroy()
+        self._lu = sp_la.lu_factor(H)
+        self._R = np.diag(np.abs(np.diag(self._lu[0])))
+        diag = np.diag(self._R)
+        if not np.all(np.isfinite(self._lu[0])) or diag.min() <= np.finfo(float).eps * diag.max():
+            raise ValueError("hybrid reduced adjoint: Phi^T A V is singular to working precision "
+                             "(|U_ii| from {:.3e} to {:.3e})".format(diag.min(), diag.max()))
+
+    def solve(self, model, rhs_local):
+        first = self._R is None
+        if first:
+            self._factor(model)
+        lam = sp_la.lu_solve(self._lu, self.comm.allreduce(self.V.getDenseArray().T @ np.asarray(rhs_local, dtype=float),
+                                                            op=MPI.SUM), trans=1)
+        psi = self._Phi @ lam
+        if first:
+            PETSc.Sys.Print("hybrid reduced adjoint: {} state and {} adjoint test directions".format(
+                self.n_state, self._Phi.shape[1] - self.n_state))
+        return psi
+
+    def destroy(self):
+        super().destroy()
+        self._Phi = None
 
 
 @dataclass
@@ -475,6 +683,17 @@ class ReducedOrderModel:
                          also run the FOM when the ROM is accepted (benchmarking;
                          the accepted output stays the ROM's)
 
+    Adjoint snapshots (module docstring; the windtunnel model adds the full-order adjoints the
+    optimizer solves)::
+
+      adjoint_snapshots  None (state snapshots only), 'augment', 'separate' or 'concatenate'
+      adjoint_rb_size, adjoint_max_rank
+                         'separate': adjoint basis width (default rb_size); 'concatenate'
+                         uses floor(rb_size / 2). The stored rank defaults to 3 times the width
+      adjoint_solve      'lspg', 'galerkin' or 'least_squares' (module docstring)
+      test_space         'lspg' (default) or 'hybrid' ('concatenate' only): the test basis
+                         [S^2 A V_s, Psi] (HybridLSPGSolver), with the adjoint of those equations
+
     After a solve that built a basis, `adjoint` is its LSPGAdjoint (None before the first),
     valid until the next solve; `adjoint.accepted` says whether the solve was accepted, and only
     an accepted solve's adjoint is used for the derivative.
@@ -487,7 +706,9 @@ class ReducedOrderModel:
                  inner_product='euclidean', state_scaling='freestream',
                  newton_max_it=15, newton_rtol=1e-10, newton_atol=1e-12, stall_window=3,
                  stall_rtol=1e-10, max_outer_iterations=3, g_conv_limit=1e-10, line_search=True,
-                 eta_threshold=1e-10, min_snapshots=2, run_fom_every_evaluation=False):
+                 eta_threshold=1e-10, min_snapshots=2, run_fom_every_evaluation=False,
+                 adjoint_snapshots=None, adjoint_rb_size=None, adjoint_max_rank=None, adjoint_solve=None,
+                 test_space='lspg'):
         if inner_product not in ('l2', 'euclidean'):
             raise ValueError("inner_product must be 'l2' or 'euclidean', got {!r}".format(inner_product))
         if not (state_scaling is None or isinstance(state_scaling, str) and state_scaling == 'freestream'
@@ -528,6 +749,38 @@ class ReducedOrderModel:
         self.eta_threshold = eta_threshold
         self.min_snapshots = min_snapshots
         self.run_fom_every_evaluation = run_fom_every_evaluation
+        if adjoint_snapshots not in (None, 'augment', 'separate', 'concatenate'):
+            raise ValueError("adjoint_snapshots must be None, 'augment', 'separate' or 'concatenate', got "
+                             "{!r}".format(adjoint_snapshots))
+        if adjoint_solve is None:
+            adjoint_solve = 'least_squares' if adjoint_snapshots == 'separate' else 'lspg'
+        if adjoint_solve not in ('lspg', 'galerkin', 'least_squares'):
+            raise ValueError("adjoint_solve must be 'lspg', 'galerkin' or 'least_squares', got {!r}".format(
+                adjoint_solve))
+        if adjoint_solve == 'least_squares' and adjoint_snapshots not in ('separate', 'concatenate'):
+            raise ValueError("adjoint_solve='least_squares' needs an adjoint basis: adjoint_snapshots='separate' "
+                             "or 'concatenate'")
+        if test_space not in ('lspg', 'hybrid'):
+            raise ValueError("test_space must be 'lspg' or 'hybrid', got {!r}".format(test_space))
+        if test_space == 'hybrid' and adjoint_snapshots != 'concatenate':
+            raise ValueError("test_space='hybrid' needs adjoint_snapshots='concatenate'")
+        self.test_space = test_space
+        self.adjoint_snapshots = adjoint_snapshots
+        self.adjoint_solve = adjoint_solve
+        if adjoint_snapshots == 'concatenate':
+            adjoint_rb_size = rb_size // 2
+        self.adjoint_rb_size = rb_size if adjoint_rb_size is None else adjoint_rb_size
+        self.adjoint_max_rank = 3 * self.adjoint_rb_size if adjoint_max_rank is None else adjoint_max_rank
+        if self.adjoint_max_rank < 1:
+            raise ValueError("adjoint_max_rank must be at least 1, got {}".format(self.adjoint_max_rank))
+        self.adjoint_pod = None
+        self.W_dual = None
+        # 'concatenate': the concatenated basis of the last solve (see `basis`)
+        self._concatenated_basis = None
+        # test_space='hybrid': {n_state, Psi} of the last solve's test basis (hybrid_test_space)
+        self._hybrid = None
+        # the W-norm of each design's state snapshot (adjoint_snapshots='augment' scales to it)
+        self._state_norms = {}
 
         self.pod = None
         self.W = None
@@ -566,6 +819,19 @@ class ReducedOrderModel:
         self.pod = PODBasis(model.mesh_obj.mesh.comm, layout.getSize(), basis_mode=self.basis_mode,
                             centering=self.centering, mean_weighting=self.mean_weighting,
                             IP_matrix=self.W, max_rank=self.max_rank, qr_rank_tol=self.qr_rank_tol)
+        for obj in (self.adjoint_pod, self.W_dual):
+            if obj is not None:
+                obj.destroy()
+        self.adjoint_pod = self.W_dual = None
+        self._state_norms = {}
+        if self.adjoint_snapshots in ('separate', 'concatenate'):
+            if self.W is not None:
+                w = self.W.w.duplicate()
+                w.array[:] = 1.0 / self.W.w.getArray(readonly=True)
+                self.W_dual = DiagonalWeight(w)
+            self.adjoint_pod = PODBasis(model.mesh_obj.mesh.comm, layout.getSize(), basis_mode=self.basis_mode,
+                                        centering=None, IP_matrix=self.W_dual, max_rank=self.adjoint_max_rank,
+                                        qr_rank_tol=self.qr_rank_tol)
         PETSc.Sys.Print("Initialized POD ROM: basis_mode={}, centering={}, rb_size={}, max_rank={}, "
                         "n_dofs={}, inner product {}{}".format(
                             self.basis_mode, self.centering, self.rb_size, self.max_rank, layout.getSize(),
@@ -641,7 +907,33 @@ class ReducedOrderModel:
 
     @property
     def n_snapshots(self):
-        return 0 if self.pod is None else self.pod.snapshot_matrix.n_snapshots
+        """State snapshots (adjoint snapshots are counted by n_adjoint_snapshots)."""
+        return 0 if self.pod is None else int(self.pod.snapshot_matrix.state_mask.sum())
+
+    @property
+    def basis(self):
+        """The basis of the last solve: the state POD basis, or with 'concatenate' the
+        concatenated state and adjoint basis. Valid until the next solve."""
+        if self._concatenated_basis is not None:
+            return self._concatenated_basis
+        return None if self.pod is None else self.pod.basis
+
+    def hybrid_test_space(self):
+        """(n_state, Psi): the state width and this rank's rows of the adjoint part of the
+        last solve's hybrid test basis [S^2 A V_s, Psi] (a copy, its first k - n_state columns,
+        k the width of `basis`), or None when that solve was not hybrid (core/hyper_reduction.py
+        mirrors it)."""
+        if self._hybrid is None:
+            return None
+        n_state = self._hybrid['n_state']
+        k = self.basis.getSize()[1]
+        return n_state, np.array(self._hybrid['Psi'][:, :k - n_state], copy=True)
+
+    @property
+    def n_adjoint_snapshots(self):
+        if self.adjoint_snapshots in ('separate', 'concatenate'):
+            return 0 if self.adjoint_pod is None else self.adjoint_pod.snapshot_matrix.n_snapshots
+        return 0 if self.pod is None else self.pod.snapshot_matrix.n_snapshots - self.n_snapshots
 
     def snapshot_singular_values(self):
         sigma = None if self.pod is None else self.pod.snapshot_matrix.Sigma
@@ -666,7 +958,63 @@ class ReducedOrderModel:
         added = self.pod.snapshot_matrix.process_and_append_to_snapshot_lists(
             model.u_vec.x.petsc_vec, np.asarray(parameter_vector, dtype=float))
         self.pod.snapshot_matrix.print_info()
+        if self.adjoint_snapshots == 'augment':
+            self._state_norms[np.asarray(parameter_vector, dtype=float).tobytes()] = \
+                self._weighted_norm(model.u_vec.x.petsc_vec.getArray(readonly=True), self.W, model)
         return added
+
+    def _weighted_norm(self, x_local, weight, model):
+        w = None if weight is None else weight.w.getArray(readonly=True)
+        local = float(x_local @ x_local) if w is None else float(x_local @ (w * x_local))
+        return float(np.sqrt(model.mesh_obj.mesh.comm.allreduce(local, op=MPI.SUM)))
+
+    def add_adjoint_snapshot(self, model, parameter_vector, row, psi_local):
+        """
+        Add the full-order adjoint psi (this rank's owned entries) of output row `row` at
+        design parameter_vector as a snapshot (adjoint_snapshots; a no-op without), scaled as
+        the module docstring says. Returns whether it added a basis direction. Collective.
+        """
+        if self.adjoint_snapshots is None:
+            return False
+        self._check_parameter_size(parameter_vector)
+        pv = np.asarray(parameter_vector, dtype=float)
+        psi = np.asarray(psi_local, dtype=float)
+        if self.adjoint_snapshots == 'augment':
+            norm = self._weighted_norm(psi, self.W, model)
+            target = self._state_norms.get(pv.tobytes())
+            if target is None and self._state_norms:
+                target = float(np.mean(list(self._state_norms.values())))
+            snapshots = self.pod.snapshot_matrix
+        else:
+            norm, target = self._weighted_norm(psi, self.W_dual, model), 1.0
+            snapshots = self.adjoint_pod.snapshot_matrix
+        if not (np.isfinite(norm) and norm > 0.0) or target is None:
+            return False
+        vec = model.u_vec.x.petsc_vec.duplicate()
+        vec.array[:] = psi * (target / norm)
+        try:
+            added = snapshots.process_and_append_to_snapshot_lists(vec, pv, tag=('adjoint', int(row)))
+        finally:
+            vec.destroy()
+        PETSc.Sys.Print("ROM adjoint snapshot (output row {}, {}): {} direction; {} adjoint snapshots".format(
+            row, self.adjoint_snapshots, "new" if added else "no new", self.n_adjoint_snapshots))
+        return added
+
+    def _adjoint_snapshot_weights(self):
+        """The local_weighted weights of the adjoint snapshots: their design's weight in the
+        state basis of the last solve (uniform where that was global), None for a global
+        adjoint basis."""
+        sm = self.adjoint_pod.snapshot_matrix
+        if self.basis_mode != 'local_weighted' or sm.n_snapshots < 2:
+            return None
+        settings = self._basis_settings
+        if settings is None or settings['basis_mode'] != 'local_weighted':
+            return np.ones(sm.n_snapshots)
+        from scipy.spatial.distance import cdist
+        d = cdist(np.vstack(sm.snapshot_list_parameters), settings['design_parameters'])
+        nearest = d.argmin(axis=1)
+        weights = np.where(d[np.arange(d.shape[0]), nearest] <= 1e-10, settings['design_weights'][nearest], 0.0)
+        return weights if np.any(weights > 0.0) else np.ones(sm.n_snapshots)
 
     def discard_adjoint(self):
         """Drop the adjoint of the last accepted solve. Collective."""
@@ -690,25 +1038,46 @@ class ReducedOrderModel:
             return None
         t0 = perf_counter()
         comm = model.mesh_obj.mesh.comm
-        with _PROF.phase("rom:basis"):
-            self.pod.construct_basis(rb_size=self.rb_size,
-                                     local_parametervector=np.asarray(parameter_vector, dtype=float),
-                                     parameter_weights=self._distance_weights(len(parameter_vector)),
-                                     weightfunction=self.weightfunction,
-                                     n_nonzero_weights=self.n_nonzero_weights,
-                                     cubic_cutoff=self.cubic_cutoff,
-                                     layout_vec=model.u_vec.x.petsc_vec,
-                                     warm_start=model.u_vec.x.petsc_vec)
+        concatenate = self.adjoint_snapshots == 'concatenate' and self.adjoint_pod.snapshot_matrix.n_snapshots > 0
+        n_adjoint = self.rb_size // 2 if concatenate else 0
+        self._build_state_basis(model, parameter_vector, self.rb_size - n_adjoint)
         if self.pod.basis is None or self.pod.basis.getSize()[1] == 0:
             PETSc.Sys.Print("ROM: empty POD basis; skipping the ROM solve")
             return None
-
         self._basis_settings = self._settings_of_last_basis()
+
+        adjoint_basis = None
+        if self.adjoint_snapshots in ('separate', 'concatenate') and self.adjoint_pod.snapshot_matrix.n_snapshots > 0:
+            with _PROF.phase("rom:adjoint_basis"):
+                self.adjoint_pod.construct_basis(rb_size=self.adjoint_rb_size, layout_vec=model.u_vec.x.petsc_vec,
+                                                 snapshot_weights=self._adjoint_snapshot_weights())
+            adjoint_basis = self.adjoint_pod.basis
+        if self._concatenated_basis is not None:
+            self._concatenated_basis.destroy()
+            self._concatenated_basis = None
+        if concatenate:
+            width = 0 if adjoint_basis is None else adjoint_basis.getSize()[1]
+            if width < n_adjoint:
+                # the slots the adjoint basis cannot fill go to the state basis
+                self._build_state_basis(model, parameter_vector, self.rb_size - width)
+                self._basis_settings = self._settings_of_last_basis()
+            with _PROF.phase("rom:basis"):
+                self._concatenated_basis = self._concatenate(comm, self.pod.basis, adjoint_basis)
+            PETSc.Sys.Print("ROM basis: {} state + {} adjoint vectors -> {} columns".format(
+                self.pod.basis.getSize()[1], width, self._concatenated_basis.getSize()[1]))
+        V = self.basis
 
         model.set_up_solver()
         with _PROF.phase("rom:weights"):
             S = self.residual_weight(model)
-        solver = self.make_solver(LSPGSolver, self.pod.basis, S, self.pod.mean, comm)
+        hybrid = self.test_space == 'hybrid' and concatenate and V.getSize()[1] > self.pod.basis.getSize()[1]
+        self._hybrid = None
+        if hybrid:
+            hybrid_kw = dict(n_state=self.pod.basis.getSize()[1], Psi=adjoint_basis.getDenseArray())
+            self._hybrid = hybrid_kw
+            solver = self.make_solver(HybridLSPGSolver, V, S, self.pod.mean, comm, **hybrid_kw)
+        else:
+            solver = self.make_solver(LSPGSolver, V, S, self.pod.mean, comm)
         try:
             result = self.run_passes(model, solver, t0)
         except BaseException:
@@ -721,9 +1090,55 @@ class ReducedOrderModel:
         # the full-order adjoint. The basis stays valid until the next solve rebuilds it, which
         # discards this adjoint first (the windtunnel model also keeps it across the derivative
         # re-run of a rejected design, which skips the ROM).
-        self.adjoint = LSPGAdjoint(self.pod.basis, S, comm, parameter_vector, result.solution,
-                                   accepted=result.accepted)
+        if self.adjoint_solve != 'least_squares':
+            adjoint_basis = None
+        dual_weight = None if adjoint_basis is None or self.W is None else \
+            1.0 / np.sqrt(self.W.w.getArray(readonly=True))
+        if hybrid:
+            self.adjoint = HybridLSPGAdjoint(V, S, comm, parameter_vector, result.solution,
+                                             accepted=result.accepted, **hybrid_kw)
+            return result
+        self.adjoint = LSPGAdjoint(V, S, comm, parameter_vector, result.solution,
+                                   accepted=result.accepted, adjoint_basis=adjoint_basis, dual_weight=dual_weight,
+                                   galerkin=self.adjoint_solve == 'galerkin')
         return result
+
+    def _build_state_basis(self, model, parameter_vector, rb_size):
+        with _PROF.phase("rom:basis"):
+            self.pod.construct_basis(rb_size=rb_size,
+                                     local_parametervector=np.asarray(parameter_vector, dtype=float),
+                                     parameter_weights=self._distance_weights(len(parameter_vector)),
+                                     weightfunction=self.weightfunction,
+                                     n_nonzero_weights=self.n_nonzero_weights,
+                                     cubic_cutoff=self.cubic_cutoff,
+                                     layout_vec=model.u_vec.x.petsc_vec,
+                                     warm_start=model.u_vec.x.petsc_vec)
+
+    # an adjoint direction is dropped from the concatenated basis when less than this fraction of
+    # it (in the W-norm) lies outside the span of the state basis
+    CONCATENATION_RTOL = 1e-8
+
+    def _concatenate(self, comm, V_state, V_adjoint):
+        """
+        [V_state, Psi_perp]: the state basis as it is (W-orthonormal, from the POD) and the
+        adjoint basis orthogonalized against it in the W inner product (two classical
+        Gram-Schmidt passes, for round-off) and then W-orthonormalized, so that both blocks
+        are orthonormal and mutually orthogonal (V^T W V = I, which the restriction
+        a = V^T W (u - mean) needs). Adjoint directions with no part outside the state basis
+        (CONCATENATION_RTOL) are dropped.
+        """
+        Vs = V_state.getDenseArray()
+        if V_adjoint is None:
+            return petsc_dense_from_local_block(comm, Vs.copy())
+        w = np.ones(Vs.shape[0]) if self.W is None else self.W.w.getArray(readonly=True)
+        sqrt_w = np.sqrt(w)
+        P = V_adjoint.getDenseArray().copy()
+        # unit W-norm columns, so that what remains after the projection is measured against 1
+        P /= np.maximum(np.sqrt(comm.allreduce(np.sum(w[:, None] * P**2, axis=0), op=MPI.SUM)), 1e-300)
+        for _ in range(2):
+            P -= Vs @ comm.allreduce(Vs.T @ (w[:, None] * P), op=MPI.SUM)
+        Q = orthonormal_columns(comm, sqrt_w[:, None] * P, atol=self.CONCATENATION_RTOL) / sqrt_w[:, None]
+        return petsc_dense_from_local_block(comm, np.column_stack([Vs, Q]))
 
     def residual_weight(self, model):
         """S, the diagonal weight of the LSPG residual norm ||S r|| on the
@@ -823,3 +1238,7 @@ class ReducedOrderModel:
         if self.W is not None:
             self.W.destroy()
             self.W = None
+        for obj in (self.adjoint_pod, self.W_dual, self._concatenated_basis):
+            if obj is not None:
+                obj.destroy()
+        self.adjoint_pod = self.W_dual = self._concatenated_basis = None

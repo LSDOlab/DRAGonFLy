@@ -241,6 +241,78 @@ coordinate space, before the mesh warping and shape parameterization), next to e
 `profile_phases=True` the phases of these reference solves are recorded as `adjoint_fom_reference` and
 `adjoint_rom_reference`, apart from the `adjoint_fom` and `adjoint_rom` records of the adjoint the optimizer used.
 
+### Adjoint snapshots
+
+The reduced adjoint lies in span($S^2 A V$): directions built from state snapshots, which need not hold the
+adjoint field. `ReducedOrderModel(adjoint_snapshots=...)` adds the full-order adjoints the optimizer solves, one per
+output row at every design the FOM solved and converged, as snapshots (`data_store.adjoint_snapshots` records them):
+
+- `'augment'`: into the state snapshot matrix, scaled to the $W$-norm of the design's state snapshot (adjoints have
+  other units) and tagged, so that they are not taken for duplicates of the state and are not centred. The one
+  basis $V$ then holds them, for the primal solve and the LSPG adjoint alike. `rb_size` must leave room for the
+  states: with `rb_size=5` and two adjoints per design, the ROM was never accepted on the test cases.
+- `'separate'`: into a snapshot matrix of their own (inner product $W^{-1}$, the dual of the state's), from which
+  every solve builds an adjoint basis $\Psi$ (`adjoint_rb_size`, weighted per design like the state basis). The
+  adjoint is then the least-squares solution of the adjoint equations over span$[S^2 A V, \Psi]$,
+  $\min \| W^{-1/2} (A^T \psi - g) \|$. That space contains the LSPG adjoint's, so in this norm the adjoint is
+  never worse. It is no longer the exact derivative of the ROM's outputs, but closer to the full-order one where
+  $\Psi$ holds the adjoint.
+
+- `'concatenate'` (recommended): into a snapshot matrix of their own, as `'separate'`. The basis of every solve is
+  then a state basis of $\lceil$`rb_size`/2$\rceil$ vectors, as the POD gives it, followed by an adjoint basis $\Psi$
+  of $\lfloor$`rb_size`/2$\rfloor$ orthogonalized against it, both weighted per design: the two blocks are
+  $W$-orthonormal and mutually $W$-orthogonal. Slots $\Psi$ cannot fill, e.g. before
+  there are adjoint snapshots, go to the state basis. The states keep their own SVD, so the adjoints cannot
+  crowd them out as with `'augment'`. The primal solve and the adjoint both use the concatenated $V$.
+
+`adjoint_solve` chooses the reduced adjoint: `'lspg'` (above; the exact derivative of the ROM's outputs),
+`'galerkin'` ($\psi = V z$ with $V^T A^T V z = V^T g$, so the adjoint basis is in its trial space, which
+span($S^2 A V$) is not) or `'least_squares'`. The defaults are `'least_squares'` for `'separate'` and
+`'lspg'` otherwise, which keeps the derivative consistent with the forward (LSPG) solve.
+
+`test_space='hybrid'` (`'concatenate'` only) keeps LSPG for the states and changes the test basis of the forward
+solve to $\Phi = [S^2 A V_s, \Psi]$: the state part includes the Jacobian, the adjoint part is the adjoint basis
+itself. The reduced equations $\Phi^T R(V a) = 0$ are solved by Newton with $\Phi$ frozen per iteration, as LSPG
+does, and their adjoint $(\Phi^T A V)^T \lambda = V^T g$, $\psi = \Phi \lambda$ is the derivative of the forward
+solve (checked against finite differences of the ROM's solves) and contains $\Psi$. On the test cases it gave the
+most accurate derivatives (table), with the ROM states as accurate as before for Euler and within
+$1.5\times10^{-8}$ for RANS; the residual is slightly larger ($\eta$ up to $5\times10^{-9}$ for RANS against
+$2\times10^{-10}$), since the forward solve no longer minimizes $\|S R\|$, which matters for a tight
+`eta_threshold`.
+
+Why the LSPG adjoint gains little from adjoint snapshots in $V$: it lies in span($S^2 A V$), so an adjoint $\psi$ in
+$V$ adds $S^2 A \psi$ to its space, not $\psi$. If instead the full-order adjoint lies in span($S^2 A V$), the LSPG
+adjoint equations recover it exactly. That is the case for the transformed snapshot $\chi = A^{-1} S^{-2} \psi$
+($S^2 A \chi = \psi$), one solve with the forward Jacobian per adjoint at the state it was computed at. Stored in
+place of $\psi$ (an experiment, not yet an option), it brought the LSPG adjoint to the Galerkin one's accuracy
+(table) while keeping the consistency with the forward solve.
+
+On the angle-of-attack test cases (three outputs, three FOM designs, seven designs), the relative errors of the
+optimizer's derivatives at the ROM-accepted designs against full-order-only derivatives were:
+
+| | Euler | RANS (Re 200) |
+|---|---|---|
+| state snapshots only | $2$–$6\times10^{-6}$ | $2$–$5\times10^{-6}$ |
+| `'augment'`, `rb_size=12` | $0.5$–$1.3\times10^{-6}$ | $0.8$–$2.2\times10^{-6}$ |
+| `'separate'`, `rb_size=5`, `adjoint_rb_size=9` | $0.8$–$4.6\times10^{-7}$ | $2.6$–$4.4\times10^{-6}$ |
+| `'concatenate'`, `rb_size=5` (3 + 2), `'lspg'` | $1.4$–$3.7\times10^{-6}$ | $1.4$–$3.7\times10^{-6}$ |
+| `'concatenate'`, `rb_size=5` (3 + 2), `'galerkin'` | $1.1$–$1.4\times10^{-8}$ | $2.2$–$5.7\times10^{-6}$ |
+| `'concatenate'`, `rb_size=8` (4 + 4), `'galerkin'` | $0.9$–$1.1\times10^{-8}$ | $0.6$–$1.7\times10^{-8}$ |
+| `'concatenate'`, `rb_size=8` (4 + 4), `'lspg'`, snapshots $\chi = A^{-1} S^{-2} \psi$ | $0.6$–$1.2\times10^{-8}$ | $1.8$–$2.9\times10^{-8}$ |
+| `'concatenate'`, `rb_size=5` (3 + 2), `test_space='hybrid'` | $1.0$–$3.7\times10^{-8}$ | $1.4$–$3.8\times10^{-6}$ |
+| `'concatenate'`, `rb_size=8` (4 + 4), `test_space='hybrid'` | $0.5$–$1.4\times10^{-10}$ | $0.8$–$3.8\times10^{-8}$ |
+| `'concatenate'`, `rb_size=8` (4 + 4), `'least_squares'` | $1$–$3\times10^{-5}$ | $0.5$–$1\times10^{-3}$ |
+
+The ROM states stayed as accurate as with the state basis alone (relative $L^2$ error ~$3\times10^{-9}$). With
+`'galerkin'` the derivatives come down to the level of that state error, once the adjoint basis can hold the
+outputs' adjoints: for RANS two adjoint vectors for three outputs were too few. The least-squares adjoint needs
+all of them in $\Psi$ (as with `'separate'` and `adjoint_rb_size=9`); with fewer it is worse than the LSPG adjoint.
+
+With `'separate'` (and `adjoint_rb_size=9`) the adjoint vector itself is within $10^{-7}$ (Euler) and $2\times10^{-6}$ (RANS) of the
+full-order one, against ~100 % for the other two. For RANS the derivative error stays at the level of the ROM's
+state error, which no adjoint can remove. These one-parameter cases have small derivative errors to begin with;
+the shape-optimization cases, where the errors are large, are what the options are for.
+
 ## Hyper-reduction (comparison)
 
 The LSPG solve above assembles the full residual and the full Jacobian $A$ at every iteration, so its cost per
@@ -274,8 +346,15 @@ small components, such as the SA variable. The sampling stays exact, since $(SA)
 $S A V$ is also LSPG's test basis. The hyper-reduced solve therefore stops where $\widetilde{(SAV)}^T S r = 0$,
 which differs from the ROM's solution by as much as the approximation tilts the test space. On the test cases
 MDEIM tracks the ROM to $10^{-9}$–$10^{-12}$ and DEIM is far less accurate, in line with the sandbox's
-measurements. The adjoint is the LSPG adjoint above, with $S A V$ replaced by its approximation at the
-optimizer's state.
+measurements. With the ROM's hybrid test space (`test_space='hybrid'`), DEIM and MDEIM solve the same hybrid
+equations, the state part of the test basis from their approximation of $S A V$.
+
+Their adjoints are consistent with their own solves. The residual of those solves is exact, so their solutions
+follow the design through the true Jacobian: with the test basis $\tilde\Phi$ frozen, the adjoint is
+$(\tilde\Phi^T A V)^T \lambda = V^T g$, $\psi = \tilde\Phi \lambda$, linearized about the method's own solution.
+It matches finite differences of the hyper-reduced solves (to $10^{-9}$–$10^{-6}$ on the test cases), and costs
+one full Jacobian assembly per design, which the `adjoint_<m>` phase records show. Its derivative contributions
+are evaluated at that solution too, against the full-order and ROM adjoints' at the optimizer's state.
 
 **Sampled assembly.** A sampled row belongs to a cell. Its row is exact when that cell and every facet of it are
 integrated, including facets shared with unsampled cells and facets owned by another rank.

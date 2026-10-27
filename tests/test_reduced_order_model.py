@@ -864,3 +864,258 @@ def test_g_conv_limit_is_relative_to_the_first_g():
     assert result.converged
     assert rom.last_solver.last_g_norm <= max(rom.newton_atol, 1e-10 * rom.last_solver.g0)
 
+
+
+# ----------------------------------------------------------------------
+# Adjoint snapshots
+# ----------------------------------------------------------------------
+@pytest.mark.unit_test
+def test_tagged_snapshots_are_duplicates_only_of_their_kind():
+    """An adjoint snapshot at a design is no duplicate of that design's state snapshot, but a
+    second one of the same output row is; only state columns are counted as states."""
+    from dragonfly_sim.core.pod import SnapshotMatrix
+    comm = MPI.COMM_WORLD
+    sm = SnapshotMatrix(comm)
+    x = PETSc.Vec().createMPI(40, comm=comm)
+    rng = np.random.default_rng(comm.rank)
+    p = np.array([0.1, 2.0])
+    for tag in (None, ('adjoint', 0), ('adjoint', 1)):
+        x.array[:] = rng.standard_normal(x.getLocalSize())
+        assert sm.process_and_append_to_snapshot_lists(x, p, tag=tag)
+    x.array[:] = rng.standard_normal(x.getLocalSize())
+    assert not sm.process_and_append_to_snapshot_lists(x, p, tag=('adjoint', 0))
+    assert sm.n_snapshots == 3 and list(sm.state_mask) == [1.0, 0.0, 0.0]
+    x.destroy()
+    sm.destroy()
+
+
+@pytest.mark.unit_test
+def test_centring_and_mean_use_state_snapshots_only():
+    """With an adjoint snapshot in the snapshot matrix, the 'mean' offset of a centred
+    local_weighted basis is the weighted mean of the state snapshots alone, and the basis
+    still spans the adjoint direction (it is not centred)."""
+    comm = MPI.COMM_WORLD
+    n = 30
+    pod = PODBasis(comm, n, basis_mode='local_weighted', centering='mean', mean_weighting='uniform')
+    x = PETSc.Vec().createMPI(n, comm=comm)
+    rstart, rend = x.getOwnershipRange()
+    rng = np.random.default_rng(4)
+    states = [rng.standard_normal(n) for _ in range(3)]
+    adjoint = rng.standard_normal(n)
+    for j, s in enumerate(states):
+        x.array[:] = s[rstart:rend]
+        pod.snapshot_matrix.process_and_append_to_snapshot_lists(x, np.array([float(j)]))
+    x.array[:] = adjoint[rstart:rend]
+    pod.snapshot_matrix.process_and_append_to_snapshot_lists(x, np.array([1.0]), tag=('adjoint', 0))
+    pod.construct_basis(rb_size=4, local_parametervector=np.array([1.0]), layout_vec=x,
+                        snapshot_weights=np.ones(4))
+    mean = global_array(comm, pod.mean.getArray())
+    assert mean == pytest.approx(np.mean(states, axis=0), rel=1e-12, abs=1e-12)
+    V = global_array(comm, pod.basis.getDenseArray())
+    a = adjoint - mean * 0.0                     # the adjoint column is not centred: it is in span(V)
+    assert np.linalg.norm(a - V @ np.linalg.lstsq(V, a, rcond=None)[0]) <= 1e-10 * np.linalg.norm(a)
+    x.destroy()
+    pod.destroy()
+
+
+@pytest.mark.unit_test
+def test_least_squares_adjoint_recovers_an_adjoint_in_its_basis(in_tmp_dir):
+    """With the exact adjoint in the adjoint basis, the least-squares adjoint is that adjoint."""
+    from dragonfly_sim.core.reduced_order_model import LSPGAdjoint
+    from dragonfly_sim.utils.pod_utils import petsc_dense_from_local_block
+    rom = ReducedOrderModel(rb_size=3)
+    wt = make_windtunnel("euler", rom=rom, suffix="lsadj")
+    m = wt.sim_model
+    comm = m.mesh_obj.mesh.comm
+    u, _, _ = wt.solve_forward(np.radians(2.0))
+    rng = np.random.default_rng(comm.rank + 7)
+    n_local = u.size
+    V = petsc_dense_from_local_block(comm, rng.standard_normal((n_local, 3)))
+    psi_true = rng.standard_normal(n_local)
+    m.set_up_solver()
+    with m.steady_residual():
+        m.problem.J(m.u_vec.x.petsc_vec, m.problem._A)
+    x, y = m.problem._A.createVecLeft(), m.problem._A.createVecRight()
+    x.array[:] = psi_true
+    m.problem._A.multTranspose(x, y)
+    g = y.getArray().copy()
+    Psi = petsc_dense_from_local_block(comm, psi_true[:, None].copy())
+    S = rom.residual_weight(m)
+    adj = LSPGAdjoint(V, S, comm, [2.0], u, adjoint_basis=Psi,
+                      dual_weight=1.0 / np.sqrt(rom.W.w.getArray(readonly=True)))
+    psi = adj.solve(m, g)
+    err = np.sqrt(comm.allreduce(float(np.sum((psi - psi_true)**2)), op=MPI.SUM))
+    assert err <= 1e-8 * np.sqrt(comm.allreduce(float(psi_true @ psi_true), op=MPI.SUM))
+    adj.destroy()
+    for obj in (V, Psi, x, y):
+        obj.destroy()
+
+
+@pytest.mark.parametrize("mode, rb_size", [("separate", 5), ("augment", 12)])
+@pytest.mark.verification
+def test_windtunnel_adds_the_full_order_adjoints_as_snapshots(in_tmp_dir, mode, rb_size):
+    """The optimizer's full-order adjoints (designs the FOM solved) become ROM snapshots, one per
+    output row and design; the state snapshot count and the derivatives' agreement with the
+    full-order ones are kept, and with a separate adjoint basis the accepted ROM's adjoint is
+    the full-order one to ~1e-6 (here the adjoint basis holds the nearby designs' adjoints)."""
+    import csdl_alpha as csdl
+    recorder = csdl.Recorder(inline=False)
+    recorder.start()
+    rom = ReducedOrderModel(rb_size=rb_size, eta_threshold=1e-9, adjoint_snapshots=mode, adjoint_rb_size=9)
+    wt = make_windtunnel("euler", rom=rom, suffix="adjsnap_" + mode, compute_all_adjoint_errors=True)
+    alpha = csdl.Variable(name='alpha', value=np.array([np.radians(ALPHAS[0])]))
+    alpha.set_as_design_variable()
+    u_vec = wt.evaluate(alpha=alpha)
+    out = wt.postprocessor.evaluate(u_vec, alpha=alpha)
+    out.D.set_as_objective()
+    # not L: on the flat slip wall the force is the normal pressure force, and L's adjoint is a
+    # multiple of D's (which the snapshot matrix then rightly finds to add no direction)
+    out.M_pitch.set_as_constraint()
+    recorder.stop()
+    sim = csdl.experimental.JaxSimulator(recorder, gpu=False)
+    for a in ALPHAS:
+        sim[alpha] = np.array([np.radians(a)])
+        sim.run()
+        sim.compute_totals()
+    assert rom.n_snapshots == 3 and rom.n_adjoint_snapshots == 6          # 3 FOM designs x 2 output rows
+    if MPI.COMM_WORLD.rank == 0:
+        ds = wt.data_store
+        assert [(e[1], e[2]) for e in ds.adjoint_snapshots] == [(0, True), (1, True)] * 3
+        accepted = [e for e in ds.adjoint_errors if e[5]]
+        # compute_totals re-runs every design: the accepted ones are solved by the ROM twice
+        assert accepted and [acc for _, acc in ds.ROM_meets_threshold] == [False] + [True] * 4
+        for e in ds.adjoint_derivative_errors:
+            if e[2]:
+                assert e[3]["alpha"][1] < 1e-5
+        if mode == "separate":
+            assert max(e[3] for e in accepted) < 1e-4
+
+
+@pytest.mark.unit_test
+def test_galerkin_adjoint_recovers_an_adjoint_in_the_basis(in_tmp_dir):
+    """The Galerkin reduced adjoint (adjoint_solve='galerkin') is exact for an adjoint in span(V)."""
+    from dragonfly_sim.core.reduced_order_model import LSPGAdjoint
+    from dragonfly_sim.utils.pod_utils import petsc_dense_from_local_block
+    rom = ReducedOrderModel(rb_size=3)
+    wt = make_windtunnel("euler", rom=rom, suffix="galadj")
+    m = wt.sim_model
+    comm = m.mesh_obj.mesh.comm
+    u, _, _ = wt.solve_forward(np.radians(2.0))
+    rng = np.random.default_rng(comm.rank + 3)
+    psi_true = rng.standard_normal(u.size)
+    V = petsc_dense_from_local_block(comm, np.column_stack([rng.standard_normal((u.size, 2)), psi_true]))
+    m.set_up_solver()
+    with m.steady_residual():
+        m.problem.J(m.u_vec.x.petsc_vec, m.problem._A)
+    x, y = m.problem._A.createVecLeft(), m.problem._A.createVecRight()
+    x.array[:] = psi_true
+    m.problem._A.multTranspose(x, y)
+    adj = LSPGAdjoint(V, rom.residual_weight(m), comm, [2.0], u, galerkin=True)
+    psi = adj.solve(m, y.getArray().copy())
+    err = np.sqrt(comm.allreduce(float(np.sum((psi - psi_true)**2)), op=MPI.SUM))
+    assert err <= 1e-8 * np.sqrt(comm.allreduce(float(psi_true @ psi_true), op=MPI.SUM))
+    adj.destroy()
+    for obj in (V, x, y):
+        obj.destroy()
+
+
+@pytest.mark.parametrize("kind, rb_size, test_space", [("euler", 5, 'lspg'), ("rans", 8, 'lspg'),
+                                                     ("euler", 5, 'hybrid'), ("rans", 8, 'hybrid')])
+@pytest.mark.verification
+def test_concatenated_state_and_adjoint_basis(in_tmp_dir, kind, rb_size, test_space):
+    """
+    adjoint_snapshots='concatenate': the basis is the state basis of ceil(rb_size / 2) vectors,
+    unchanged, followed by floor(rb_size / 2) adjoint vectors orthogonalized against it (all
+    rb_size state vectors before there are adjoint snapshots), the whole W-orthonormal; the ROM
+    is accepted as with the state basis, the default adjoint is the LSPG one, and with the
+    Galerkin adjoint, or the hybrid test space with its own adjoint, the optimizer's derivatives
+    match the full-order ones to ~1e-7.
+    """
+    import csdl_alpha as csdl
+    eta = 1e-9 if kind == "euler" else 1e-7
+
+    def derivatives(rom):
+        recorder = csdl.Recorder(inline=False)
+        recorder.start()
+        wt = make_windtunnel(kind, rom=rom, suffix="concat_{}".format(rom is not None))
+        alpha = csdl.Variable(name='alpha', value=np.array([np.radians(ALPHAS[0])]))
+        alpha.set_as_design_variable()
+        u_vec = wt.evaluate(alpha=alpha)
+        out = wt.postprocessor.evaluate(u_vec, alpha=alpha)
+        out.D.set_as_objective()
+        out.M_pitch.set_as_constraint()
+        recorder.stop()
+        sim = csdl.experimental.JaxSimulator(recorder, gpu=False)
+        totals, widths = [], []
+        for a in ALPHAS:
+            sim[alpha] = np.array([np.radians(a)])
+            sim.run()
+            if rom is not None and rom.basis is not None:
+                widths.append((rom.n_adjoint_snapshots, rom.pod.basis.getSize()[1], rom.basis.getSize()[1]))
+            t = sim.compute_totals()
+            totals.append([float(np.asarray(t[o, alpha]).ravel()[0]) for o in (out.D, out.M_pitch)])
+        return wt, np.array(totals), widths
+
+    _, reference, _ = derivatives(None)
+    assert ReducedOrderModel(rb_size=rb_size, adjoint_snapshots='concatenate').adjoint_solve == 'lspg'
+    rom = ReducedOrderModel(rb_size=rb_size, eta_threshold=eta, adjoint_snapshots='concatenate',
+                            **(dict(adjoint_solve='galerkin') if test_space == 'lspg' else dict(test_space='hybrid')))
+    assert rom.adjoint_rb_size == rb_size // 2
+    wt, totals, widths = derivatives(rom)
+    n_state, n_adjoint = (rb_size + 1) // 2, rb_size // 2
+    for n_adj_snapshots, state_width, width in widths:
+        if n_adj_snapshots == 0:
+            assert state_width == min(rb_size, rom.n_snapshots) and width == state_width
+        elif n_adj_snapshots >= n_adjoint:
+            assert state_width <= n_state and width <= rb_size
+    m = wt.sim_model
+    comm = m.mesh_obj.mesh.comm
+    V = rom.basis.getDenseArray()
+    w = rom.W.w.getArray(readonly=True)
+    n_s = rom.pod.basis.getSize()[1]
+    assert V.shape[1] > n_s                                     # adjoint directions in the basis
+    assert np.array_equal(V[:, :n_s], rom.pod.basis.getDenseArray())   # the state block as the POD gives it
+    assert comm.allreduce(V.T @ (w[:, None] * V), op=MPI.SUM) == pytest.approx(np.eye(V.shape[1]), abs=1e-10)
+    if comm.rank == 0:
+        ds = wt.data_store
+        assert [acc for _, acc in ds.ROM_meets_threshold] == [False] + [True] * 4
+    accepted = slice(3, None)
+    assert np.max(np.abs(totals[accepted] - reference[accepted]) / np.abs(reference[accepted])) < 1e-7
+    # the FOM designs: the full-order adjoint (identical serially; in parallel solves differ by round-off)
+    assert totals[:3] == pytest.approx(reference[:3], rel=1e-10)
+
+
+@pytest.mark.verification
+def test_hybrid_adjoint_is_the_derivative_of_the_hybrid_rom(in_tmp_dir):
+    """test_space='hybrid': the derivative at an accepted design is that of the hybrid ROM's own
+    outputs (central differences of its solves, the basis fixed between them), as the LSPG
+    adjoint's is of the LSPG ROM's."""
+    import csdl_alpha as csdl
+    recorder = csdl.Recorder(inline=False)
+    recorder.start()
+    rom = ReducedOrderModel(rb_size=5, eta_threshold=1e-9, adjoint_snapshots='concatenate', test_space='hybrid')
+    wt = make_windtunnel("euler", rom=rom, suffix="hybrid_fd")
+    alpha = csdl.Variable(name='alpha', value=np.array([np.radians(ALPHAS[0])]))
+    alpha.set_as_design_variable()
+    u_vec = wt.evaluate(alpha=alpha)
+    out = wt.postprocessor.evaluate(u_vec, alpha=alpha)
+    out.D.set_as_objective()
+    out.M_pitch.set_as_constraint()
+    recorder.stop()
+    sim = csdl.experimental.JaxSimulator(recorder, gpu=False)
+    for a in ALPHAS[:3]:
+        sim[alpha] = np.array([np.radians(a)])
+        sim.run()
+        sim.compute_totals()                     # FOM designs: their adjoints become snapshots
+    a = np.radians(ALPHAS[4])
+    sim[alpha] = np.array([a])
+    sim.run()
+    dD = float(np.asarray(sim.compute_totals()[out.D, alpha]).ravel()[0])
+    from dragonfly_sim.core.reduced_order_model import HybridLSPGAdjoint
+    assert isinstance(rom.adjoint, HybridLSPGAdjoint) and rom.adjoint.accepted
+    n_snapshots = (rom.n_snapshots, rom.n_adjoint_snapshots)
+    h = 1e-5
+    fd = (wt.solve_forward(a + h)[2]["D"] - wt.solve_forward(a - h)[2]["D"]) / (2 * h)
+    assert (rom.n_snapshots, rom.n_adjoint_snapshots) == n_snapshots       # both solves were the ROM's
+    PETSc.Sys.Print("HYBRID-ADJOINT-CHECK: dD/dalpha {:.12f}, FD of the ROM solves {:.12f}".format(dD, fd))
+    assert abs(fd - dD) < 1e-6 * abs(fd), (fd, dD)

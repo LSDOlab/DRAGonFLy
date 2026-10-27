@@ -33,7 +33,7 @@ from scipy.spatial.distance import cdist
 from mpi4py import MPI
 from petsc4py import PETSc
 
-from dragonfly_sim.utils.pod_utils import (petsc_append_dense_column, petsc_dense_from_local_block,
+from dragonfly_sim.utils.pod_utils import (petsc_dense_from_local_block,
                                            petsc_small_mat_from_numpy, petsc_small_vec_from_numpy,
                                            petsc_small_mat_to_numpy, cubic_dist_hat,
                                            cubic_dist_hat_fixed, basis_size_floor, cubic_weights)
@@ -84,6 +84,11 @@ class SnapshotMatrix:
 
         self.snapshot_parameter_array = np.array([])
         self.snapshot_list_parameters = []
+        # the kind of each snapshot (column of R/VT): None for a state, any other tag (e.g.
+        # ('adjoint', row) in core/reduced_order_model.py) for data at the same design that is
+        # not a state. Duplicates are detected among snapshots of one tag; centring
+        # (PODBasis) applies to state columns only.
+        self.snapshot_list_tags = []
         self.rejected_snapshot_parameters = []
         # rejected_snapshot_reconstruction_weights[j] has the length n_snapshots
         # had when rejection j happened; consumers zero-pad it. Valid because
@@ -97,11 +102,16 @@ class SnapshotMatrix:
     def construct_snapshot_parameter_array(self):
         self.snapshot_parameter_array = np.vstack(self.snapshot_list_parameters)
 
-    def _is_duplicate_parameter(self, par_vec):
-        if len(self.snapshot_list_parameters) == 0:
+    def _is_duplicate_parameter(self, par_vec, tag=None):
+        same = [p for p, t in zip(self.snapshot_list_parameters, self.snapshot_list_tags) if t == tag]
+        if len(same) == 0:
             return False
-        self.construct_snapshot_parameter_array()
-        return cdist(par_vec[None, :], self.snapshot_parameter_array).min() <= 1e-10
+        return cdist(par_vec[None, :], np.vstack(same)).min() <= 1e-10
+
+    @property
+    def state_mask(self):
+        """Per snapshot (column of R/VT): 1.0 for a state, 0.0 for another kind."""
+        return np.array([t is None for t in self.snapshot_list_tags], dtype=float)
 
     # ------------------------------------------------------------------
     # Snapshot update
@@ -115,13 +125,14 @@ class SnapshotMatrix:
         self.W.mult(x, Wx)
         return Wx, True
 
-    def process_and_append_to_snapshot_lists(self, x_k, par_vec):
+    def process_and_append_to_snapshot_lists(self, x_k, par_vec, tag=None):
         """
         Incorporate snapshot `x_k` (not modified) with parameter vector
-        `par_vec`. Returns True if it added a new basis direction, False if
-        it was a duplicate parameter or rank-deficient within qr_rank_tol.
+        `par_vec` and kind `tag` (None: a state). Returns True if it added a
+        new basis direction, False if it was a duplicate parameter (among
+        snapshots of its tag) or rank-deficient within qr_rank_tol.
         """
-        if self._is_duplicate_parameter(par_vec):
+        if self._is_duplicate_parameter(par_vec, tag):
             PETSc.Sys.Print("Snapshot parameter vector already present; keeping its location and "
                             "reconstruction weights, adding no column.")
             Wx, owns_Wx = self._apply_W(x_k)
@@ -145,6 +156,7 @@ class SnapshotMatrix:
         t0 = perf_counter()
         new_direction_found = self._update_weighted_QR_and_SVD(x_k)
         self.snapshot_list_parameters += [deepcopy(par_vec)]
+        self.snapshot_list_tags += [tag]
         PETSc.Sys.Print("Snapshot append time: {}".format(perf_counter() - t0))
 
         assert len(self.snapshot_list_parameters) == self.n_snapshots
@@ -199,6 +211,41 @@ class SnapshotMatrix:
         """||x||_W = sqrt(x^T W x), given W x. Collective."""
         return float(np.sqrt(max(np.real(x.dot(Wx)), 0.0)))
 
+    # rows of Q rotated per block in _rotated_Q: a block of ~ROTATION_BLOCK_ENTRIES
+    # entries is the only temporary
+    ROTATION_BLOCK_ENTRIES = 2**22
+
+    def _rotated_Q(self, e_local, U_R, k):
+        """
+        Q' = [Q e] U_R[:, :k] = Q U_R[:r, :k] (+ e U_R[r, :k] with a new direction e,
+        this rank's slice), without forming [Q e]: a block of rows at a time, written
+        straight into Q', or over Q itself when its width does not change (k = r, e.g.
+        at max_rank). The peak is then Q and Q' (one copy of Q in place) instead of Q,
+        [Q e], the product and Q'. Collective.
+        """
+        comm = self.comm
+        r = 0 if self.Q is None else self.Q.getSize()[1]
+        Q_local = None if self.Q is None else self.Q.getDenseArray()
+        n_local = Q_local.shape[0] if Q_local is not None else e_local.shape[0]
+        top = U_R[:r, :k]
+        e_row = None if e_local is None else U_R[r, :k]
+        if self.Q is not None and k == r:
+            Q_new, out = self.Q, Q_local
+        else:
+            M_global = comm.allreduce(n_local, op=MPI.SUM)
+            Q_new = PETSc.Mat().createDense(size=((n_local, M_global), (PETSc.DECIDE, k)), comm=comm)
+            Q_new.setUp()
+            out = Q_new.getDenseArray()
+        block = max(1, self.ROTATION_BLOCK_ENTRIES // max(k, 1))
+        for start in range(0, n_local, block):
+            rows = slice(start, min(start + block, n_local))
+            part = Q_local[rows] @ top if r > 0 else np.zeros((rows.stop - rows.start, k))
+            if e_row is not None:
+                part += e_local[rows, None] * e_row[None, :]
+            out[rows] = part
+        Q_new.assemble()
+        return Q_new
+
     def _update_weighted_QR_and_SVD(self, x_k):
         comm = self.comm
         Wx, owns_Wx = self._apply_W(x_k)
@@ -225,30 +272,25 @@ class SnapshotMatrix:
                             "remains empty.".format(self.qr_rank_tol))
             R_new_np = np.zeros((0, R_old_np.shape[1] + 1))
 
-        # Q extended by the new direction
-        Q_ext = petsc_append_dense_column(comm, self.Q, e_local / rho) if new_direction_found else self.Q
-
         # SVD of the small R, computed redundantly (and identically) on every rank
         if R_new_np.shape[0] > 0 and R_new_np.shape[1] > 0:
             U_R_np, Sigma_np, VT_np = sp_la.svd(R_new_np, full_matrices=False)
         else:
             U_R_np, Sigma_np, VT_np = np.zeros((0, 0)), np.zeros((0,)), np.zeros((0, R_new_np.shape[1]))
 
-        # Rotate Q into R's left-singular basis, truncated to max_rank:
-        # Q' = Q U_R[:, :k], R' = diag(Sigma[:k]) VT[:k]. Q' stays W-orthonormal,
-        # Q' R' is the rank-k truncation of the snapshot matrix, and the SVD of
-        # R' has U = I, so U = Q'.
-        if Q_ext is not None:
+        # Rotate [Q e] (e the new direction, if any) into R's left-singular basis,
+        # truncated to max_rank: Q' = [Q e] U_R[:, :k], R' = diag(Sigma[:k]) VT[:k].
+        # Q' stays W-orthonormal, Q' R' is the rank-k truncation of the snapshot
+        # matrix, and the SVD of R' has U = I, so U = Q'.
+        if self.Q is not None or new_direction_found:
             k = Sigma_np.shape[0] if self.max_rank is None else min(Sigma_np.shape[0], self.max_rank)
-            Q_new = petsc_dense_from_local_block(comm, Q_ext.getDenseArray() @ U_R_np[:, :k],
-                                                 Q_ext.getSize()[0])
+            Q_new = self._rotated_Q(e_local / rho if new_direction_found else None, U_R_np, k)
             Sigma_np = Sigma_np[:k]
             VT_np = VT_np[:k, :]
             R_new_np = Sigma_np[:, None] * VT_np
-            Q_ext.destroy()
         else:
             Q_new = None
-        if self.Q is not None and self.Q is not Q_ext:
+        if self.Q is not None and self.Q is not Q_new:
             self.Q.destroy()
         for obj in (self.R, self.Sigma, self.VT):
             if obj is not None:
@@ -414,16 +456,27 @@ class PODBasis:
                                 resid, self.WARM_START_SPAN_TOL))
         return g
 
-    def _set_basis_from_local_block(self, basis_local_block):
+    def _set_basis_from_product(self, U_local, M):
         """
-        Rebuild self.basis from this rank's row block. (MatCreateSubMatrix is
-        not used to slice columns of U: for MATDENSE it fails on a width
-        change, and under MPI returns replicated columns or corrupts the heap,
-        depending on how the column IS is split.)
+        Rebuild self.basis as U M, U_local this rank's rows of the snapshot basis and M
+        small and replicated, a block of rows at a time straight into the new Mat (no
+        full-size temporary: for MDEIM a column is a whole Jacobian). (MatCreateSubMatrix
+        is not used to slice columns of U: for MATDENSE it fails on a width change, and
+        under MPI returns replicated columns or corrupts the heap, depending on how the
+        column IS is split.)
         """
         if self.basis is not None:
             self.basis.destroy()
-        self.basis = petsc_dense_from_local_block(self.comm, np.ascontiguousarray(basis_local_block))
+        n_local, k = U_local.shape[0], M.shape[1]
+        self.basis = PETSc.Mat().createDense(
+            size=((n_local, self.comm.allreduce(n_local, op=MPI.SUM)), (PETSc.DECIDE, k)), comm=self.comm)
+        self.basis.setUp()
+        out = self.basis.getDenseArray()
+        block = max(1, SnapshotMatrix.ROTATION_BLOCK_ENTRIES // max(k, 1))
+        for start in range(0, n_local, block):
+            rows = slice(start, min(start + block, n_local))
+            out[rows] = U_local[rows] @ M
+        self.basis.assemble()
         return self.basis
 
     def _local_weighted_snapshot_weights(self, local_parametervector, weightfunction,
@@ -567,7 +620,7 @@ class PODBasis:
         if self.basis_mode == 'global' or n_snapshots < 2:
             # bounded by the rank, not n_snapshots: a rank-deficient snapshot
             # adds a column to R/VT but none to U
-            self._set_basis_from_local_block(U.getDenseArray()[:, :min(basis_rank, rb_size)])
+            self._set_basis_from_product(U.getDenseArray(), np.eye(basis_rank)[:, :min(basis_rank, rb_size)])
         else:
             if snapshot_weights is not None:
                 weights = np.asarray(snapshot_weights, dtype=float).ravel()
@@ -600,18 +653,21 @@ class PODBasis:
                 # of the small factor. The mean is S x for weights x over the columns
                 # (g_c = Sig VT x, x bounded); the warm start enters through its
                 # projection g_c = U^T W u0 directly (see _warm_start_projection)
+                # only state columns are centred (and make up the mean): an adjoint
+                # snapshot (core/reduced_order_model.py) is not a state
+                state = self.snapshot_matrix.state_mask
                 if self.centering == 'warm_start':
                     if warm_start is None:
                         raise ValueError("centering='warm_start' needs the warm_start solution")
                     g_c = self._warm_start_projection(warm_start, U, Sig_np, VT_np)
                 else:
-                    x = weights.copy() if self.mean_weighting == 'snapshot_weights' \
-                        else np.full(num_rows, 1.0 / max(num_rows, 1))
+                    x = weights * state if self.mean_weighting == 'snapshot_weights' else state.copy()
+                    x = x / max(x.sum(), 1e-300)
                     g_c = Sig_np * (VT_np @ x)
                 self.mean = U.createVecLeft()
                 self.mean.getArray()[:] = U.getDenseArray() @ g_c
                 self.mean.assemble()
-                K = K - np.outer(g_c, weight_mat.sum(axis=0))
+                K = K - np.outer(g_c, (weight_mat * state[:, None]).sum(axis=0))
 
             # SVD of K: small (rank x num_cols), replicated, so dense scipy
             t0 = perf_counter()
@@ -627,7 +683,7 @@ class PODBasis:
             # the basis is U U_tilde truncated to rb_size; truncate U_tilde first
             # so the intermediate never exceeds rb_size columns
             k = min(rb_size, n_rank)
-            self._set_basis_from_local_block(U.getDenseArray() @ U_tilde_np[:, :k])
+            self._set_basis_from_product(U.getDenseArray(), U_tilde_np[:, :k])
             PETSc.Sys.Print("local_weighted basis{}: {} of {} snapshots carry nonzero weight -> {} basis "
                             "vectors (rb_size = {}, numerical rank {}); small SVD time {}".format(
                                 "" if self.centering is None else ", centred ({})".format(self.centering),

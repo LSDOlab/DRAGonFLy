@@ -656,7 +656,7 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         # the hyper-reduction comparison trains on the Jacobians of a FOM solve of a new design
         harvest = self.hyper_reduction is not None and not repeat
         solution_fom, fom_converged = self._run_fom_solve(
-            harvest_basis=(rom.pod.basis if rom_result is not None else None) if harvest else False)
+            harvest_basis=(rom.basis if rom_result is not None else None) if harvest else False)
         if rom_forces is not None and fom_converged:
             self._log_rom_error(rom_forces)
             self._log_rom_state_error(rom_result.solution, solution_fom)
@@ -783,6 +783,9 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
                                  self._phase_record)
         finally:
             model.set_u_vec(state)
+            if self.release_solver_memory:
+                # the comparison's solves rebuilt the Newton problem the FOM solve had freed
+                model.release_solver()
         for res in results:
             self._log_hyper_reduced_solve(res, rom_result, rom_forces, solution_fom, fom_forces)
 
@@ -959,6 +962,7 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         # the full-order adjoint is the optimizer's, as without a ROM
         self._fom_adjoint(input_vals, u_vec, alpha, mesh_node_motions, d_outputs, d_residuals,
                           pre_apply_inverse_jacobian_time)
+        self._add_adjoint_snapshot(parameter_vector, d_residuals['u_vec'])
         psi_rom = None
         if (self.compute_all_adjoint_errors and adjoint is not None and not adjoint.accepted
                 and adjoint.matches_design(parameter_vector)):
@@ -967,6 +971,22 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
             psi_rom = self._log_rejected_rom_adjoint_error(adjoint, d_outputs, d_residuals['u_vec'])
         self._hyper_reduced_adjoints(input_vals, u_vec, alpha, mesh_node_motions, d_outputs,
                                      parameter_vector, d_residuals['u_vec'], psi_rom)
+
+    def _add_adjoint_snapshot(self, parameter_vector, psi):
+        """The optimizer's full-order adjoint psi of this output row as a ROM snapshot
+        (ReducedOrderModel adjoint_snapshots), at a design the FOM solved and converged, whose
+        state snapshot the ROM holds. Collective."""
+        rom = self.reduced_order_model
+        if rom is None or rom.adjoint_snapshots is None:
+            return
+        fom = self._fom_design
+        if fom is None or not fom[1] or not np.array_equal(parameter_vector, fom[0]):
+            return
+        eval_idx, row = self.eval_idx - 1, self._current_adjoint_row
+        with self._phase_record("adjoint_snapshot", eval_idx):
+            added = rom.add_adjoint_snapshot(self.sim_model, parameter_vector, row, psi)
+        if self.mesh.mesh.comm.Get_rank() == 0:
+            self.data_store.adjoint_snapshots += [(eval_idx, row, bool(added), rom.n_adjoint_snapshots)]
 
     def _fom_adjoint(self, input_vals, u_vec, alpha, mesh_node_motions, d_outputs, d_residuals,
                      start_time, log=True):
@@ -1119,25 +1139,48 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         fom_norm = norm(psi_fom)
         rom_norm = None if psi_rom is None else norm(psi_rom)
         eval_idx, row = self.eval_idx - 1, self._current_adjoint_row
-        for m in hr.prepared_methods:
-            try:
-                with self._phase_record("adjoint_" + m, eval_idx):
-                    psi, walltime = hr.adjoint(m, self.sim_model, parameter_vector, d_outputs['u_vec'])
-            except ValueError as exc:
-                PETSc.Sys.Print("{} adjoint failed: {}".format(m.upper(), exc))
-                continue
-            abs_err = norm(psi - psi_fom)
-            rel_err = abs_err / fom_norm if fom_norm > 0.0 else np.nan
-            rel_rom = np.nan if psi_rom is None or not rom_norm > 0.0 else norm(psi - psi_rom) / rom_norm
-            contribution = self._contribution_errors(psi, psi_fom, psi_rom)
-            if comm.Get_rank() == 0:
-                getattr(self.data_store, m + "_adjoint_errors").append(
-                    (eval_idx, row, float(abs_err), float(rel_err), float(rel_rom), float(walltime)))
-                getattr(self.data_store, m + "_adjoint_derivative_errors").append((eval_idx, row, contribution))
-            PETSc.Sys.Print("{} adjoint error (output row {}): |psi - psi_fom| = {:.3e}, relative {:.3e}; "
-                            "relative to the ROM adjoint {:.3e}; {:.3f} s; derivative contributions: {}".format(
-                                m.upper(), row, abs_err, rel_err, rel_rom, walltime,
-                                self._contribution_string(contribution)))
+        model = self.sim_model
+        try:
+            for m in hr.prepared_methods:
+                self._hyper_reduced_adjoint(hr, m, parameter_vector, d_outputs, psi_fom, psi_rom, fom_norm,
+                                            rom_norm, eval_idx, row)
+        finally:
+            # the optimizer's state, which compute_jacvec_product linearizes about
+            model.set_u_vec(u_vec)
+            model.update_derived_fields()
+
+    def _hyper_reduced_adjoint(self, hr, m, parameter_vector, d_outputs, psi_fom, psi_rom, fom_norm, rom_norm,
+                               eval_idx, row):
+        """Method m's adjoint, linearized about its own solution (consistent with its forward
+        solve), and its errors against the full-order and ROM adjoints and contributions. Leaves
+        the model at that solution. Collective."""
+        comm = self.mesh.mesh.comm
+
+        def norm(x):
+            return np.sqrt(comm.allreduce(float(x @ x), op=MPI.SUM))
+
+        state = hr.solution(m)
+        if state is None or not comm.allreduce(bool(np.all(np.isfinite(state))), op=MPI.LAND):
+            return
+        self.sim_model.set_u_vec(state)
+        try:
+            with self._phase_record("adjoint_" + m, eval_idx):
+                psi, walltime = hr.adjoint(m, self.sim_model, parameter_vector, d_outputs['u_vec'])
+        except ValueError as exc:
+            PETSc.Sys.Print("{} adjoint failed: {}".format(m.upper(), exc))
+            return
+        abs_err = norm(psi - psi_fom)
+        rel_err = abs_err / fom_norm if fom_norm > 0.0 else np.nan
+        rel_rom = np.nan if psi_rom is None or not rom_norm > 0.0 else norm(psi - psi_rom) / rom_norm
+        contribution = self._contribution_errors(psi, psi_fom, psi_rom, state=state)
+        if comm.Get_rank() == 0:
+            getattr(self.data_store, m + "_adjoint_errors").append(
+                (eval_idx, row, float(abs_err), float(rel_err), float(rel_rom), float(walltime)))
+            getattr(self.data_store, m + "_adjoint_derivative_errors").append((eval_idx, row, contribution))
+        PETSc.Sys.Print("{} adjoint error (output row {}): |psi - psi_fom| = {:.3e}, relative {:.3e}; "
+                        "relative to the ROM adjoint {:.3e}; {:.3f} s; derivative contributions: {}".format(
+                            m.upper(), row, abs_err, rel_err, rel_rom, walltime,
+                            self._contribution_string(contribution)))
 
     def _record_adjoint_error(self, psi_rom, psi_fom, rom_accepted, rom_walltime):
         """(eval_idx, output row, ||psi_rom - psi_fom||_2, that relative to ||psi_fom||_2,
@@ -1162,27 +1205,42 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
                             "accepted" if rom_accepted else "rejected", row, abs_err, rel_err,
                             self._contribution_string(contribution)))
 
-    def _derivative_contributions(self, psis):
+    def _derivative_contributions(self, psis, state=None):
         """
         The contributions of the adjoints `psis` (owned entries) to the derivative of an
         output: (dR/dinput)^T psi for every input of the model at the linearization point of
         the current adjoint call, as compute_jacvec_product forms them: {'alpha': float,
         'mesh_node_motions': this rank's owned entries in the mesh coordinate space} (the
         latter with mesh node motions). dR/dalpha and dR/dx are built once for all of them.
+        With `state` (owned entries), at that state instead (operators built and freed here).
         Collective.
         """
         u_vec, alpha, mesh_node_motions = self._adjoint_point
         m = self.sim_model
         comm = self.mesh.mesh.comm
+        if state is not None:
+            # another linearization point (a hyper-reduced solution): its own operators, freed below
+            ops = self._contribution_operators_at(state, mesh_node_motions)
+            try:
+                return self._apply_contribution_operators(ops, psis)
+            finally:
+                self._destroy_contribution_operators(ops)
         if self._contribution_operators is None:
             # dR/dalpha and dR/dx at the adjoint's linearization point, kept for the rest of the
             # adjoint call (released at its end)
-            local_size = m.u_vec.x.petsc_vec.local_size
-            dr_dalpha = np.array(m.assemble_dRdalpha_vec(u_vec).getArray()[:local_size], copy=True)
-            dr_dxmesh = None if mesh_node_motions is None else \
-                m.compute_dRdxmesh_mat(u_vec, self.mesh.coordinate_space)
-            self._contribution_operators = (dr_dalpha, dr_dxmesh)
-        dr_dalpha, dr_dxmesh = self._contribution_operators
+            self._contribution_operators = self._contribution_operators_at(u_vec, mesh_node_motions)
+        return self._apply_contribution_operators(self._contribution_operators, psis)
+
+    def _contribution_operators_at(self, state, mesh_node_motions):
+        m = self.sim_model
+        local_size = m.u_vec.x.petsc_vec.local_size
+        dr_dalpha = np.array(m.assemble_dRdalpha_vec(state).getArray()[:local_size], copy=True)
+        dr_dxmesh = None if mesh_node_motions is None else m.compute_dRdxmesh_mat(state, self.mesh.coordinate_space)
+        return dr_dalpha, dr_dxmesh
+
+    def _apply_contribution_operators(self, ops, psis):
+        comm = self.mesh.mesh.comm
+        dr_dalpha, dr_dxmesh = ops
         out = [{'alpha': comm.allreduce(float(np.dot(dr_dalpha, psi)), op=MPI.SUM)} for psi in psis]
         if dr_dxmesh is not None:
             x, y = dr_dxmesh.createVecLeft(), dr_dxmesh.createVecRight()
@@ -1197,17 +1255,21 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
 
     def _release_contribution_operators(self):
         ops, self._contribution_operators = getattr(self, "_contribution_operators", None), None
+        self._destroy_contribution_operators(ops)
+
+    def _destroy_contribution_operators(self, ops):
         if ops is not None and ops[1] is not None and self.sim_model.derived_fields:
             # a fresh chained operator (as compute_jacvec_product's uncached one)
             destroy_chained_operator(ops[1])
 
-    def _contribution_errors(self, psi, psi_fom, psi_rom=None):
+    def _contribution_errors(self, psi, psi_fom, psi_rom=None, state=None):
         """
         {input: (|c - c_fom|, relative to |c_fom|, |c_fom|, |c - c_rom| / |c_rom|)} with c,
         c_fom and c_rom the derivative contributions (_derivative_contributions) of the
         adjoint psi, of the full-order adjoint psi_fom (computed once per output row) and of
-        the ROM adjoint psi_rom (None: nan). Norms are 2-norms over the input (for alpha, the
-        absolute value). This, not the distance between the adjoint vectors, is the error a
+        the ROM adjoint psi_rom (None: nan), c at `state` (None: the adjoint's linearization
+        point; a hyper-reduced adjoint's is its own solution) and c_fom, c_rom at the adjoint's
+        linearization point. Norms are 2-norms over the input (for alpha, the absolute value). This, not the distance between the adjoint vectors, is the error a
         reduced adjoint puts into the derivative. Collective.
         """
         comm = self.mesh.mesh.comm
@@ -1216,9 +1278,10 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
             if self._fom_contribution is None or self._fom_contribution[0] != row:
                 self._fom_contribution = (row, self._derivative_contributions([np.asarray(psi_fom, dtype=float)])[0])
             c_fom = self._fom_contribution[1]
-            cands = [np.asarray(psi, dtype=float)] + ([] if psi_rom is None else [np.asarray(psi_rom, dtype=float)])
-            contributions = self._derivative_contributions(cands)
-        c, c_rom = contributions[0], (None if psi_rom is None else contributions[1])
+            psi = np.asarray(psi, dtype=float)
+            c_rom = None if psi_rom is None else \
+                self._derivative_contributions([np.asarray(psi_rom, dtype=float)])[0]
+            c = self._derivative_contributions([psi], state=state)[0]
 
         def norm(key, v):
             v = np.atleast_1d(v)
