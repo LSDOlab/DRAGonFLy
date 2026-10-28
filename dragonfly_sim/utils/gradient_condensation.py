@@ -31,7 +31,16 @@ it into an existing SNES):
               wing where every exact factorization runs out of memory.
   compact     operator = preconditioning matrix = A_UU: approximate Newton
               (defect correction); converges linearly
+  pressure_pc operator exact, preconditioning matrix A_UU plus the
+              reconstruction's terms (A_UG M^-1 B_GU) in the continuity rows
+              and on the pressure column only: for incompressible (water)
+              time steps, whose pressure-velocity coupling runs largely
+              through the second-order terms the compact part drops, while
+              the rest stays compact
+
+The pressure is component 0 of every block of the (blocked) state.
 """
+import numpy as np
 import ufl
 from petsc4py import PETSc
 from dolfinx.fem.forms import form as _create_form
@@ -131,7 +140,7 @@ class CondensedGradientProblem(NonlinearProblem_mod):
     current u in place and `inv_mass` is M_G^-1 as a Vec in G's layout.
     """
 
-    MODES = ("exact", "compact_pc", "compact")
+    MODES = ("exact", "compact_pc", "compact", "pressure_pc")
 
     def __init__(self, F, J, u, G, b_G, update_G, inv_mass, jit_options={}):
         super().__init__(F, J, u, jit_options=jit_options, mat_type=None)
@@ -143,6 +152,7 @@ class CondensedGradientProblem(NonlinearProblem_mod):
         self._A_UU = self._condensed.A_UU
         self._A = self._condensed.A
         self.jacobian_mode = "exact"
+        self.pc_log_stage = None      # a PETSc log stage timing the pressure_pc matrix, if set
 
     def configure_snes(self, snes, mode):
         """Re-wire `snes`'s Jacobian for jacobian_mode `mode` (see the module
@@ -163,6 +173,49 @@ class CondensedGradientProblem(NonlinearProblem_mod):
                 sync(x)
                 self.J(x, self._A)            # assembles A_UU on the way
             snes.setJacobian(jac, self._A, self._A_UU)
+            return
+
+        if mode == "pressure_pc":
+            # P = A_UU + C on the pressure rows and column, set in one pass by
+            # COO (A_UU's and C's values, C's off the pressure zeroed) into
+            # the exact Jacobian's pattern, so its ILU(0) sees the same pattern
+            bs = self._A.getBlockSize()
+            self._P = None
+
+            def build_P():
+                C = self._condensed._C
+                ijs, mask = [], None
+                for M in (self._A_UU, C):
+                    ia, ja, _ = M.getValuesCSR()
+                    rows = M.getOwnershipRange()[0] + np.repeat(np.arange(len(ia) - 1), np.diff(ia))
+                    ijs.append((rows, ja))
+                    if M is C:
+                        mask = ((rows % bs == 0) | (ja % bs == 0)).astype(float)
+                P_ = PETSc.Mat().create(comm=self._A.getComm())
+                P_.setSizes(self._A.getSizes(), bsize=bs)
+                P_.setType(self._A.getType())
+                P_.setPreallocationCOO(np.concatenate([i for i, _ in ijs]).astype(PETSc.IntType),
+                                       np.concatenate([j for _, j in ijs]).astype(PETSc.IntType))
+                self._P_mask = mask
+                self._P_nnz = (len(ijs[0][1]), len(ijs[1][1]))
+                return P_
+
+            def jac(snes_, x, A, P):
+                sync(x)
+                self.J(x, self._A)            # assembles A_UU and C = A_UG M^-1 B_GU on the way
+                if self.pc_log_stage is not None:
+                    self.pc_log_stage.push()
+                v_UU = self._A_UU.getValuesCSR()[2]
+                v_C = self._condensed._C.getValuesCSR()[2]
+                if (len(v_UU), len(v_C)) != self._P_nnz:
+                    raise RuntimeError("pressure_pc: the Jacobian's sparsity changed")
+                self._P.setValuesCOO(np.concatenate([v_UU, v_C * self._P_mask]),
+                                     addv=PETSc.InsertMode.INSERT_VALUES)
+                if self.pc_log_stage is not None:
+                    self.pc_log_stage.pop()
+
+            self._P = build_P()
+            snes.setJacobian(jac, self._A, self._P)
             return
 
         def compact(snes_, x, A, P):

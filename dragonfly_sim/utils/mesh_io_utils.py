@@ -101,8 +101,42 @@ def merge_structured_blocks(blocks):
     return points, quads
 
 
+def truncate_farfield(data, radius, center=(0.5, 0.0)):
+    """
+    Cut a planar grid (read_cgns_planar's dict, scaled to the chord) down to
+    the cells whose nodes all lie within `radius` chords of `center` (mid-chord
+    by default); the boundary this leaves outside the wall becomes the far
+    field. Unused nodes are dropped. Returns a new dict, with the kept cells'
+    indices in the original grid as "kept_cells".
+
+    Grids such as ONERA's Rizzi grids reach ~5e4 chords: their outermost cells
+    are so large that round-off in their residual rows (~eps |K| |U| / dt)
+    puts a floor under the residual norm of a time step far above the
+    accuracy the solution has elsewhere.
+    """
+    points, quads = data["points"], data["quads"]
+    r = np.linalg.norm(points - np.asarray(center), axis=1)
+    keep = np.all(r[quads] <= radius, axis=1)
+    if not keep.any():
+        raise ValueError("no cell lies within {} chords".format(radius))
+    kept = quads[keep]
+    used = np.unique(kept)
+    new_index = -np.ones(len(points), dtype=np.int64)
+    new_index[used] = np.arange(len(used))
+    kept = new_index[kept]
+    wall = new_index[data["wall_edges"]]
+    if np.any(wall < 0):
+        raise ValueError("the far-field radius {} cuts through wall cells".format(radius))
+    edges, counts = np.unique(np.sort(_quad_edges(kept), axis=1), axis=0, return_counts=True)
+    wall_set = {tuple(e) for e in np.sort(wall, axis=1)}
+    farfield = np.array([e for e in edges[counts == 1] if tuple(e) not in wall_set], dtype=np.int64)
+    out = dict(data, points=points[used], quads=kept, wall_edges=wall, farfield_edges=farfield,
+               kept_cells=np.nonzero(keep)[0], farfield_radius=float(radius))
+    return out
+
+
 def read_cgns_planar(cgns_path, plane_index=0, wall_family="Wall", farfield_family="Farfield",
-                     scale_to_chord=True):
+                     scale_to_chord=True, farfield_radius=None):
     """
     Read a structured multi-block CGNS grid that is one cell thick (or planar)
     and reduce it to a 2D quadrilateral mesh. Serial.
@@ -114,6 +148,9 @@ def read_cgns_planar(cgns_path, plane_index=0, wall_family="Wall", farfield_fami
 
     scale_to_chord: shift the points so the wall's leading edge (its smallest
     x) is at x = 0 and scale them by 1 / chord, the wall's x extent.
+
+    farfield_radius: if given (in chords; needs scale_to_chord), keep only
+    the cells within this distance of mid-chord (truncate_farfield).
 
     Returns a dict: points (N, 2), quads (M, 4) (dolfinx ordering,
     counterclockwise), wall_edges and farfield_edges (node index pairs),
@@ -171,8 +208,13 @@ def read_cgns_planar(cgns_path, plane_index=0, wall_family="Wall", farfield_fami
     chord = float(wall_x.max() - wall_x.min())
     if scale_to_chord:
         points = (points - np.array([wall_x.min(), 0.0])) / chord
-    return dict(points=points, quads=quads, wall_edges=edges["wall"],
+    data = dict(points=points, quads=quads, wall_edges=edges["wall"],
                 farfield_edges=edges["farfield"], chord=chord, n_raw_points=n_raw)
+    if farfield_radius is not None:
+        if not scale_to_chord:
+            raise ValueError("farfield_radius is in chords: it needs scale_to_chord")
+        data = truncate_farfield(data, farfield_radius)
+    return data
 
 
 # The six faces of a hexahedron in dolfinx ordering, as local node indices

@@ -560,3 +560,54 @@ class GreenGaussReconstruction:
         self.set_up()
         return CondensedJacobian(F, self.model.u_vec, self.G, self.gg_rhs, self.inv_mass,
                                  jit_options=_JIT)
+
+
+class InteriorPenaltyGradients:
+    """
+    The gradients of the viscous terms for DG bases of degree p >= 1, in
+    place of GreenGaussReconstruction (same interface for RANS_model): G is
+    the broken gradient grad U of the polynomial state, and the facet
+    gradients carry the interior penalty of the symmetric interior-penalty
+    (SIPG) method,
+
+        G_f = {grad U} - eta/d_f [[U]] (x) n+,          eta = C_ip (p + 1)^2,
+        G_b = grad U  - eta/d_f (U - U_b) (x) n          (boundary facets),
+
+    d_f the cells' extent normal to the facet (mean volume over facet area),
+    so the penalty follows the wall-normal spacing of stretched
+    boundary-layer cells. The viscous flux being linear in its gradient
+    argument, -F_v(V_f, G_f) . n [[v]] is the consistency term {F_v(grad U)}
+    . n plus the penalty eta/d_f F_v([[U]] (x) n) . n, which dissipates
+    (Jacobian positive) for every component that diffuses; RANS_model adds
+    the volume term and the symmetric term -F_v(V_f, [[U]] (x) n) : {grad v}
+    (optimal L2 rates p + 1 at every p; the incomplete method without it
+    reached only ~2.3 at p = 2). No derived fields, nothing condensed: Newton assembles the
+    exact Jacobian directly.
+    """
+
+    def __init__(self, model, penalty=1.0):
+        self.model = model
+        p = model.poly_order
+        self.eta = float(penalty) * (p + 1) ** 2
+        msh = model.mesh_obj.mesh
+        # pointwise (ufl.CellVolume / FacetArea are not lowered for quads)
+        self._vol = model.mesh_obj.cell_volume
+        self._area = abs(ufl.classes.FacetJacobianDeterminant(msh)) * ufl.classes.ReferenceFacetVolume(msh)
+
+    def install(self):
+        pass
+
+    @property
+    def G(self):
+        return ufl.grad(self.model.u_vec)
+
+    def face_gradient_interior(self):
+        U, n = self.model.u_vec, self.model.mesh_obj.n
+        d_f = 0.5 * (self._vol('+') + self._vol('-')) / self._area('+')
+        return ufl.avg(self.G) - (self.eta / d_f) * ufl.outer(U('+') - U('-'), n('+'))
+
+    def face_gradient_boundary(self, U_b, U=None):
+        U = self.model.u_vec if U is None else U
+        n = self.model.mesh_obj.n
+        d_f = self._vol / self._area
+        return ufl.grad(U) - (self.eta / d_f) * ufl.outer(U - U_b, n)

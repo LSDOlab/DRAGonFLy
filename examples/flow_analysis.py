@@ -91,7 +91,7 @@ def build_model(dolfinx_mesh, model="sa", mach=0.5, alpha_deg=0.0, Re=6e6, geome
                 limiter_eps=1e-2, jacobian_mode="compact_pc", ff_beta=0.5, ff_relax_length=50.0,
                 inner_bdry_function=None, euler_muscl=False, wall_tags=None, symmetry_tags=None,
                 preconditioning=None, preconditioning_floor=1.0, shock_capturing=None, fluid="air",
-                water_speed=5.0):
+                water_speed=5.0, poly_order=0):
     """
     Build a ready-to-solve model on `dolfinx_mesh`.
 
@@ -119,6 +119,9 @@ def build_model(dolfinx_mesh, model="sa", mach=0.5, alpha_deg=0.0, Re=6e6, geome
 
     The body (inner boundary) is the model's wall: slip for Euler, adiabatic
     no-slip otherwise. In 3D the y = 0 plane is a symmetry (slip) plane.
+    poly_order: the DG degree of the viscous models (p >= 1: DG with interior
+    penalty, see core/RANS_model.py; muscl is then ignored). The quadrature
+    degree is raised to at least 2p + 1.
     Returns (mesh_obj, model, transverse); transverse is the
     TransverseFarfield for "riemann2" (attach it to the time integrator),
     else None.
@@ -144,7 +147,8 @@ def build_model(dolfinx_mesh, model="sa", mach=0.5, alpha_deg=0.0, Re=6e6, geome
                                      limiter_eps=limiter_eps, jacobian_mode=jacobian_mode,
                                      preconditioning=preconditioning,
                                      preconditioning_floor=preconditioning_floor,
-                                     shock_capturing=shock_capturing, material=material)
+                                     shock_capturing=shock_capturing, material=material,
+                                     poly_order=poly_order)
     else:
         raise ValueError("model must be euler, laminar or sa")
     flow.direct_linear_solver = direct
@@ -168,7 +172,7 @@ def build_model(dolfinx_mesh, model="sa", mach=0.5, alpha_deg=0.0, Re=6e6, geome
         sym_tags = [(sym, SYMMETRY_TAG)]
         outer = outer & ~sym
     mesh_obj.tag_boundary_facets([(outer, FARFIELD_TAG), (inner_mask, WALL_TAG)] + sym_tags)
-    qd = {'quadrature_degree': quadrature_degree}
+    qd = {'quadrature_degree': max(quadrature_degree, 2 * poly_order + 1)}
     mesh_obj.form_manager.build_boundary_measure(measure_metadata=qd)
     mesh_obj.form_manager.build_cell_and_interior_facet_measures(measure_metadata=qd)
 

@@ -367,7 +367,7 @@ class TimeIntegrator:
             self._copy(self.term.U_nm1, self.model.u_vec)
 
     def advance(self, step_control, order=2, newton_rtol=1e-8, newton_atol=1e-10,
-                newton_max_it=20, dual_time=None, newton_criterion="residual"):
+                newton_max_it=20, dual_time=None, newton_criterion="residual", segregated=None):
         """
         One physical time step from U^n. The step size comes from
         step_control (StepSizeController); a failed Newton solve restores
@@ -378,6 +378,9 @@ class TimeIntegrator:
         against newton_atol and newton_rtol times the first update -- for
         meshes whose huge far-field cells put the residual's round-off
         floor (~ eps/dt |U| |K|) above any useful absolute tolerance.
+        `segregated` (core/segregated.py:SegregatedSolver) replaces the
+        monolithic Newton solve by its block Gauss-Seidel iteration, with its
+        own block residual criterion (the newton_* arguments are not used).
         Returns a StepRecord; record.accepted is False if every retry failed.
         """
         m, term = self.model, self.term
@@ -390,11 +393,15 @@ class TimeIntegrator:
             ratio = term.set_bdf(k, dt, self.dt_prev)
             for b in self.boundary_updaters:
                 b.prepare(k, ratio, dt)
-            if dual_time is None:
+            if segregated is not None:
+                term.set_cfl(None)
+                ok, rec = segregated.solve()
+            elif dual_time is None:
                 term.set_cfl(None)
                 ok, rec = self._newton_solve(newton_rtol, newton_atol, newton_max_it, newton_criterion)
             else:
-                ok, rec = self._dual_time_solve(dual_time, newton_rtol, newton_atol, newton_max_it)
+                ok, rec = self._dual_time_solve(dual_time, newton_rtol, newton_atol, newton_max_it,
+                                                newton_criterion)
             if ok:
                 rec.dt, rec.order, rec.retries = dt, k, attempt
                 break
@@ -430,16 +437,25 @@ class TimeIntegrator:
                          res_initial=r0, res_final=r1)
         return bool(converged and np.isfinite(r1)), rec
 
-    def _dual_time_solve(self, ctrl, rtol, atol, max_it):
-        """PTC on R* inside one physical step; converged when |R*| < max(atol,
-        rtol |R*_0|). Each pseudo step is one Newton step."""
+    def _dual_time_solve(self, ctrl, rtol, atol, max_it, criterion="residual"):
+        """PTC on R* inside one physical step. Each pseudo step is one Newton
+        step. "residual": converged when |R*| < max(atol, rtol |R*_0|);
+        "incremental": when the pseudo step's update ||V - V_old|| < max(atol,
+        rtol times the first update) (see advance)."""
         m, term = self.model, self.term
         ctrl.reset()
         b = m.solver.b
         r_prev = self._unsteady_residual_norm(b)
         r0, its, ksp = r_prev, 0, 0
         target = max(atol, rtol * r0)
-        while r_prev > target and its < max_it:
+        dx0 = dx = None
+
+        def converged():
+            if criterion == "incremental":
+                return dx is not None and dx <= max(atol, rtol * dx0)
+            return r_prev <= target
+
+        while not converged() and its < max_it:
             its += 1
             term.set_cfl(ctrl.cfl)
             self._copy(term.U_old, m.u_vec)
@@ -455,9 +471,14 @@ class TimeIntegrator:
                     break
                 continue
             r_prev = r
+            update = m.u_vec.x.petsc_vec.copy()
+            update.axpy(-1.0, term.U_old.x.petsc_vec)
+            dx = update.norm()
+            update.destroy()
+            dx0 = dx if dx0 is None else dx0
         term.set_cfl(None)
         rec = StepRecord(accepted=True, newton_its=its, ksp_its=ksp, res_initial=r0, res_final=r_prev)
-        return bool(r_prev <= target and np.isfinite(r_prev)), rec
+        return bool(converged() and np.isfinite(r_prev)), rec
 
     def _unsteady_residual_norm(self, b):
         """|R*| with the pseudo term off (at U = U_old it vanishes anyway)."""

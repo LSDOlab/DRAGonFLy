@@ -1,6 +1,7 @@
 """
-Compressible RANS (and laminar Navier-Stokes) at p = 0, built on the Euler
-model by composition.
+Compressible RANS (and laminar Navier-Stokes), built on the Euler model by
+composition: cell-centred finite volume (p = 0, the default) or
+discontinuous Galerkin of degree p >= 1 (poly_order).
 
 CompressibleRANSModel owns a CompressibleEulerModel (`self.flow`) whose state
 carries the turbulence model's transported scalars after the primitive mean
@@ -28,6 +29,11 @@ sources use the Green-Gauss gradient G. G is condensed out of Newton
 exactly, and is a derived field for adjoints and shape derivatives, as are
 the cell centres and the wall distance.
 
+DG, p >= 1: the polynomial's own gradient replaces G everywhere, with the
+viscous volume term int F_v(V, grad V) : grad v and the symmetric
+interior-penalty facet terms (reconstruction.InteriorPenaltyGradients); no
+MUSCL (the basis carries the order), no condensation (exact Jacobian).
+
 Nondimensionalization: the material's (rho_inf = |u_inf| = T_inf = 1, the
 mesh unit), so mu_inf = 1/Re (Re held fixed under set_mach).
 
@@ -50,7 +56,7 @@ direct_linear_solver for MUMPS on the exact Jacobian instead.
 import ufl
 
 from dragonfly_sim.core.Euler_model import CompressibleEulerModel
-from dragonfly_sim.core.reconstruction import GreenGaussReconstruction
+from dragonfly_sim.core.reconstruction import GreenGaussReconstruction, InteriorPenaltyGradients
 from dragonfly_sim.core.turbulence_models import SpalartAllmarasNeg
 from dragonfly_sim.core.wall_distance import WallDistance
 from dragonfly_sim.core.materials import IdealGas
@@ -65,17 +71,20 @@ class CompressibleRANSModel:
     # read or written goes to self.flow.
     _OWN = frozenset((
         "flow", "turbulence_model", "Re", "Pr_t", "muscl", "limiter", "limiter_eps",
-        "jacobian_mode", "reconstruction", "wall_distance", "wall_tags", "mu_inf_const"))
+        "jacobian_mode", "reconstruction", "wall_distance", "wall_tags", "mu_inf_const", "ip_penalty"))
 
     def __init__(self, mesh, Re, turbulence_model=None, gamma=1.4, Pr=0.72, Pr_t=0.9,
                  viscosity_law="sutherland", T_inf_dim=300.0, sutherland_S_dim=110.4,
                  muscl=True, limiter=None, limiter_eps=1e-2, jacobian_mode="compact_pc",
-                 material=None, preconditioning=None, preconditioning_floor=1.0, shock_capturing=None):
+                 material=None, preconditioning=None, preconditioning_floor=1.0, shock_capturing=None,
+                 poly_order=0, ip_penalty=1.0):
         """`material` (core/materials.py) is the fluid; by default an IdealGas
         from gamma, Pr, viscosity_law and the Sutherland constants.
         preconditioning, preconditioning_floor, shock_capturing: the Euler
         host's low-Mach preconditioning and artificial viscosity
-        (CompressibleEulerModel)."""
+        (CompressibleEulerModel). poly_order: the DG degree (p >= 1 ignores muscl,
+        limiter and jacobian_mode); ip_penalty: the interior-penalty constant
+        C_ip of p >= 1."""
         tm = SpalartAllmarasNeg() if turbulence_model is None else turbulence_model
         if material is None:
             material = IdealGas(gamma, Pr=Pr, viscosity_law=viscosity_law,
@@ -83,7 +92,7 @@ class CompressibleRANSModel:
         self.turbulence_model = tm
         self.Re = float(Re)
         self.Pr_t = float(Pr_t)
-        self.muscl = muscl
+        self.muscl = bool(muscl) and poly_order == 0     # p >= 1: the basis carries the order
         self.limiter = limiter
         self.limiter_eps = limiter_eps
         self.jacobian_mode = jacobian_mode
@@ -91,8 +100,9 @@ class CompressibleRANSModel:
         self.wall_distance = None
         self.wall_tags = []
         self.mu_inf_const = None
+        self.ip_penalty = float(ip_penalty)
 
-        self.flow = flow = CompressibleEulerModel(mesh, poly_order=0, flux_function=hll_flux,
+        self.flow = flow = CompressibleEulerModel(mesh, poly_order=poly_order, flux_function=hll_flux,
                                                   extra_variables=tm.names, material=material,
                                                   preconditioning=preconditioning,
                                                   preconditioning_floor=preconditioning_floor,
@@ -135,7 +145,9 @@ class CompressibleRANSModel:
     # ------------------------------------------------------------------
     def define_elements_functionspaces(self):
         self.flow.define_elements_functionspaces()
-        if self.reconstruction is None:
+        if self.reconstruction is None and self.flow.poly_order > 0:
+            self.reconstruction = InteriorPenaltyGradients(self.flow, self.ip_penalty)
+        elif self.reconstruction is None:
             self.reconstruction = GreenGaussReconstruction(
                 self.flow, muscl=self.muscl, limiter=self.limiter, limiter_eps=self.limiter_eps,
                 limiter_scales=self._limiter_scales)
@@ -154,7 +166,7 @@ class CompressibleRANSModel:
         flow.set_up_solver()
         if was_set_up:
             return
-        mode = "exact" if flow.direct_linear_solver else self.jacobian_mode
+        mode = "exact" if flow.direct_linear_solver or flow.poly_order > 0 else self.jacobian_mode
         if mode != "exact":
             flow.problem.configure_snes(flow.solver.snes, mode)
             flow.solver.krylov_solver.setFromOptions()
@@ -215,6 +227,14 @@ class CompressibleRANSModel:
         jump_v = ufl.outer(v('+') - v('-'), n('+'))
         F = - ufl.inner(flow.embed(self.viscous_flux(0.5 * (U('+') + U('-')), rec.face_gradient_interior())),
                         jump_v) * flow.forms.dS
+        if flow.poly_order > 0:
+            # the volume term and the symmetric interior-penalty term (F_v is
+            # linear in its gradient argument: F_v(V, [[U]] (x) n) : {grad v}
+            # is the adjoint-consistency term [[U]] (x) n : {K^T grad v})
+            U_avg = 0.5 * (U('+') + U('-'))
+            F += ufl.inner(flow.embed(self.viscous_flux(U, rec.G)), ufl.grad(v)) * flow.forms.dx
+            F -= ufl.inner(flow.embed(self.viscous_flux(U_avg, ufl.outer(U('+') - U('-'), n('+')))),
+                           ufl.avg(ufl.grad(v))) * flow.forms.dS
         if flow.n_extra:
             # the WallDistance field, or a UFL expression standing in for it
             # (manufactured-solution tests)
@@ -229,9 +249,15 @@ class CompressibleRANSModel:
         if kind == "slip":
             return None   # symmetry: zero shear stress and heat flux
         flow = self.flow
-        Fv = self.viscous_flux(U_b, self.reconstruction.face_gradient_boundary(U_b),
-                               heat_flux=(kind != "wall"))
-        return - ufl.inner(flow.embed(ufl.dot(Fv, flow.mesh_obj.n)), flow.v_vec) * flow.forms.ds(meshtag)
+        n, ds = flow.mesh_obj.n, flow.forms.ds(meshtag)
+        heat = kind != "wall"
+        Fv = self.viscous_flux(U_b, self.reconstruction.face_gradient_boundary(U_b), heat_flux=heat)
+        F = - ufl.inner(flow.embed(ufl.dot(Fv, n)), flow.v_vec) * ds
+        if flow.poly_order > 0:
+            # symmetric interior-penalty term (see _interior_terms)
+            F -= ufl.inner(flow.embed(self.viscous_flux(U_b, ufl.outer(flow.u_vec - U_b, n), heat_flux=heat)),
+                           ufl.grad(flow.v_vec)) * ds
+        return F
 
     def _viscous_cutoff_speed(self, U, h):
         """(nu/h)^2: low-Mach preconditioning stops at the viscous speed, so

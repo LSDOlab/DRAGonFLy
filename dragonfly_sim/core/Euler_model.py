@@ -98,8 +98,8 @@ class CompressibleEulerModel():
             Barter-Darmofal artificial viscosity (core/shock_capturing.py),
             which adds its viscosity field as an auxiliary unknown.
         """
-        if poly_order > 0:
-            raise ValueError("This release only support 0th-order DG bases for now")
+        if poly_order > 0 and shock_capturing not in (None, False):
+            raise ValueError("the artificial viscosity is the p = 0 form (core/shock_capturing.py)")
 
         self.mesh_obj = mesh
         self.poly_order = poly_order
@@ -213,6 +213,30 @@ class CompressibleEulerModel():
         # subdomain factorizations: more memory, robust where ILU stalls,
         # e.g. the zero pressure diagonal of an incompressible time step)
         self.subdomain_solver = "ilu"
+        # Preconditioner of the Newton steps' Krylov solve:
+        #   "asm"    additive Schwarz with subdomain ILU/LU (the default; the
+        #            compressible flows' setting)
+        #   "schur"  a Schur-complement field split of the pressure p' from
+        #            the other unknowns: ASM/ILU on the velocity-scalar block,
+        #            BoomerAMG on the assembled Schur approximation (selfp).
+        #            For incompressible (water) and low-Mach time steps, whose
+        #            pressure couples globally (a Poisson-like Schur
+        #            complement) where local ILU stalls. Needs an AIJ
+        #            Jacobian (the condensed MUSCL/RANS ones are).
+        #   "mg"     hp-multigrid (utils/line_multigrid.py): p-multigrid DG p
+        #            -> ... -> DG 0, then agglomeration levels with a linear
+        #            function per aggregate, Galerkin coarse operators and line
+        #            smoothing along the strongly coupled (wall-normal) lines on
+        #            every level; with FGMRES. For stiff time steps on stretched
+        #            near-wall cells, where the one-level preconditioners'
+        #            iterations grow like 1/h. multigrid_options: its keywords
+        #            (HPMultigridPC).
+        self.linear_preconditioner = "asm"
+        # extra PETSc options of the Newton steps' Krylov solve, {name without
+        # the prefix: value}, applied after the model's own (experiments with
+        # preconditioner variants, e.g. the Schur complement approximation)
+        self.newton_ksp_options = {}
+        self.multigrid_options = {}
 
         self.fom_solution_writer = None
         self._output_fields = []
@@ -766,7 +790,9 @@ class CompressibleEulerModel():
 
     def set_up_solver(self):
         if not self.solver_is_set_up:
-            mat_type = "baij"
+            # PCFIELDSPLIT does not split BAIJ matrices by component, and
+            # PCMG's Galerkin products (MatPtAP) do not take them either
+            mat_type = "aij" if self.linear_preconditioner in ("schur", "mg") else "baij"
             F_newton, J_newton = self.newton_forms()
             if self.problem_factory is not None:
                 self.problem = self.problem_factory(F_newton, J_newton)
@@ -816,6 +842,11 @@ class CompressibleEulerModel():
             ksp = self.solver.krylov_solver
             self.apply_krylov_solver_settings(ksp, monitor_convergence=False, max_it=300,
                                               rtol=self.krylov_rtol)
+            if self.newton_ksp_options:
+                opts = PETSc.Options()
+                for key, value in self.newton_ksp_options.items():
+                    opts[ksp.getOptionsPrefix() + key] = value
+                ksp.setFromOptions()
             self.solver_is_set_up = True
 
             # Print Jacobian matrix block size
@@ -964,7 +995,19 @@ class CompressibleEulerModel():
         if gmres_restart is None:
             gmres_restart = max_it
         opts[f"{option_prefix}ksp_gmres_restart"] = "{}".format(gmres_restart)
-        opts[f"{option_prefix}pc_type"] = "asm"
+        if self.linear_preconditioner == "schur":
+            self._schur_fieldsplit_options(opts, option_prefix)
+            sub = option_prefix + "fieldsplit_0_"         # ASM/ILU below acts on the velocity block
+        elif self.linear_preconditioner == "asm":
+            opts[f"{option_prefix}pc_type"] = "asm"
+            sub = option_prefix
+        elif self.linear_preconditioner == "mg":
+            opts[f"{option_prefix}ksp_type"] = "fgmres"
+            opts[f"{option_prefix}pc_type"] = "python"
+            sub = None
+        else:
+            raise ValueError("linear_preconditioner must be 'asm', 'schur' or 'mg'")
+        option_prefix_pc, option_prefix = option_prefix, sub or option_prefix
         opts[f"{option_prefix}pc_asm_overlap"] = "{}".format(self.asm_overlap)
 
         opts[f"{option_prefix}sub_pc_type"] = self.subdomain_solver
@@ -981,6 +1024,7 @@ class CompressibleEulerModel():
         # ("natural", i.e. no reordering, per that log's ksp_view).
         # (nested dissection for exact factorizations, which RCM would fill)
         opts[f"{option_prefix}sub_pc_factor_mat_ordering_type"] = "rcm" if self.subdomain_solver == "ilu" else "nd"
+        option_prefix = option_prefix_pc
 
         # the options database is global and the prefix is shared by every KSP of that name:
         # clear a setting an earlier KSP made (diagonal scaling cannot work on a matrix-free operator)
@@ -992,6 +1036,44 @@ class CompressibleEulerModel():
             opts[f"{option_prefix}ksp_diagonal_scale_fix"] = ""
 
         ksp.setFromOptions()
+        if self.linear_preconditioner == "mg" and not self.direct_linear_solver:
+            ksp.getPC().setPythonContext(self._hp_multigrid())
+
+    def _hp_multigrid(self):
+        """The 'mg' preconditioner's context (see linear_preconditioner)."""
+        from dragonfly_sim.utils.line_multigrid import HPMultigridPC
+        msh = self.mesh_obj.mesh
+        tdim = msh.topology.dim
+        spaces = [self.functionspaces["V"]] + [
+            dolfinx.fem.functionspace(msh, ("DG", q, (self.n_state,))) for q in range(self.poly_order - 1, -1, -1)]
+        interp = []
+        for fine, coarse in zip(spaces[:-1], spaces[1:]):
+            P = dolfinx.fem.petsc.interpolation_matrix(coarse, fine)
+            P.assemble()
+            interp.append(P)
+        n_cells = msh.topology.index_map(tdim).size_local
+        centroids = dolfinx.mesh.compute_midpoints(msh, tdim, np.arange(n_cells, dtype=np.int32))[:, :tdim]
+        return HPMultigridPC(interp, self.n_state, [V.dofmap.dof_layout.num_dofs for V in spaces], centroids,
+                             **self.multigrid_options)
+
+    def _schur_fieldsplit_options(self, opts, prefix):
+        """The 'schur' preconditioner (see linear_preconditioner): fields by
+        component of the blocked state, p' (component 0) against the rest."""
+        others = ",".join(str(k) for k in range(1, self.n_state))
+        for key, value in {
+                "pc_type": "fieldsplit",
+                "pc_fieldsplit_block_size": self.n_state,
+                "pc_fieldsplit_0_fields": others,
+                "pc_fieldsplit_1_fields": "0",
+                "pc_fieldsplit_type": "schur",
+                "pc_fieldsplit_schur_fact_type": "upper",
+                "pc_fieldsplit_schur_precondition": "selfp",
+                "fieldsplit_0_ksp_type": "preonly",
+                "fieldsplit_0_pc_type": "asm",
+                "fieldsplit_1_ksp_type": "preonly",
+                "fieldsplit_1_pc_type": "hypre",
+                "fieldsplit_1_pc_hypre_type": "boomeramg"}.items():
+            opts[prefix + key] = value
 
     def _assemble_physical_residual(self):
         """
