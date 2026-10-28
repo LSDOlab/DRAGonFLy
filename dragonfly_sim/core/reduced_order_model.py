@@ -151,6 +151,18 @@ def orthonormal_columns(comm, X_local, rtol=1e-10, atol=0.0):
     return Q1 @ U[:, keep]
 
 
+def subspace_distance(comm, X_local, x_local):
+    """||x - P x||_2 / ||x||_2, P the orthogonal projection onto the span of the
+    row-distributed columns X, and P x (this rank's rows). Collective."""
+    x = np.asarray(x_local, dtype=float)
+    Q = orthonormal_columns(comm, np.asarray(X_local, dtype=float)) if X_local is not None and \
+        np.asarray(X_local).shape[1] else np.zeros((x.shape[0], 0))
+    Px = Q @ comm.allreduce(Q.T @ x, op=MPI.SUM)
+    norm = np.sqrt(comm.allreduce(float(x @ x), op=MPI.SUM))
+    dist = np.sqrt(comm.allreduce(float((x - Px) @ (x - Px)), op=MPI.SUM))
+    return (dist / norm if norm > 0.0 else np.nan), Px
+
+
 class LSPGSolver:
     """
     Reduced Newton (Gauss-Newton) loop on a POD basis, driving a model's
@@ -414,13 +426,17 @@ class LSPGAdjoint:
             SAV, AV = scaled_jacobian_basis(model, self.V, self.S)
             if self.galerkin:
                 AV_local = AV.getDenseArray()
-                self._lu = sp_la.lu_factor(self.comm.allreduce(self.V.getDenseArray().T @ AV_local, op=MPI.SUM))
+                VtAV = self.comm.allreduce(self.V.getDenseArray().T @ AV_local, op=MPI.SUM)
+                self.condition_number = float(np.linalg.cond(VtAV))
+                self._lu = sp_la.lu_factor(VtAV)
                 self._Q, self._R = None, np.diag(np.abs(np.diag(self._lu[0])))
             elif self.adjoint_basis is None:
                 self._Q, self._R = tsqr(self.comm, SAV)
             else:
                 self._factor_least_squares(model, SAV)
         AV.destroy()
+        if not self.galerkin:
+            self.condition_number = float(np.linalg.cond(self._R))
         diag = np.abs(np.diag(self._R))
         if not np.all(np.isfinite(self._R)) or diag.min() <= np.finfo(float).eps * diag.max():
             raise ValueError("reduced adjoint: S A V is singular to working precision "
@@ -494,6 +510,16 @@ class LSPGAdjoint:
         else:
             PETSc.Sys.Print("reduced (LSPG) adjoint: reused the factorization, |psi| = {:.6e}".format(psi_norm))
         return psi
+
+    def spaces(self):
+        """(this rank's rows of a basis of the space every reduced adjoint psi lies in, of the
+        adjoint basis it holds or None), after the first solve: S^2 A V (LSPG), V (Galerkin),
+        span[S^2 A V, Psi] (least squares)."""
+        if self.galerkin:
+            return self.V.getDenseArray(), None
+        if self.adjoint_basis is not None:
+            return self._T, self.adjoint_basis.getDenseArray()
+        return (self._Q if self.S is None else self.S.getArray(readonly=True)[:, None] * self._Q), None
 
     def _galerkin_residual(self, model, psi, rhs, b):
         """|V^T (A^T psi - g)| / |V^T g|, with the Jacobian _factor assembled
@@ -587,6 +613,7 @@ class HybridLSPGAdjoint(LSPGAdjoint):
             self._Phi = hybrid_test_basis(SAV, S, self.n_state, self.Psi)
             H = self.comm.allreduce(self._Phi.T @ AV.getDenseArray(), op=MPI.SUM)
         AV.destroy()
+        self.condition_number = float(np.linalg.cond(H))
         self._lu = sp_la.lu_factor(H)
         self._R = np.diag(np.abs(np.diag(self._lu[0])))
         diag = np.diag(self._R)
@@ -605,6 +632,9 @@ class HybridLSPGAdjoint(LSPGAdjoint):
             PETSc.Sys.Print("hybrid reduced adjoint: {} state and {} adjoint test directions".format(
                 self.n_state, self._Phi.shape[1] - self.n_state))
         return psi
+
+    def spaces(self):
+        return self._Phi, self._Phi[:, self.n_state:]
 
     def destroy(self):
         super().destroy()
@@ -1015,6 +1045,14 @@ class ReducedOrderModel:
         nearest = d.argmin(axis=1)
         weights = np.where(d[np.arange(d.shape[0]), nearest] <= 1e-10, settings['design_weights'][nearest], 0.0)
         return weights if np.any(weights > 0.0) else np.ones(sm.n_snapshots)
+
+    def stored_adjoint_subspace(self):
+        """This rank's rows of the left-singular vectors the adjoint snapshot matrix keeps
+        (adjoint_snapshots 'separate' / 'concatenate', at most adjoint_max_rank of them), or None:
+        every adjoint basis lies in their span."""
+        if self.adjoint_pod is None or self.adjoint_pod.snapshot_matrix.Q is None:
+            return None
+        return self.adjoint_pod.snapshot_matrix.Q.getDenseArray()
 
     def discard_adjoint(self):
         """Drop the adjoint of the last accepted solve. Collective."""

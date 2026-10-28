@@ -22,6 +22,7 @@ from dragonfly_sim.utils.petsc_utils import set_petsc_vec_array
 from dragonfly_sim.utils.derived_fields import destroy_chained_operator
 from dragonfly_sim.utils.solver_utils import ksp_converged_reason_name
 from dragonfly_sim.core.postprocessor import DG_postprocessor
+from dragonfly_sim.core.reduced_order_model import subspace_distance
 from dragonfly_sim.utils.solver_profiling import PROFILER as _PROF
 
 
@@ -1231,6 +1232,52 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
                         "derivative contributions: {}".format(
                             "accepted" if rom_accepted else "rejected", row, abs_err, rel_err,
                             self._contribution_string(contribution)))
+        self._log_adjoint_space(self.reduced_order_model.adjoint, psi_fom, rel_err, rom_accepted)
+
+    def _log_adjoint_space(self, adjoint, psi_fom, rel_err, rom_accepted):
+        """
+        Where the ROM adjoint's error comes from: the relative 2-norm distance of psi_fom to the
+        space the reduced adjoint lies in (no reduced adjoint there can be closer), to the
+        adjoint basis it holds and to all adjoint snapshot data the ROM keeps (the span of the
+        adjoint snapshot matrix, truncated at adjoint_max_rank), the condition number of the
+        reduced adjoint matrix and the derivative contributions of the best approximation (the
+        projection of psi_fom onto that space). The ratio of the adjoint's error to the first
+        distance is what the reduced solve adds to the approximation error. In
+        data_store.adjoint_space_errors. Collective.
+        """
+        spaces = getattr(adjoint, "spaces", None)
+        if spaces is None or getattr(adjoint, "condition_number", None) is None:
+            return
+        comm = self.mesh.mesh.comm
+        test, adjoint_part = spaces()
+        dist_test, best = subspace_distance(comm, test, psi_fom)
+        dist_adjoint = np.nan if adjoint_part is None else subspace_distance(comm, adjoint_part, psi_fom)[0]
+        stored = self.reduced_order_model.stored_adjoint_subspace()
+        dist_stored = np.nan if stored is None else subspace_distance(comm, stored, psi_fom)[0]
+        contribution = self._contribution_errors(best, psi_fom)
+        # per state variable (the components of the blocked state): its share of |psi_fom|^2 and
+        # of |psi_fom - best|^2, the part of psi_fom no reduced adjoint in the space has
+        bs = self.sim_model.u_vec.x.block_size
+        psi_fom = np.asarray(psi_fom, dtype=float)
+        shares = []
+        for x in (psi_fom, psi_fom - best):
+            per = comm.allreduce(np.sum(x.reshape(-1, bs)**2, axis=0), op=MPI.SUM)
+            shares.append(tuple(float(v) for v in per / max(per.sum(), 1e-300)))
+        eval_idx, row = self.eval_idx - 1, self._current_adjoint_row
+        if comm.Get_rank() == 0:
+            self.data_store.adjoint_space_errors += [(eval_idx, row, bool(rom_accepted), float(dist_test),
+                                                      float(dist_adjoint), float(dist_stored),
+                                                      float(adjoint.condition_number), contribution,
+                                                      shares[0], shares[1])]
+        PETSc.Sys.Print("ROM adjoint space (output row {}): relative distance of psi_fom to the reduced adjoint "
+                        "space {:.3e} (the solve then gives {:.3e}, x{:.2g}), to the adjoint basis {:.3e}, to the "
+                        "stored adjoint snapshots {:.3e}; reduced matrix condition {:.3e}; derivative contributions "
+                        "of the best approximation: {}; share of |psi_fom|^2 per state variable {}, of the "
+                        "best approximation's misfit {}".format(
+                            row, dist_test, rel_err, rel_err / dist_test if dist_test > 0.0 else np.nan,
+                            dist_adjoint, dist_stored, adjoint.condition_number,
+                            self._contribution_string(contribution), np.round(shares[0], 4),
+                            np.round(shares[1], 4)))
 
     def _derivative_contributions(self, psis, state=None):
         """

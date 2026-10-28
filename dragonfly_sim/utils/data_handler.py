@@ -79,6 +79,16 @@ class DataStore():
         # the mesh warping and shape parameterization), the 2-norm over the input.
         self.adjoint_derivative_errors = []
 
+        # With every adjoint_errors entry of a reduced adjoint that has one, where its error comes
+        # from: (eval_idx, output row, whether the ROM solve was accepted, relative 2-norm
+        # distance of psi_fom to the space the reduced adjoint lies in (the best any reduced
+        # adjoint there can do), to the adjoint basis it holds (nan: none), to all adjoint
+        # snapshot data the ROM keeps (the adjoint snapshot matrix truncated at adjoint_max_rank;
+        # nan: none), condition number of the reduced adjoint matrix, {input: contribution errors
+        # of the best approximation, as in adjoint_derivative_errors}, per state variable its
+        # share of |psi_fom|^2, per state variable its share of |psi_fom - best approximation|^2).
+        self.adjoint_space_errors = []
+
         # Per full-order adjoint added as a ROM snapshot (ReducedOrderModel adjoint_snapshots):
         # (eval_idx, output row, whether it added a basis direction, adjoint snapshots stored)
         self.adjoint_snapshots = []

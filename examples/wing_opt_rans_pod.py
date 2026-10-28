@@ -44,7 +44,8 @@ cells two facets away (25 for an interior hex), ~900 nonzeros per cell, ~1.6e8 o
 ~1.3 GB per snapshot over all ranks. The stored basis holds mdeim_max_rank of them (twice that while a snapshot
 is added), the harvest buffer mdeim_max_snapshots_per_solve + 1, and building the operators one more (plus its
 sparsity), hence the small values below: ~6 * 1.3 GB stored, ~16 GB at peak. DEIM's snapshots are state-sized
-(1.1e6 entries): 200 stored and 11 * rb_size buffered, ~3 GB.
+(1.1e6 entries): 200 stored and 11 * rb_size buffered, ~3 GB. The ROM's adjoint snapshots are state-sized too:
+adjoint_max_rank = 60 of them, ~0.5 GB.
 """
 import argparse
 import os
@@ -189,10 +190,15 @@ if __name__ == '__main__':
     # adjoint basis of 5, orthogonalized against it, and the test space of the reduced solve is hybrid: LSPG's
     # S^2 A V for the state part, the adjoint basis itself for the adjoint part (test_space='hybrid'). The reduced
     # adjoint is that of the same equations, so the derivative stays consistent with the reduced solve, and it
-    # holds the adjoint basis, which the state basis alone does not (core/reduced_order_model.py).
+    # holds the adjoint basis, which the state basis alone does not (core/reduced_order_model.py). The adjoint
+    # snapshot matrix keeps adjoint_max_rank directions: four adjoints per design, so the default 3 * 5 = 15
+    # was full after four designs, and later adjoints were truncated into the earlier designs' subspace; 60
+    # keeps ~15 designs (~0.5 GB over all ranks). With compute_all_adjoint_errors, adjoint_space_errors
+    # records how far each full-order adjoint is from the reduced adjoint space, the adjoint basis and the
+    # stored adjoint snapshots.
     rom = ReducedOrderModel(rb_size=10, basis_mode='local_weighted', eta_threshold=1e-15,
                             distance_weighting='total_derivative', cubic_cutoff=0.8,
-                            adjoint_snapshots='concatenate', test_space='hybrid')
+                            adjoint_snapshots='concatenate', test_space='hybrid', adjoint_max_rank=60)
 
     # DEIM and MDEIM beside the ROM, for comparison only (their bases follow the ROM's local_weighted one).
     # DEIM: deim_n_modes >= rb_size (its basis spans S A V), the sandbox's 100 modes; MDEIM: the memory
