@@ -1162,6 +1162,33 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         state = hr.solution(m)
         if state is None or not comm.allreduce(bool(np.all(np.isfinite(state))), op=MPI.LAND):
             return
+        with self._uncached_derived_fields():
+            self._hyper_reduced_adjoint_at(hr, m, state, parameter_vector, d_outputs, psi_fom, psi_rom, fom_norm,
+                                           rom_norm, eval_idx, row, norm)
+
+    @contextlib.contextmanager
+    def _uncached_derived_fields(self):
+        """
+        Within this block the derived fields do not use their Jacobian cache
+        (set_adjoint_options(cache_jacobians=True)): for evaluations at a state other than the
+        optimizer's (a hyper-reduced solution). The cache is keyed by state and released when
+        another state asks for it, which would destroy the matrices that operators cached for the
+        optimizer's state still hold (compute_jacvec_product's dR/dx with cache_jacvec_operators):
+        a segmentation fault in its next use. Uncached, those evaluations build and free their own.
+        """
+        rec = getattr(self.sim_model, "reconstruction", None)
+        saved = None if rec is None else rec.cache_jacobians
+        if rec is not None:
+            rec.cache_jacobians = False
+        try:
+            yield
+        finally:
+            if rec is not None:
+                rec.cache_jacobians = saved
+
+    def _hyper_reduced_adjoint_at(self, hr, m, state, parameter_vector, d_outputs, psi_fom, psi_rom, fom_norm,
+                                  rom_norm, eval_idx, row, norm):
+        comm = self.mesh.mesh.comm
         self.sim_model.set_u_vec(state)
         try:
             with self._phase_record("adjoint_" + m, eval_idx):

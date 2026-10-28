@@ -476,3 +476,111 @@ def test_hyper_reduced_adjoint_is_the_derivative_of_its_solve(in_tmp_dir, kind, 
         assert abs(fd - adjoint) < 1e-5 * abs(fd), (name, fd, adjoint)
         checked.append(name)
     assert "mdeim" in checked
+
+
+@pytest.mark.unit_test
+def test_contributions_at_another_state_keep_the_cached_derived_field_jacobians(in_tmp_dir):
+    """
+    With the reconstruction's Jacobian cache on (set_adjoint_options(cache_jacobians=True), as in the
+    RANS wing optimization), the derivative contributions of a hyper-reduced adjoint, evaluated at its
+    own solution, must leave the cache of the optimizer's state alone: the cached dR/dx operator of
+    compute_jacvec_product (cache_jacvec_operators) holds the cached mesh Jacobian, and releasing it
+    (another state's key) left that operator with a destroyed matrix -- a segmentation fault in the
+    next output row's compute_jacvec_product.
+    """
+    rom = ReducedOrderModel(rb_size=3)
+    wt = _windtunnel("rans", rom=rom)
+    wt.set_adjoint_options(cache_jacobians=True, cache_jacvec_operators=True)
+    m = wt.sim_model
+    comm = m.mesh_obj.mesh.comm
+    u, _, _ = wt.solve_forward(np.radians(2.0))
+    gradient = m.reconstruction.gradient
+    dr_dx = m.compute_dRdxmesh_mat(u, wt.mesh.coordinate_space)        # holds the cached dG/dx
+    cached = gradient._cache["mesh"]
+    motions = np.zeros((wt.mesh.mesh.geometry.x.shape[0], wt.mesh.mesh.geometry.dim))
+    wt._adjoint_point = (u, np.radians(2.0), motions)
+    wt._fom_contribution = None
+    wt._contribution_operators = None
+    wt._current_adjoint_row = 0
+    other = 1.001 * u                                                  # another state
+    psi = np.random.default_rng(comm.rank).standard_normal(u.size)
+    with wt._uncached_derived_fields():
+        wt._derivative_contributions([psi], state=other)
+    m.set_u_vec(u)
+    m.update_derived_fields()
+    assert gradient._cache is not None and gradient._cache["mesh"] is cached
+    x, y = dr_dx.createVecLeft(), dr_dx.createVecRight()
+    x.array[:] = psi
+    dr_dx.multTranspose(x, y)                                          # the cached operator still works
+    assert np.all(np.isfinite(y.getArray()))
+    wt._release_contribution_operators()
+
+
+@pytest.mark.verification
+def test_comparison_in_a_shape_optimization_with_cached_adjoint_operators(in_tmp_dir):
+    """
+    The RANS wing optimization's settings on a small shape problem (an FFD control-point design
+    variable and alpha, three outputs): the concatenated hybrid ROM, the comparison, the adjoint
+    error records, released solver memory and set_adjoint_options(cache_jacobians=True,
+    cache_jacvec_operators=True). Evaluating the hyper-reduced adjoints' contributions at their own
+    solutions used to release the derived-field Jacobian cache under compute_jacvec_product's
+    cached dR/dx: a segmentation fault in the second output row of the first design with a
+    comparison (cluster run slurm-13826353). Every design's derivatives must now come through, with
+    the comparison's mesh-motion contributions recorded.
+    """
+    import csdl_alpha as csdl
+    from dragonfly_sim.core.shape_design import FFDShapeParameterization, ControlPointMotions
+    recorder = csdl.Recorder(inline=False)
+    recorder.start()
+    shape = FFDShapeParameterization([5, 3], [2, 2], layers=[ControlPointMotions({1: 0.01})])
+    rom = ReducedOrderModel(rb_size=10, basis_mode='local_weighted', eta_threshold=1e-7, cubic_cutoff=0.8,
+                            adjoint_snapshots='concatenate', test_space='hybrid')
+    hr = HyperReductionComparison(deim_n_modes=20, mdeim_n_modes=4, mdeim_max_rank=6,
+                                  mdeim_max_snapshots_per_solve=1)
+    from dragonfly_sim.core.windtunnel_model import DG_windtunnel_model
+    from dragonfly_sim.core.RANS_model import CompressibleRANSModel
+    from cases import jittered_square
+    from test_reduced_order_model import BC, _WINDTUNNELS
+    wt = DG_windtunnel_model(jittered_square(8), BC, shape, mesh_inner_bdry_function=lambda x: x[1] < 1e-8,
+                             poly_order=0, filename_suffix="hr_shape", model_class=CompressibleRANSModel,
+                             model_kwargs={"Re": 200.0}, reduced_order_model=rom, hyper_reduction=hr,
+                             moments=[("pitch", (0.25, 0.), "pitch")], compute_all_adjoint_errors=True)
+    _WINDTUNNELS.append(wt)
+    wt.euler_residual_conv_limit = 1e-11
+    wt.release_solver_memory = True
+    wt.write_mesh_deformation = False
+    # Mesh.is_valid reads dolfinx's tensor-product quad numbering of this square as inverted (every
+    # cell Jacobian determinant negative); valid here is "no cell flipped": all of one sign
+    quality = wt.mesh._update_quality
+
+    def one_orientation():
+        quality()
+        jac = wt.mesh._quality["jac"].x.array
+        c = wt.mesh.mesh.comm
+        wt.mesh.is_valid = bool(c.allreduce(bool(np.all(jac < 0)), op=MPI.LAND)
+                                or c.allreduce(bool(np.all(jac > 0)), op=MPI.LAND))
+    wt.mesh._update_quality = one_orientation
+    wt.set_up_sim()
+    wt.set_adjoint_options(cell_centre_matrix=True, cache_jacobians=True, structured_gradient=True,
+                           cache_jacvec_operators=True)
+    shape_params = shape.declare_design_variables()
+    alpha = csdl.Variable(name='alpha', value=np.array([np.radians(2.0)]))
+    alpha.set_as_design_variable()
+    motions = wt.deform_mesh()
+    u = wt.evaluate(motions, shape_params, alpha)
+    out = wt.postprocessor.evaluate(u, motions, alpha, shape_params)
+    out.D.set_as_objective()
+    out.L.set_as_constraint()
+    out.M_pitch.set_as_constraint()
+    recorder.stop()
+    sim = csdl.experimental.JaxSimulator(recorder, gpu=False)
+    for p, a in [(0.0, 2.0), (0.004, 2.3), (-0.003, 2.15), (0.002, 2.2)]:
+        sim[shape_params] = np.full(shape_params.shape, p)
+        sim[alpha] = np.array([np.radians(a)])
+        sim.run()
+        totals = sim.compute_totals()
+        assert np.all(np.isfinite(np.asarray(totals[out.D, shape_params])))
+        assert np.isfinite(float(np.asarray(totals[out.D, alpha]).ravel()[0]))
+    if MPI.COMM_WORLD.rank == 0:
+        records = wt.data_store.mdeim_adjoint_derivative_errors
+        assert records and all("mesh_node_motions" in e[2] for e in records)
