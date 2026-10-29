@@ -22,7 +22,9 @@ from dragonfly_sim.utils.petsc_utils import set_petsc_vec_array
 from dragonfly_sim.utils.derived_fields import destroy_chained_operator
 from dragonfly_sim.utils.solver_utils import ksp_converged_reason_name
 from dragonfly_sim.core.postprocessor import DG_postprocessor
-from dragonfly_sim.core.reduced_order_model import subspace_distance
+from dragonfly_sim.core.reduced_order_model import subspace_distance, orthonormal_columns
+from dragonfly_sim.utils.pod_utils import tsqr
+import scipy.linalg as sp_la
 from dragonfly_sim.utils.solver_profiling import PROFILER as _PROF
 
 
@@ -200,6 +202,9 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         # solved it, else None: a re-evaluation of that design skips the ROM
         # (see _solve)
         self._fom_design = None
+        # rom_adjoint_shadow(): the reverse products use the rejected ROM's adjoint
+        self._rom_adjoint_shadow = False          # rom_adjoint_shadow(): the method, 'rom', 'deim' or 'mdeim'
+        self._rom_adjoint_shadow_failed = False
 
         # Naming suffix for exported files
         self.filename_suffix = filename_suffix
@@ -522,6 +527,40 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         before = self._phase_snapshot()
         yield
         self._record_phases(kind, self.eval_idx if eval_idx is None else eval_idx, before)
+
+    def rom_adjoint_shadow_available(self, method='rom'):
+        """Whether the design the FOM solved last has the adjoint of a rejected ROM solve
+        (method 'rom'), or operators of the hyper-reduced comparison method 'deim' / 'mdeim',
+        which rom_adjoint_shadow(method) can differentiate with."""
+        if self._fom_design is None:
+            return False
+        if method != 'rom':
+            hr = self.hyper_reduction
+            return hr is not None and method in hr.prepared_methods and hr.has_operators(self._fom_design[0])
+        rom = self.reduced_order_model
+        adjoint = None if rom is None else rom.adjoint
+        return adjoint is not None and not adjoint.accepted and adjoint.matches_design(self._fom_design[0])
+
+    @contextlib.contextmanager
+    def rom_adjoint_shadow(self, method='rom'):
+        """
+        A derivative evaluation of the design the FOM solved last with the adjoint of its
+        rejected ROM solve (method 'rom'), or of the hyper-reduced comparison method 'deim' /
+        'mdeim', evaluated at the full-order solution as compute_all_adjoint_errors does for the
+        ROM, in place of the full-order adjoint: the total derivatives that adjoint would give
+        the optimizer, through the same chain (mesh warping, shape parameterization, explicit
+        output derivatives) as the full-order ones. At the full-order state, the hyper-reduced
+        adjoints differ from the full-order one by the reduction and the Jacobian approximation
+        alone (their logged adjoint errors are at their own solutions). Nothing is solved, logged
+        or stored in it beyond the re-evaluation CSDL runs first (a repeat of that design, which
+        takes an evaluation index). Yields a callable that is True when an adjoint call found
+        no such adjoint (its products are then nan).
+        """
+        self._rom_adjoint_shadow, self._rom_adjoint_shadow_failed = method, False
+        try:
+            yield lambda: self._rom_adjoint_shadow_failed
+        finally:
+            self._rom_adjoint_shadow = False
 
     def solve_residual_equations(self, input_vals, output_vals):
         phases_before = self._phase_snapshot()
@@ -927,6 +966,7 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
             # for the derivative contributions of the adjoint comparisons; the full-order
             # adjoint's contribution is computed once per output row
             self._adjoint_point = (u_vec, alpha, mesh_node_motions)
+            self._adjoint_rhs = d_outputs['u_vec']
             self._fom_contribution = None
             self._contribution_operators = None
             try:
@@ -942,6 +982,22 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         rom = self.reduced_order_model
         adjoint = None if rom is None else rom.adjoint
         parameter_vector = self._parameter_vector(shape_parameters, alpha)
+        if self._rom_adjoint_shadow:
+            # rom_adjoint_shadow(): the rejected ROM's (or a hyper-reduced method's) adjoint at this,
+            # the full-order, state
+            method, hr = self._rom_adjoint_shadow, self.hyper_reduction
+            if method == 'rom' and adjoint is not None and not adjoint.accepted and \
+                    adjoint.matches_design(parameter_vector):
+                with _PROF.phase("rom:adjoint"):
+                    d_residuals['u_vec'] = adjoint.solve(self.sim_model, d_outputs['u_vec'])
+            elif method != 'rom' and hr is not None and method in hr.prepared_methods and \
+                    hr.has_operators(parameter_vector):
+                with _PROF.phase("rom:adjoint"):
+                    d_residuals['u_vec'], _ = hr.adjoint(method, self.sim_model, parameter_vector, d_outputs['u_vec'])
+            else:
+                self._rom_adjoint_shadow_failed = True
+                d_residuals['u_vec'] = np.full_like(np.asarray(d_outputs['u_vec'], dtype=float), np.nan)
+            return
         if adjoint is not None and adjoint.accepted and adjoint.matches(parameter_vector, u_vec):
             # The accepted solution is the ROM's: the adjoint of its
             # projected (LSPG) equations, lifted to the full state, which
@@ -1106,7 +1162,103 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         walltime = perf_counter() - start
         self._record_phases("adjoint_rom_reference", self.eval_idx - 1, phases_before)
         self._record_adjoint_error(psi_rom, psi_fom, False, walltime)
+        try:
+            self._log_output_correction(adjoint, psi_rom, psi_fom)
+        except Exception as exc:
+            # a diagnostic must not stop the optimization
+            PETSc.Sys.Print("output correction: failed: {!r}".format(exc))
+        try:
+            self._log_first_order_correction()
+        except Exception as exc:
+            PETSc.Sys.Print("first-order correction: failed: {!r}".format(exc))
         return psi_rom
+
+    def _log_first_order_correction(self):
+        """
+        First-order model management (data_store.first_order_corrections): the ROM derivative of this
+        output row corrected by the ROM's derivative error at the previous design with a full-order
+        derivative, mu_0, as a trust-region method corrects its model's gradient at the centre:
+        dJ_rom(mu) + (dJ_fom - dJ_rom)(mu_0). Here every design with a rejected ROM is such a mu_0 for the
+        next. The derivative error is that of the contributions (dR/dinput)^T psi (dJ/dinput =
+        df/dinput|_u - (dR/dinput)^T psi), so the corrected contribution is c_rom(mu) + (c_fom -
+        c_rom)(mu_0). Collective.
+        """
+        comm = self.mesh.mesh.comm
+        c_rom, c_fom = self._rom_contributions
+        eval_idx, row = self.eval_idx - 1, self._current_adjoint_row
+        err = {k: np.atleast_1d(np.asarray(c_fom[k], dtype=float) - np.asarray(c_rom[k], dtype=float)).copy()
+               for k in c_fom}
+        store = getattr(self, "_first_order_points", None)
+        if store is None:
+            store = self._first_order_points = {}
+        prev = store.get(row)
+        store[row] = (eval_idx, err, {k: np.atleast_1d(np.asarray(c_fom[k], dtype=float)).copy() for k in c_fom})
+        if prev is None or prev[0] == eval_idx:
+            return
+
+        def norm(key, v):
+            return float(abs(v[0])) if key == 'alpha' else float(np.sqrt(comm.allreduce(float(v @ v), op=MPI.SUM)))
+        errors = {}
+        for k in err:
+            ref = norm(k, np.atleast_1d(c_fom[k]))
+            corrected = norm(k, err[k] - prev[1][k])
+            # for comparison: the uncorrected ROM, and mu_0's full-order derivative reused as it is
+            stale = norm(k, np.atleast_1d(c_fom[k]) - prev[2][k])
+            errors[k] = tuple(v / ref if ref > 0.0 else np.nan for v in (corrected, norm(k, err[k]), stale))
+            errors[k] = (corrected,) + errors[k]
+        if comm.Get_rank() == 0:
+            self.data_store.first_order_corrections += [(eval_idx, row, prev[0], errors)]
+        PETSc.Sys.Print("first-order correction (output row {}, from design {}): derivative contributions relative "
+                        "error {} (uncorrected {}; design {}'s full-order ones {})".format(
+                            row, prev[0], ", ".join("{} {:.3e}".format(k, e[1]) for k, e in errors.items()),
+                            ", ".join("{} {:.3e}".format(k, e[2]) for k, e in errors.items()), prev[0],
+                            ", ".join("{} {:.3e}".format(k, e[3]) for k, e in errors.items())))
+
+    def _log_output_correction(self, adjoint, psi_rom, psi_fom):
+        """The dual-weighted residual correction of this output row at the rejected ROM solution
+        (data_store.output_corrections). Collective."""
+        comm = self.mesh.mesh.comm
+        u_fom = np.asarray(self._adjoint_point[0], dtype=float)
+        u_rom = adjoint.solution
+        eval_idx, row = self.eval_idx - 1, self._current_adjoint_row
+        cache = getattr(self, "_rom_residual_cache", None)
+        if cache is None or cache[0] != eval_idx:
+            # R(u_r), once per design
+            self._rom_residual_cache = cache = (eval_idx, self._residual_at(u_rom, u_fom))
+        r_rom = cache[1]
+
+        def dot(a, b):
+            return comm.allreduce(float(np.dot(a, b)), op=MPI.SUM)
+        g = np.asarray(self._adjoint_rhs, dtype=float)
+        dual = getattr(adjoint, "last_dual", None)
+        record = (dot(g, u_rom - u_fom), -dot(psi_fom, r_rom), -dot(psi_rom, r_rom),
+                  np.nan if dual is None else -dot(dual, r_rom))
+        if comm.Get_rank() == 0:
+            self.data_store.output_corrections += [(eval_idx, row) + tuple(float(v) for v in record)]
+        PETSc.Sys.Print("output correction (output row {}): ROM output error to first order {:.3e}; corrected "
+                        "with the full-order adjoint {:.3e}, the ROM adjoint {:.3e}, the dual ROM adjoint {:.3e}".format(
+                            row, record[0], record[0] + record[1], record[0] + record[2], record[0] + record[3]))
+
+    def _residual_at(self, state, restore):
+        """This rank's owned entries of the steady residual R(state) on the current mesh and angle
+        of attack; the model is put back at `restore` (owned entries) afterwards. Collective."""
+        model = self.sim_model
+        with self._uncached_derived_fields():
+            try:
+                model.set_u_vec(state)
+                if hasattr(model, "update_derived_fields"):
+                    model.update_derived_fields()
+                model.set_up_solver()
+                b = model.problem._b.duplicate()
+                with model.steady_residual():
+                    model.problem.F(model.u_vec.x.petsc_vec, b)
+                r = np.array(b.getArray(readonly=True)[:len(state)], copy=True)
+                b.destroy()
+            finally:
+                model.set_u_vec(restore)
+                if hasattr(model, "update_derived_fields"):
+                    model.update_derived_fields()
+        return r
 
     def _hyper_reduced_adjoints(self, input_vals, u_vec, alpha, mesh_node_motions, d_outputs,
                                 parameter_vector, psi_fom, psi_rom):
@@ -1200,14 +1352,16 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         abs_err = norm(psi - psi_fom)
         rel_err = abs_err / fom_norm if fom_norm > 0.0 else np.nan
         rel_rom = np.nan if psi_rom is None or not rom_norm > 0.0 else norm(psi - psi_rom) / rom_norm
+        scale = self._dual_norm_scale()
+        rel_dual = np.nan if scale is None else norm(scale * (psi - psi_fom)) / norm(scale * psi_fom)
         contribution = self._contribution_errors(psi, psi_fom, psi_rom, state=state)
         if comm.Get_rank() == 0:
             getattr(self.data_store, m + "_adjoint_errors").append(
-                (eval_idx, row, float(abs_err), float(rel_err), float(rel_rom), float(walltime)))
+                (eval_idx, row, float(abs_err), float(rel_err), float(rel_rom), float(walltime), float(rel_dual)))
             getattr(self.data_store, m + "_adjoint_derivative_errors").append((eval_idx, row, contribution))
-        PETSc.Sys.Print("{} adjoint error (output row {}): |psi - psi_fom| = {:.3e}, relative {:.3e}; "
-                        "relative to the ROM adjoint {:.3e}; {:.3f} s; derivative contributions: {}".format(
-                            m.upper(), row, abs_err, rel_err, rel_rom, walltime,
+        PETSc.Sys.Print("{} adjoint error (output row {}): |psi - psi_fom| = {:.3e}, relative {:.3e} (in the dual "
+                        "norm {:.3e}); relative to the ROM adjoint {:.3e}; {:.3f} s; derivative contributions: {}".format(
+                            m.upper(), row, abs_err, rel_err, rel_dual, rel_rom, walltime,
                             self._contribution_string(contribution)))
 
     def _record_adjoint_error(self, psi_rom, psi_fom, rom_accepted, rom_walltime):
@@ -1224,6 +1378,9 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         rel_err = abs_err / fom_norm if fom_norm > 0.0 else np.nan
         eval_idx, row = self.eval_idx - 1, self._current_adjoint_row
         contribution = self._contribution_errors(psi_rom, psi_fom)
+        # the ROM adjoint's, before _log_adjoint_space computes others (_log_first_order_correction)
+        self._rom_contributions = self._last_contributions
+        self._last_reduced_adjoint = psi_rom
         if comm.Get_rank() == 0:
             self.data_store.adjoint_errors += [(eval_idx, row, float(abs_err), float(rel_err), float(fom_norm),
                                                 bool(rom_accepted), float(rom_walltime))]
@@ -1250,34 +1407,118 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
             return
         comm = self.mesh.mesh.comm
         test, adjoint_part = spaces()
-        dist_test, best = subspace_distance(comm, test, psi_fom)
-        dist_adjoint = np.nan if adjoint_part is None else subspace_distance(comm, adjoint_part, psi_fom)[0]
-        stored = self.reduced_order_model.stored_adjoint_subspace()
-        dist_stored = np.nan if stored is None else subspace_distance(comm, stored, psi_fom)[0]
-        contribution = self._contribution_errors(best, psi_fom)
-        # per state variable (the components of the blocked state): its share of |psi_fom|^2 and
-        # of |psi_fom - best|^2, the part of psi_fom no reduced adjoint in the space has
-        bs = self.sim_model.u_vec.x.block_size
+        rom = self.reduced_order_model
+        # the stored adjoint data
+        stored = rom.stored_adjoint_subspace()
         psi_fom = np.asarray(psi_fom, dtype=float)
-        shares = []
-        for x in (psi_fom, psi_fom - best):
-            per = comm.allreduce(np.sum(x.reshape(-1, bs)**2, axis=0), op=MPI.SUM)
-            shares.append(tuple(float(v) for v in per / max(per.sum(), 1e-300)))
+        bs = self.sim_model.u_vec.x.block_size
         eval_idx, row = self.eval_idx - 1, self._current_adjoint_row
+        record = [eval_idx, row, bool(rom_accepted), float(adjoint.condition_number)]
+        # in the 2-norm, and in the ROM's dual norm (W^-1 = D^2, the adjoint POD's inner product,
+        # which balances the components: a component's adjoint scales as 1 / its residual scale)
+        for name, scale in (("2-norm", None), ("dual norm", self._dual_norm_scale())):
+            if name != "2-norm" and scale is None:
+                record.append(None)
+                continue
+
+            def scaled(X):
+                return None if X is None else (X if scale is None else
+                                                (scale[:, None] * X if X.ndim == 2 else scale * X))
+            x = scaled(psi_fom)
+            dist_test, best = subspace_distance(comm, scaled(test), x)
+            dist_adjoint = np.nan if adjoint_part is None else subspace_distance(comm, scaled(adjoint_part), x)[0]
+            dist_stored = np.nan if stored is None else subspace_distance(comm, scaled(stored), x)[0]
+            psi_rom = self._last_reduced_adjoint
+            solve_err = np.nan
+            if psi_rom is not None:
+                d = scaled(np.asarray(psi_rom, dtype=float)) - x
+                solve_err = np.sqrt(comm.allreduce(float(d @ d), op=MPI.SUM)
+                                    / max(comm.allreduce(float(x @ x), op=MPI.SUM), 1e-300))
+            # the best approximation in this norm, in the state layout, and its contributions
+            best_psi = best if scale is None else best / scale
+            contribution = self._contribution_errors(best_psi, psi_fom)
+            # per state variable (the components of the blocked state): its share of |psi_fom|^2 and
+            # of |psi_fom - best|^2 (the part no reduced adjoint in the space has), in this norm
+            shares = []
+            for v in (x, x - best):
+                per = comm.allreduce(np.sum(v.reshape(-1, bs)**2, axis=0), op=MPI.SUM)
+                shares.append(tuple(float(s) for s in per / max(per.sum(), 1e-300)))
+            record.append(dict(space=float(dist_test), adjoint_basis=float(dist_adjoint), stored=float(dist_stored),
+                               solve=float(solve_err), best_contributions=contribution, shares=shares[0],
+                               misfit_shares=shares[1]))
+            PETSc.Sys.Print("ROM adjoint space (output row {}, {}): relative distance of psi_fom to the reduced "
+                            "adjoint space {:.3e} (the solve gives {:.3e}, x{:.2g}), to the adjoint basis {:.3e}, "
+                            "to the stored adjoint snapshots {:.3e}; reduced matrix condition {:.3e}; derivative "
+                            "contributions of the best approximation: {}; share of |psi_fom|^2 per state variable "
+                            "{}, of the best approximation's misfit {}".format(
+                                row, name, dist_test, solve_err,
+                                solve_err / dist_test if dist_test > 0.0 else np.nan, dist_adjoint, dist_stored,
+                                adjoint.condition_number, self._contribution_string(contribution),
+                                np.round(shares[0], 4), np.round(shares[1], 4)))
+        try:
+            record.append(self._min_residual_adjoint(adjoint, test, psi_fom, row))
+        except Exception as exc:
+            # a diagnostic must not stop the optimization
+            PETSc.Sys.Print("ROM adjoint space: the minimum-residual comparison failed: {!r}".format(exc))
+            record.append(None)
         if comm.Get_rank() == 0:
-            self.data_store.adjoint_space_errors += [(eval_idx, row, bool(rom_accepted), float(dist_test),
-                                                      float(dist_adjoint), float(dist_stored),
-                                                      float(adjoint.condition_number), contribution,
-                                                      shares[0], shares[1])]
-        PETSc.Sys.Print("ROM adjoint space (output row {}): relative distance of psi_fom to the reduced adjoint "
-                        "space {:.3e} (the solve then gives {:.3e}, x{:.2g}), to the adjoint basis {:.3e}, to the "
-                        "stored adjoint snapshots {:.3e}; reduced matrix condition {:.3e}; derivative contributions "
-                        "of the best approximation: {}; share of |psi_fom|^2 per state variable {}, of the "
-                        "best approximation's misfit {}".format(
-                            row, dist_test, rel_err, rel_err / dist_test if dist_test > 0.0 else np.nan,
-                            dist_adjoint, dist_stored, adjoint.condition_number,
-                            self._contribution_string(contribution), np.round(shares[0], 4),
-                            np.round(shares[1], 4)))
+            self.data_store.adjoint_space_errors += [tuple(record)]
+
+    def _min_residual_adjoint(self, adjoint, test, psi_fom, row):
+        """
+        For comparison with the reduced adjoint: the minimum-residual adjoint over the same space,
+        psi = T z minimizing ||D (A^T T z - g)||, T an orthonormal basis of the space, g the adjoint's
+        right-hand side, A the Jacobian at the reduced adjoint's linearization point (A^T T formed
+        once per reduced adjoint, for all its output rows) and D the state scales (W^-1/2). Not the
+        derivative of the reduced solve, but what a stable solve on that space gives. Returns {'dual': relative error in the dual norm, '2-norm': in the
+        2-norm, 'contributions': as adjoint_derivative_errors}. Collective.
+        """
+        comm = self.mesh.mesh.comm
+        scale = self._dual_norm_scale()
+        d = np.ones_like(psi_fom) if scale is None else scale
+        model = self.sim_model
+        cache = getattr(self, "_min_residual_cache", None)
+        if cache is None or cache[0] is not adjoint:
+            # A^T T at this state (the reduced adjoint's linearization point), once per reduced
+            # adjoint; the solver may have been released since its factorization
+            if model.problem is None:
+                model.set_up_solver()
+            with model.steady_residual():
+                model.problem.J(model.u_vec.x.petsc_vec, model.problem._A)
+            A = model.problem._A
+            T = orthonormal_columns(comm, np.asarray(test, dtype=float))
+            x, y = A.createVecLeft(), A.createVecRight()
+            ATT = np.empty_like(T)
+            for j in range(T.shape[1]):
+                x.array[:] = T[:, j]
+                A.multTranspose(x, y)
+                ATT[:, j] = y.array
+            x.destroy()
+            y.destroy()
+            Q, R = tsqr(comm, d[:, None] * ATT)
+            self._min_residual_cache = cache = (adjoint, T, ATT, Q, R)
+        _, T, ATT, Q, R = cache
+        g = np.asarray(self._adjoint_rhs, dtype=float)
+        z = sp_la.solve_triangular(R, comm.allreduce(Q.T @ (d * g), op=MPI.SUM), lower=False)
+        psi = T @ z
+
+        def rel(v, w):
+            return np.sqrt(comm.allreduce(float((v - w) @ (v - w)), op=MPI.SUM)
+                           / max(comm.allreduce(float(w @ w), op=MPI.SUM), 1e-300))
+        out = {'dual': float(rel(d * psi, d * psi_fom)), '2-norm': float(rel(psi, psi_fom)),
+               'contributions': self._contribution_errors(psi, psi_fom)}
+        PETSc.Sys.Print("ROM adjoint space (output row {}): the minimum-residual adjoint over the same space has "
+                        "relative error {:.3e} (dual norm), {:.3e} (2-norm); derivative contributions: {}".format(
+                            row, out['dual'], out['2-norm'], self._contribution_string(out['contributions'])))
+        return out
+
+    def _dual_norm_scale(self):
+        """This rank's entries of W^-1/2 = D (the square root of the ROM's dual weight), None
+        without a state scaling."""
+        rom = self.reduced_order_model
+        if rom is None or rom.W is None:
+            return None
+        return 1.0 / np.sqrt(rom.W.w.getArray(readonly=True))
 
     def _derivative_contributions(self, psis, state=None):
         """
@@ -1356,6 +1597,8 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
             c_rom = None if psi_rom is None else \
                 self._derivative_contributions([np.asarray(psi_rom, dtype=float)])[0]
             c = self._derivative_contributions([psi], state=state)[0]
+        # the ROM adjoint's are kept by _record_adjoint_error for _log_first_order_correction
+        self._last_contributions = (c, c_fom)
 
         def norm(key, v):
             v = np.atleast_1d(v)

@@ -28,9 +28,10 @@ there are none, and the distance is unweighted (as it is without the probe).
 
     OMP_NUM_THREADS=1 mpirun -n 8 python wing_opt_rans_pod.py [--hyper-reduction {both,deim,mdeim,none}]
 
-The ROM's basis concatenates a state and an adjoint basis (the optimizer's full-order adjoints are snapshots),
-and its reduced solve uses a hybrid test space (LSPG for the states, the adjoint basis for the adjoints), with
-the adjoint of those same equations.
+The ROM's basis concatenates a state basis and an adjoint basis of the same size per output (the optimizer's
+full-order adjoints are snapshots), and its reduced solve is the paired hybrid (LSPG for the states, the adjoint
+basis for the adjoints, each paired with a trial direction W^-1 A^T psi), with the adjoint of those same
+equations.
 
 DEIM and MDEIM (core/hyper_reduction.py) run beside the ROM for comparison (--hyper-reduction, default both):
 trained on the Jacobians of the full-order solves, they solve every design the ROM solves, with its basis and
@@ -45,7 +46,7 @@ cells two facets away (25 for an interior hex), ~900 nonzeros per cell, ~1.6e8 o
 is added), the harvest buffer mdeim_max_snapshots_per_solve + 1, and building the operators one more (plus its
 sparsity), hence the small values below: ~6 * 1.3 GB stored, ~16 GB at peak. DEIM's snapshots are state-sized
 (1.1e6 entries): 200 stored and 11 * rb_size buffered, ~3 GB. The ROM's adjoint snapshots are state-sized too:
-adjoint_max_rank = 60 of them, ~0.5 GB.
+adjoint_max_rank = 15 per output row, 60 in all, ~0.5 GB.
 """
 import argparse
 import os
@@ -186,19 +187,26 @@ if __name__ == '__main__':
     # default and is spelled out for clarity: it only acts once the probe below has supplied weights.
     #
     # The full-order adjoints the optimizer solves (four output rows: drag and the three constraints) are
-    # snapshots too (adjoint_snapshots='concatenate'): every basis is a state basis of 5 vectors followed by an
-    # adjoint basis of 5, orthogonalized against it, and the test space of the reduced solve is hybrid: LSPG's
-    # S^2 A V for the state part, the adjoint basis itself for the adjoint part (test_space='hybrid'). The reduced
-    # adjoint is that of the same equations, so the derivative stays consistent with the reduced solve, and it
-    # holds the adjoint basis, which the state basis alone does not (core/reduced_order_model.py). The adjoint
-    # snapshot matrix keeps adjoint_max_rank directions: four adjoints per design, so the default 3 * 5 = 15
-    # was full after four designs, and later adjoints were truncated into the earlier designs' subspace; 60
-    # keeps ~15 designs (~0.5 GB over all ranks). With compute_all_adjoint_errors, adjoint_space_errors
-    # records how far each full-order adjoint is from the reduced adjoint space, the adjoint basis and the
-    # stored adjoint snapshots.
+    # snapshots too (adjoint_snapshots='concatenate'). Each output row keeps its adjoints in a snapshot matrix of
+    # its own and gets an adjoint basis of the same size, adjoint_rb_size = 5 (adjoint_bases='per_output'); the
+    # four bases are orthonormalized together in W^-1 into Psi, of up to 4 * 5 = 20 directions (fewer where they
+    # share directions). On the OAT15A airfoil (examples/airfoil_opt_rans_pod.py) per-output bases cut the drag
+    # gradient error in the second half of a 30-iteration run from 20% to 7% against one shared basis of 5, at a
+    # 5x larger forward residual. The reduced solve is the paired hybrid: test basis [S^2 A V_s, Psi] (LSPG's for
+    # the 5 state vectors, Psi itself), trial basis [V_s, W^-1 A^T Psi] (hybrid_trial='paired', A at the solve's
+    # warm start), so that each adjoint test direction has its trial partner. The reduced adjoint is that of these
+    # equations (the exact derivative of the ROM's outputs, the basis fixed per design) and lies in a space that
+    # holds Psi. With the adjoint basis itself as trial directions (hybrid_trial='adjoint') the reduced system was
+    # nearly singular on a transonic RANS case and its adjoint ~100x less accurate than its space allowed; LSPG
+    # with the adjoints' preimages A^-1 S^-2 psi in the trial basis (tried and removed) did not extrapolate to
+    # other designs (docs/src/reduced_order_modeling.md). Each row's snapshot matrix keeps adjoint_max_rank
+    # directions, one per design: 15 keeps ~15 designs per row (4 * 15 vectors, ~0.5 GB over all ranks). With
+    # compute_all_adjoint_errors, adjoint_space_errors records how far each full-order adjoint is from the reduced
+    # adjoint's space and how close the reduced adjoint comes to it.
     rom = ReducedOrderModel(rb_size=10, basis_mode='local_weighted', eta_threshold=1e-15,
                             distance_weighting='total_derivative', cubic_cutoff=0.8,
-                            adjoint_snapshots='concatenate', test_space='hybrid', adjoint_max_rank=60)
+                            adjoint_snapshots='concatenate', test_space='hybrid', hybrid_trial='paired',
+                            adjoint_bases='per_output', adjoint_rb_size=5, adjoint_max_rank=15)
 
     # DEIM and MDEIM beside the ROM, for comparison only (their bases follow the ROM's local_weighted one).
     # DEIM: deim_n_modes >= rb_size (its basis spans S A V), the sandbox's 100 modes; MDEIM: the memory

@@ -282,10 +282,135 @@ $2\times10^{-10}$), since the forward solve no longer minimizes $\|S R\|$, which
 
 Why the LSPG adjoint gains little from adjoint snapshots in $V$: it lies in span($S^2 A V$), so an adjoint $\psi$ in
 $V$ adds $S^2 A \psi$ to its space, not $\psi$. If instead the full-order adjoint lies in span($S^2 A V$), the LSPG
-adjoint equations recover it exactly. That is the case for the transformed snapshot $\chi = A^{-1} S^{-2} \psi$
-($S^2 A \chi = \psi$), one solve with the forward Jacobian per adjoint at the state it was computed at. Stored in
-place of $\psi$ (an experiment, not yet an option), it brought the LSPG adjoint to the Galerkin one's accuracy
-(table) while keeping the consistency with the forward solve.
+adjoint equations recover it exactly. That is the case for the preimage $\chi = A^{-1} S^{-2} \psi$
+($S^2 A \chi = \psi$), one solve with the forward Jacobian per adjoint at the state it was computed at. An option
+that put the preimages into the trial basis in place of the adjoint basis brought the LSPG adjoint to the Galerkin
+one's accuracy on the test cases (table), consistent with the forward solve, but it did not extrapolate on a real
+shape optimization (below) and was removed.
+
+**Recommended: `adjoint_snapshots='concatenate'`, `test_space='hybrid'`, `hybrid_trial='paired'`.** The table
+above is from small cases with one design variable, where every variant looks good. On a transonic RANS shape
+optimization (OAT15A, Rizzi grid 2 cut at 200 chords, 15 FFD control points and $\alpha$, three outputs:
+examples/airfoil_opt_rans_pod.py) they behave very differently. Errors are relative and in the dual norm
+$W^{-1} = D^2$; "space" is the distance of $\psi_\text{FOM}$ to the space the reduced adjoint lies in, the
+best any reduced adjoint there can do.
+
+| | space | reduced adjoint | why |
+|---|---|---|---|
+| `test_space='hybrid'`, `hybrid_trial='adjoint'` | $0.2$–$1\%$ | $1.0$ | $\Phi^T A V$ nearly singular: amplification 40–180 |
+| `test_space='lspg'`, adjoints as snapshots | $1.0$ | $1.0$ | the space span($S^2 A V$) does not hold $\psi$ |
+| `test_space='lspg'`, preimages $\chi$ in the trial basis (removed) | $1.0$ | $1.0$ | preimages do not extrapolate (below) |
+| `test_space='hybrid'`, `hybrid_trial='paired'` | $0.2$–$4\%$ | $4$–$20\%$ | paired: amplification 2–20 |
+
+With the paired hybrid the mesh-motion contributions of the reduced adjoint came within $1$–$6\%$ of the
+full-order ones for a design $10^{-2}$ steps from a snapshot design, against $120$–$180\%$ unpaired; the
+$\alpha$ contributions, which come from the far-field rows where the adjoint is small, within $8$–$30\%$.
+
+Why. An adjoint $A^{-T} g$ lies mostly along the weakest directions of $A$: $A^T\psi = g$ is small next to
+$\psi$. Testing with the adjoint basis $\Psi$ makes the rows $\Psi^T A V = (A^T\Psi)^T V$ small for every
+trial direction, and the reduced matrix gets about one near-zero singular value per output (between
+dual-orthonormal test and $W$-orthonormal trial bases: $\sim 10^{-1}$ down to three of $10^{-8}$ for three
+outputs; a property of the spans, not the basis: `hybrid_state_test='orthonormal'` gave identical results).
+The trial direction that pairs best with a test direction $\psi$ maximizes $\psi^T A v / \|v\|_W$:
+$v = W^{-1} A^T \psi$. `hybrid_trial='paired'` uses $Z = W^{-1} A_0^T \Psi$, $A_0$ the Jacobian at the solve's
+warm start, for the adjoint part of the trial basis; $\Psi^T A Z$ is then the Gram matrix of $A^T\Psi$, and
+the smallest singular value rose to $\sim 5\times10^{-5}$. It costs one Jacobian assembly and $k$ products with
+$A^T$ per ROM solve, and its adjoint does as well as a minimum-residual adjoint on the same space.
+
+LSPG avoids the pairing problem by construction: its adjoint is the best approximation of $\psi_\text{FOM}$
+in its space in the dual norm (with $S A V = Q R$ and $D = S^{-1}$, $D\psi = Q Q^T D\psi_\text{FOM}$; on the
+OAT15A case its amplification was exactly 1). But its space is span($S^2 A V$), which holds $\psi$ only if
+$V$ holds the preimage $\chi = A^{-1} S^{-2}\psi$. The preimages work at the Jacobian they were computed with
+(the table above), not on the OAT15A case. $\chi$ is dominated by $A$'s weakest direction ($\sim 10^3$ times
+$\psi$), so $S^2 (A_\text{new} - A_\text{old}) \chi_\text{old}$ is large for a small change of $A$:
+$S^2 A_\text{new} \chi_\text{old}$ missed $\psi_\text{old}$ by a factor 5 over a design step of 0.009 (of a
+snapshot spacing of 1; shape steps of up to 0.2% chord and $0.05^\circ$ per unit) and by a factor 50 over 0.09.
+Two versions were tried: a POD of the $\chi$ in the $W$-norm, which keeps the wrong directions (they all look
+like the weakest mode), and the adjoint basis chosen from the $\psi$ in the dual norm with the same combinations
+of the $\chi$ in the trial basis, which avoids that but not the drift. Distance of $\psi_\text{FOM}$ to the LSPG
+adjoint's space (grid 1; the reduced adjoint's error is the same, LSPG's amplification being 1), against the
+space of all earlier preimages untruncated and against the old adjoints themselves:
+
+| step from the nearest snapshot design | 0.1 | 0.01 | 0.001 |
+|---|---|---|---|
+| preimages, 5 adjoint directions ($W$-norm POD of $\chi$) | $1.0$ | $0.995$ | $0.83$–$0.99$ |
+| preimages, 5 adjoint directions (chosen from the $\psi$) | $0.99$–$1.0$ | $0.98$–$0.99$ | $0.90$–$0.99$ |
+| span($S^2 A_\text{new}\,[\chi]$), all 15 earlier preimages | $0.79$–$1.0$ | $0.45$–$0.62$ | $0.08$–$0.10$ |
+| span of the earlier $\psi$ of one design | $5\%$ | $0.4\%$ | $0.04\%$ |
+| paired hybrid: space / reduced adjoint | $0.6$–$0.9\%$ / $4$–$12\%$ | $0.2\%$ / $5\%$ | |
+
+**Dual-corrected LSPG (`adjoint_snapshots='separate'`, `adjoint_solve='dual_corrected'`).** The non-conforming
+dual approach of Keil, Mechelli, Ohlberger, Schindler and Volkwein (ESAIM: M2AN, 2021), adapted to LSPG. The
+forward solve is plain LSPG on the state basis alone. A dual ROM on the adjoint basis $\Psi$ gives
+$\psi_d = \Psi z$, $z$ minimizing $\|W^{-1/2}(A^T \Psi z - g)\|$, and corrects an output to
+$f_c = f(u_r) - \psi_d^T R(u_r)$, which leaves only $(\psi_\text{FOM} - \psi_d)^T R(u_r)$ of the error. With the
+bases, the weights and $\psi_d$'s dependence on the design frozen and the terms proportional to $R(u_r)$ dropped
+(as for the LSPG adjoint), the derivative of $f_c$ uses
+$$\psi = \psi_d + S Q R^{-T} V^T (g - A^T \psi_d), \qquad S A V = Q R,$$
+the LSPG adjoint of what the dual ROM leaves of the adjoint equations; with $D = S^{-1}$,
+$D\psi = D\psi_\text{LSPG} + (I - QQ^T) D\psi_d$. The forward solve does not see $\Psi$. The output correction is
+not yet part of the ROM's outputs; `data_store.output_corrections` records it. On the test cases the derivative
+matches central differences of the ROM's solves to $2$–$4\times10^{-8}$, and the correction takes the ROM's
+output error from $1.7\times10^{-6}$ to $\sim10^{-11}$.
+
+On the OAT15A optimization (Rizzi grid 2, 6 SLSQP iterations, 15 reduced adjoints, the ROM never accepted; the
+dual-corrected ROM with a state basis of 10 and the paired hybrid's 5 adjoint vectors):
+
+| | dual-corrected | paired hybrid | LSPG (concatenated, 5 + 5) |
+|---|---|---|---|
+| reduced adjoint, dual norm: median / max | $6.5\%$ / $28\%$ | $10\%$ / $35\%$ | $1.0$ |
+| mesh-motion contributions, median | $6.7\%$ | $12\%$ | $1.0$ |
+| $\alpha$ contributions, median | $29\%$ | $47\%$ | $1.07$ |
+| forward $\eta$ | $2\times10^{-7}$–$3\times10^{-6}$ | $4\times10^{-6}$–$3\times10^{-4}$ | $2\times10^{-7}$–$3\times10^{-6}$ |
+| DEIM / MDEIM forward $\eta$ | up to $10^{-4}$ | up to $5\times10^{-3}$ | up to $4\times10^{-6}$ |
+
+The DEIM and MDEIM adjoints stay plain (hyper-reduced) LSPG, error $1.0$: the dual ROM uses the full $A^T$. The
+output correction reduces the ROM's first-order output error to a median of $32\%$ of itself, about as much as
+the full-order adjoint does ($47\%$): the limit is the nonlinearity of $R$ between $u_r$ and $u_\text{FOM}$ (the
+shock), not the dual ROM.
+
+With `basis_mode='global'` instead of `'local_weighted'` (same case; the state bases hold every state snapshot in
+both modes, so only the adjoint basis, 5 of up to 24 adjoint snapshots, differs):
+
+| | dual-corrected, local / global | paired hybrid, local / global |
+|---|---|---|
+| reduced adjoint, dual norm: median | $6.5\%$ / $17.5\%$ | $10\%$ / $28\%$ |
+| distance of $\psi_\text{FOM}$ to the adjoint space, median | $1.2\%$ / $1.7\%$ | $1.0\%$ / $1.7\%$ |
+| mesh-motion / $\alpha$ contributions, median | $6.7\%$ / $29\%$ ; $10.5\%$ / $46\%$ | $12\%$ / $47\%$ ; $19\%$ / $99\%$ |
+| $c_l$ error, median | $1.7\times10^{-3}$ / $1.7\times10^{-3}$ | $4\times10^{-3}$ / $1.7\times10^{-2}$ |
+
+The weighting toward nearby designs keeps the adjoint basis's 5 vectors on the adjoints that matter: global
+bases make both reduced adjoints about $2.5$ times worse, and the paired hybrid's forward solve too (its trial
+basis holds the adjoint directions). Most of the dual-corrected adjoint's error is the dual ROM's solve, a
+minimum residual, not the space: $4$ (local) to $10$ (global) times the distance to the space.
+
+**First-order model management** (`data_store.first_order_corrections`, a diagnostic): a trust-region method
+corrects its model's gradient at the centre $\mu_0$, $\nabla J_r(\mu) + (\nabla J_\text{FOM} - \nabla J_r)(\mu_0)$.
+Recorded with $\mu_0$ the previous design (every design has a full-order derivative here), against the
+previous design's full-order derivative reused as it is. Medians on the same case, over the 12 (design, output)
+pairs from the second rejected design on:
+
+| contributions: mesh motions / $\alpha$ | ROM | ROM, corrected | previous design's FOM derivative |
+|---|---|---|---|
+| LSPG | $1.0$ / $1.0$ | $7.5\%$ / $20\%$ | $7.5\%$ / $20\%$ |
+| paired hybrid, local_weighted | $4.3\%$ / $57\%$ | $6.6\%$ / $71\%$ | |
+| paired hybrid, global | $18.5\%$ / $130\%$ | $14.7\%$ / $92\%$ | |
+| dual-corrected, local_weighted | $7.4\%$ / $46\%$ | $11.5\%$ / $39\%$ | |
+| dual-corrected, global | $14.6\%$ / $58\%$ | $11.0\%$ / $72\%$ | |
+
+The LSPG adjoint contributes nothing (it is nearly orthogonal to the full-order one), so its corrected gradient
+is the previous design's, to four digits. For the other ROMs the correction helps where the ROM is poor (global
+bases) and hurts where it is good (local_weighted): the previous design's error does not carry over. On these
+steps (the first SLSQP iterations) the previous design's full-order derivative is a hard baseline: the
+local_weighted ROMs match or beat it in the mesh-motion contributions (in $58$–$67\%$ of the pairs), but not in
+$\alpha$ ($46$–$57\%$ against $20\%$), whose contributions come from the far-field rows where the adjoint is small.
+
+With `compute_all_adjoint_errors`, `data_store.adjoint_space_errors` records for every reduced adjoint the
+distance of the full-order adjoint to the reduced adjoint's space, to the adjoint basis and to the stored adjoint
+snapshots, the reduced adjoint's error, the condition number, the contributions of the best approximation and of
+the minimum-residual adjoint on the same space, in the 2-norm and in the dual norm $W^{-1} = D^2$. Use the dual
+norm: in the 2-norm a RANS adjoint is all $\tilde\nu$ (its residual scale is ~$10^{-3}$, so its adjoint is
+~$10^3$ larger).
 
 On the angle-of-attack test cases (three outputs, three FOM designs, seven designs), the relative errors of the
 optimizer's derivatives at the ROM-accepted designs against full-order-only derivatives were:
@@ -298,7 +423,7 @@ optimizer's derivatives at the ROM-accepted designs against full-order-only deri
 | `'concatenate'`, `rb_size=5` (3 + 2), `'lspg'` | $1.4$–$3.7\times10^{-6}$ | $1.4$–$3.7\times10^{-6}$ |
 | `'concatenate'`, `rb_size=5` (3 + 2), `'galerkin'` | $1.1$–$1.4\times10^{-8}$ | $2.2$–$5.7\times10^{-6}$ |
 | `'concatenate'`, `rb_size=8` (4 + 4), `'galerkin'` | $0.9$–$1.1\times10^{-8}$ | $0.6$–$1.7\times10^{-8}$ |
-| `'concatenate'`, `rb_size=8` (4 + 4), `'lspg'`, snapshots $\chi = A^{-1} S^{-2} \psi$ | $0.6$–$1.2\times10^{-8}$ | $1.8$–$2.9\times10^{-8}$ |
+| `'concatenate'`, `rb_size=8` (4 + 4), `'lspg'`, preimages $\chi = A^{-1} S^{-2} \psi$ (removed) | $0.6$–$1.2\times10^{-8}$ | $1.8$–$2.9\times10^{-8}$ |
 | `'concatenate'`, `rb_size=5` (3 + 2), `test_space='hybrid'` | $1.0$–$3.7\times10^{-8}$ | $1.4$–$3.8\times10^{-6}$ |
 | `'concatenate'`, `rb_size=8` (4 + 4), `test_space='hybrid'` | $0.5$–$1.4\times10^{-10}$ | $0.8$–$3.8\times10^{-8}$ |
 | `'concatenate'`, `rb_size=8` (4 + 4), `'least_squares'` | $1$–$3\times10^{-5}$ | $0.5$–$1\times10^{-3}$ |

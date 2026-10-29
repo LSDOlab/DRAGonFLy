@@ -9,6 +9,17 @@
   the adjoint basis itself for the adjoint directions, with its consistent adjoint), which gave derivatives
   100-10^4x closer to the full-order ones on the test cases. Snapshots can be tagged (`SnapshotMatrix`); centring uses state snapshots only.
   Derivative-contribution errors of the reduced adjoints (`data_store.adjoint_derivative_errors`).
+  `adjoint_solve='dual_corrected'` (with `'separate'`): plain LSPG forward, a dual ROM on the adjoint basis, and
+  the adjoint of the dual-weighted-residual corrected outputs (the non-conforming dual approach): on a
+  transonic RANS case 6.5% from the full-order adjoint (paired hybrid 10%) with LSPG's forward residuals.
+  Diagnostics: `data_store.output_corrections` (dual-weighted residual output corrections) and
+  `data_store.first_order_corrections` (trust-region style first-order gradient corrections).
+  `hybrid_trial='paired'` (recommended with `test_space='hybrid'`) uses $W^{-1} A^T \Psi$ as the trial
+  directions of the adjoint part, paired with the adjoint test directions: with the adjoint basis itself the
+  hybrid reduced system was nearly singular on a transonic RANS case, and its adjoint ~100x less accurate than
+  its space allowed, and its DEIM/MDEIM solves diverged (paired, their residuals stay below 5e-3). Where a ROM adjoint's error comes from: `data_store.adjoint_space_errors`;
+  `hybrid_state_test='orthonormal'`; examples/airfoil_opt_rans_pod.py (OAT15A on the Rizzi grids, which
+  `load_dolfinx_mesh(..., farfield_radius=)` can cut).
 - The incremental snapshot SVD rotates its basis in place (or straight into the new one): the transient memory of a
   snapshot update is a few vectors instead of three copies of the stored basis.
 - Hyper-reduction comparison (`core/hyper_reduction.py`): `DG_windtunnel_model(hyper_reduction=

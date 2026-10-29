@@ -355,8 +355,9 @@ def test_comparison_adjoints(in_tmp_dir, request):
         for m in ("deim", "mdeim"):
             errors = getattr(ds, m + "_adjoint_errors")
             assert errors, m
-            for eval_idx, row, absolute, relative, rel_rom, walltime in errors:
+            for eval_idx, row, absolute, relative, rel_rom, walltime, relative_dual in errors:
                 assert row == 0 and np.isfinite(absolute) and np.isfinite(relative) and walltime > 0.0
+                assert np.isfinite(relative_dual)
             # the last derivative took the ROM adjoint: compared with it too
             assert np.isfinite(errors[-1][4])
             assert "adjoint_" + m in [k for _, k, _ in ds.phase_times]
@@ -584,3 +585,54 @@ def test_comparison_in_a_shape_optimization_with_cached_adjoint_operators(in_tmp
     if MPI.COMM_WORLD.rank == 0:
         records = wt.data_store.mdeim_adjoint_derivative_errors
         assert records and all("mesh_node_motions" in e[2] for e in records)
+
+
+def test_hyper_reduced_adjoint_total_derivatives(in_tmp_dir):
+    """attach_rom_adjoint_derivative_comparison with the comparison: at every design with a rejected ROM
+    solve, the total derivatives with the ROM's and with each hyper-reduced method's adjoint (at the
+    full-order solution) are recorded beside the optimizer's, which keeps the full-order ones. MDEIM's
+    Jacobian is close to the true one here, so its derivatives are close to the ROM's."""
+    import csdl_alpha as csdl
+    from dragonfly_sim.utils.dv_sensitivity import attach_rom_adjoint_derivative_comparison
+    recorder = csdl.Recorder(inline=False)
+    recorder.start()
+    rom = ReducedOrderModel(rb_size=4, eta_threshold=1e-15)
+    wt = make_windtunnel("euler", rom=rom, suffix="hr_totals",
+                         hyper_reduction=HyperReductionComparison(deim_n_modes=8, mdeim_n_modes=4))
+    alpha = csdl.Variable(name='alpha', value=np.array([np.radians(ALPHAS[0])]))
+    alpha.set_as_design_variable()
+    u_vec = wt.evaluate(alpha=alpha)
+    out = wt.postprocessor.evaluate(u_vec, alpha=alpha)
+    out.D.set_as_objective()
+    out.M_pitch.set_as_constraint()
+    recorder.stop()
+    sim = csdl.experimental.JaxSimulator(recorder, gpu=False)
+    attach_rom_adjoint_derivative_comparison(sim, wt, wt.data_store, printer=PETSc.Sys.Print)
+    returned = []
+    for a in ALPHAS[:5]:
+        sim[alpha] = np.array([np.radians(a)])
+        d = sim.compute_optimization_derivatives()
+        returned.append(np.array([np.ravel(d['df'])[0], np.ravel(d['dc'])[0]]))
+    if MPI.COMM_WORLD.rank == 0:
+        ds = wt.data_store
+        rom_records = ds.rom_adjoint_total_derivatives
+        assert len(rom_records) >= 2
+        for m in ("deim", "mdeim"):
+            records = getattr(ds, m + "_adjoint_total_derivatives")
+            # the designs whose comparison had operators: all ROM designs but the first (no Jacobian snapshots yet)
+            by_eval = {rr[0]: rr for rr in rom_records}
+            assert len(records) >= 1 and all(r[0] in by_eval for r in records), m
+            for r in records:
+                rr = by_eval[r[0]]
+                J_fom = np.array([np.ravel(r[1])[0], np.ravel(r[2])[0]])
+                J = np.array([np.ravel(r[3])[0], np.ravel(r[4])[0]])
+                J_rom = np.array([np.ravel(rr[3])[0], np.ravel(rr[4])[0]])
+                assert np.array_equal(J_fom, np.array([np.ravel(rr[1])[0], np.ravel(rr[2])[0]]))
+                assert np.all(np.isfinite(J)) and np.any(J != J_fom)
+                PETSc.Sys.Print("HR-ADJOINT-TOTALS {} eval {}: rel to FOM {}, rel to ROM {}".format(
+                    m, r[0], np.abs(J - J_fom) / np.abs(J_fom), np.abs(J - J_rom) / np.abs(J_rom)))
+                if m == "mdeim":
+                    assert np.allclose(J, J_rom, rtol=1e-2), (J, J_rom)
+        # the optimizer got the full-order derivatives
+        fom = [np.array([np.ravel(r[1])[0], np.ravel(r[2])[0]]) for r in rom_records]
+        assert all(any(np.array_equal(f, g) for g in returned) for f in fom)

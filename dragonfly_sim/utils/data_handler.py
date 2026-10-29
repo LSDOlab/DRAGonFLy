@@ -80,14 +80,44 @@ class DataStore():
         self.adjoint_derivative_errors = []
 
         # With every adjoint_errors entry of a reduced adjoint that has one, where its error comes
-        # from: (eval_idx, output row, whether the ROM solve was accepted, relative 2-norm
-        # distance of psi_fom to the space the reduced adjoint lies in (the best any reduced
-        # adjoint there can do), to the adjoint basis it holds (nan: none), to all adjoint
-        # snapshot data the ROM keeps (the adjoint snapshot matrix truncated at adjoint_max_rank;
-        # nan: none), condition number of the reduced adjoint matrix, {input: contribution errors
-        # of the best approximation, as in adjoint_derivative_errors}, per state variable its
-        # share of |psi_fom|^2, per state variable its share of |psi_fom - best approximation|^2).
+        # from: (eval_idx, output row, whether the ROM solve was accepted, condition number of the
+        # reduced adjoint matrix, {...} in the 2-norm, {...} in the ROM's dual norm W^-1 = D^2 or
+        # None without a state scaling). Each dict: 'space', 'adjoint_basis', 'stored': the relative
+        # distance of psi_fom to the space the reduced adjoint lies in (the best any reduced adjoint
+        # there can do), to the adjoint basis it holds (nan: none) and to all adjoint snapshot data
+        # the ROM keeps (the adjoint snapshot matrix truncated at adjoint_max_rank; nan: none);
+        # 'solve': the reduced adjoint's relative error; 'best_contributions': {input: contribution
+        # errors of the best approximation, as in adjoint_derivative_errors}; 'shares',
+        # 'misfit_shares': per state variable its share of |psi_fom|^2 and of
+        # |psi_fom - best approximation|^2. Last, for comparison, the minimum-residual adjoint over
+        # the same space (min ||D (A^T psi - g)||, not the reduced solve's derivative): {'dual',
+        # '2-norm': its relative errors, 'contributions': as adjoint_derivative_errors}.
         self.adjoint_space_errors = []
+
+        # Per reduced adjoint of a rejected ROM solve (compute_all_adjoint_errors), the dual-weighted
+        # residual correction of the output: (eval_idx, output row, g^T (u_r - u_fom), -psi_fom^T R(u_r),
+        # -psi_rom^T R(u_r), -psi_d^T R(u_r) or nan), g the output's gradient at the full-order solution
+        # u_fom, u_r the ROM solution and R(u_r) its residual: the first is the ROM's output error to
+        # first order, and an output corrected by an adjoint psi as f(u_r) - psi^T R(u_r) is left with
+        # the sum of the first and that adjoint's term; psi_d is the dual ROM's adjoint
+        # (adjoint_solve='dual_corrected', whose corrected outputs use it).
+        self.output_corrections = []
+
+        # First-order model management (DG_windtunnel_model._log_first_order_correction), per reduced
+        # adjoint of a rejected ROM solve after the first: (eval_idx, output row, eval_idx of mu_0 (the
+        # previous such design), {input: (|c - c_fom|, relative to |c_fom|, the uncorrected relative
+        # error, the relative error of mu_0's full-order contribution reused as it is)}) with c the ROM's
+        # derivative contribution corrected by its error at mu_0.
+        self.first_order_corrections = []
+
+        # Per design with a rejected ROM solve (utils/dv_sensitivity.attach_rom_adjoint_derivative_comparison):
+        # (eval_idx, df_fom, dc_fom, df_rom, dc_rom), the total derivatives of the objective (1, n_dv) and
+        # the constraints (n_c, n_dv) in physical design variable units, with the full-order adjoint (the
+        # optimizer's) and with the rejected ROM's adjoint at the full-order solution.
+        self.rom_adjoint_total_derivatives = []
+        # the same with the DEIM / MDEIM comparison's adjoints at the full-order solution
+        self.deim_adjoint_total_derivatives = []
+        self.mdeim_adjoint_total_derivatives = []
 
         # Per full-order adjoint added as a ROM snapshot (ReducedOrderModel adjoint_snapshots):
         # (eval_idx, output row, whether it added a basis direction, adjoint snapshots stored)
@@ -142,7 +172,8 @@ class DataStore():
         #   <M>_outputs             {name: [(eval_idx, value)]} like ROM_outputs
         # per adjoint solve (output row) of a design it solved:
         #   <m>_adjoint_errors      (eval_idx, row, |psi - psi_FOM|, relative to |psi_FOM|,
-        #                           |psi - psi_ROM| / |psi_ROM| or nan, wall time), psi the
+        #                           |psi - psi_ROM| / |psi_ROM| or nan, wall time, relative error
+        #                           in the ROM's dual norm W^-1 = D^2 or nan), psi the
         #                           adjoint of its own solve (linearized about its solution),
         #                           psi_FOM and psi_ROM the optimizer's state's
         #   <m>_adjoint_derivative_errors

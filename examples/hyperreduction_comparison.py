@@ -72,7 +72,7 @@ def report(ds):
             print("{:>5} {:>10.3e} {:>5} {:>9.3f} {:>9.3f} {:>10.3e} {:>10.3e} {:>10.3e} {:>5}/{:<6}".format(
                 e, s["eta"][1][k], int(s["iterations"][1][k]), s["online"][1][k], s["offline"][1][k],
                 s["l2_fom"][1][k], s["l2_rom"][1][k], dcd, i["sampled_cells"], i["total_cells"]))
-        adj = np.array([a[2:] for a in getattr(ds, m + "_adjoint_errors")]).reshape(-1, 4)
+        adj = np.array([a[2:6] for a in getattr(ds, m + "_adjoint_errors")]).reshape(-1, 4)
         if adj.size:
             print("adjoints: {} solves; relative error vs FOM median {:.3e}, vs ROM median {:.3e}, "
                   "mean wall time {:.3f} s".format(adj.shape[0], np.median(adj[:, 1]),

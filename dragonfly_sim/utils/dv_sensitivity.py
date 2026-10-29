@@ -422,3 +422,80 @@ def attach_total_derivative_probe(sim, printer=print, param_scales=None,
         sim._total_derivative_probe_attached = False
 
     return detach
+
+
+def attach_rom_adjoint_derivative_comparison(sim, flow_model, record_to, printer=print,
+                                             record_attr='rom_adjoint_total_derivatives', methods=None):
+    """Compare, at every design with a rejected ROM solve, the total derivatives the optimizer
+    gets (full-order adjoint) with those the ROM's adjoint would give it.
+
+    Wraps ``compute_optimization_derivatives`` on the simulator INSTANCE, like
+    attach_total_derivative_probe (attach this one first: the probe then sees the optimizer's
+    derivatives). After the optimizer's evaluation it evaluates the derivatives again inside
+    ``flow_model.rom_adjoint_shadow()``, so that the flow model's reverse products use the
+    rejected ROM's adjoint (DG_windtunnel_model.rom_adjoint_shadow) and CSDL chains them through
+    the mesh warping, the shape parameterization and the explicit output derivatives as it does
+    the full-order ones. The second evaluation re-runs the model on the same design (a repeat,
+    which takes an evaluation index) and costs one reverse sweep with reduced adjoints. The
+    optimizer gets the first evaluation's dict.
+
+    Appends to ``record_to.<record_attr>`` (rank 0 records, every rank computes)
+    ``(eval_idx, df_fom, dc_fom, df_rom, dc_rom)``, eval_idx that of the adjoint records of the
+    design (adjoint_errors), the derivatives in physical design variable units as
+    compute_optimization_derivatives returns them.
+
+    ``methods``: the reduced adjoints to compare, 'rom' and the hyper-reduced comparison's
+    'deim' / 'mdeim' (default: 'rom' and the flow model's hyper-reduction methods), one more
+    evaluation each; a hyper-reduced method's records go to ``record_to.<method>_adjoint_total_
+    derivatives``.
+    """
+    if methods is None:
+        hr = getattr(flow_model, "hyper_reduction", None)
+        methods = ('rom',) + (() if hr is None else tuple(hr.models))
+    attrs = {m: record_attr if m == 'rom' else m + "_adjoint_total_derivatives" for m in methods}
+    for attr in attrs.values():
+        if not hasattr(record_to, attr):
+            raise AttributeError("record_to has no attribute '{}' to append to".format(attr))
+    original = sim.compute_optimization_derivatives
+
+    def copy(v):
+        return None if v is None else np.array(v, dtype=float, copy=True)
+
+    def wrapped(*args, **kwargs):
+        deriv_dict = original(*args, **kwargs)
+        result = {k: copy(v) if k in ('df', 'dc') else v for k, v in deriv_dict.items()}
+        # the adjoint records' index of this design, before the shadow evaluations take their own
+        eval_idx = flow_model.eval_idx - 1
+        for method in methods:
+            try:
+                if not flow_model.rom_adjoint_shadow_available(method):
+                    continue
+                with flow_model.rom_adjoint_shadow(method) as failed:
+                    shadow = original(*args, **kwargs)
+                    missing = failed()
+                if missing:
+                    printer("{}-adjoint total derivatives: no {} adjoint at eval_idx {}".format(
+                        method.upper(), method.upper(), eval_idx))
+                    continue
+                df_rom, dc_rom = copy(shadow['df']), copy(shadow['dc'])
+                if flow_model.mesh.mesh.comm.Get_rank() == 0:
+                    getattr(record_to, attrs[method]).append((eval_idx, result['df'], result['dc'], df_rom, dc_rom))
+                J_fom, J_rom = stack_total_derivatives(result['df'], result['dc']), \
+                    stack_total_derivatives(df_rom, dc_rom)
+                rel = np.linalg.norm(J_rom - J_fom, axis=1) / np.maximum(np.linalg.norm(J_fom, axis=1), 1e-300)
+                printer("{}-adjoint total derivatives (eval_idx {}): relative error per output {}".format(
+                    method.upper(), eval_idx, " ".join("{:.3e}".format(r) for r in rel)))
+            except Exception as exc:
+                # a diagnostic must not stop the optimization
+                printer("WARNING: {}-adjoint total-derivative comparison failed: {!r}".format(method.upper(), exc))
+        return result
+
+    sim.compute_optimization_derivatives = wrapped
+
+    def detach():
+        try:
+            del sim.compute_optimization_derivatives
+        except AttributeError:
+            pass
+
+    return detach

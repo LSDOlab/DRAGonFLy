@@ -1119,3 +1119,289 @@ def test_hybrid_adjoint_is_the_derivative_of_the_hybrid_rom(in_tmp_dir):
     assert (rom.n_snapshots, rom.n_adjoint_snapshots) == n_snapshots       # both solves were the ROM's
     PETSc.Sys.Print("HYBRID-ADJOINT-CHECK: dD/dalpha {:.12f}, FD of the ROM solves {:.12f}".format(dD, fd))
     assert abs(fd - dD) < 1e-6 * abs(fd), (fd, dD)
+
+
+def test_orthonormal_hybrid_state_test_changes_the_basis_not_the_rom(in_tmp_dir):
+    """hybrid_state_test='orthonormal' replaces the state test columns S^2 A V_s by S Q, a basis of
+    the same span: the reduced equations, hence the ROM's solutions and its adjoint, are the same
+    as with 'normal_equations' up to round-off."""
+    import csdl_alpha as csdl
+    results = {}
+    for mode in ('normal_equations', 'orthonormal'):
+        recorder = csdl.Recorder(inline=False)
+        recorder.start()
+        rom = ReducedOrderModel(rb_size=5, eta_threshold=1e-9, adjoint_snapshots='concatenate', test_space='hybrid',
+                                hybrid_state_test=mode)
+        wt = make_windtunnel("euler", rom=rom, suffix="hybrid_" + mode)
+        alpha = csdl.Variable(name='alpha', value=np.array([np.radians(ALPHAS[0])]))
+        alpha.set_as_design_variable()
+        u_vec = wt.evaluate(alpha=alpha)
+        out = wt.postprocessor.evaluate(u_vec, alpha=alpha)
+        out.D.set_as_objective()
+        out.M_pitch.set_as_constraint()
+        recorder.stop()
+        sim = csdl.experimental.JaxSimulator(recorder, gpu=False)
+        for a in ALPHAS[:3]:
+            sim[alpha] = np.array([np.radians(a)])
+            sim.run()
+            sim.compute_totals()
+        sim[alpha] = np.array([np.radians(ALPHAS[4])])
+        sim.run()
+        totals = sim.compute_totals()
+        assert rom.adjoint.accepted and rom.adjoint.orthonormal == (mode == 'orthonormal')
+        results[mode] = (np.array(sim[out.D]).ravel()[0], float(np.asarray(totals[out.D, alpha]).ravel()[0]),
+                         float(np.asarray(totals[out.M_pitch, alpha]).ravel()[0]), rom.adjoint.inf_sup)
+    ref, orth = results['normal_equations'], results['orthonormal']
+    assert orth[:3] == pytest.approx(ref[:3], rel=1e-8)
+    # the basis-independent singular values do not depend on the basis either
+    assert orth[3] == pytest.approx(ref[3], rel=1e-6)
+
+
+@pytest.mark.verification
+@pytest.mark.parametrize("paired_update", ["warm_start", "newton", "solution"])
+@pytest.mark.parametrize("kind", ["euler", "rans"])
+def test_paired_hybrid_adjoint_is_consistent_and_holds_the_adjoint(in_tmp_dir, kind, paired_update):
+    """hybrid_trial='paired': the trial directions paired with the adjoint test directions Psi are
+    W^-1 A^T Psi, with the Jacobian at the warm start, at every Newton iteration or at the solution
+    (paired_update). The derivative at an accepted design is the hybrid ROM's own (central differences
+    of its solves), and its adjoint is close to the full-order one."""
+    import csdl_alpha as csdl
+    recorder = csdl.Recorder(inline=False)
+    recorder.start()
+    rom = ReducedOrderModel(rb_size=8, eta_threshold=1e-9, adjoint_snapshots='concatenate', test_space='hybrid',
+                            hybrid_trial='paired', paired_update=paired_update)
+    wt = make_windtunnel(kind, rom=rom, suffix="paired", compute_all_adjoint_errors=True)
+    alpha = csdl.Variable(name='alpha', value=np.array([np.radians(ALPHAS[0])]))
+    alpha.set_as_design_variable()
+    u_vec = wt.evaluate(alpha=alpha)
+    out = wt.postprocessor.evaluate(u_vec, alpha=alpha)
+    out.D.set_as_objective()
+    out.M_pitch.set_as_constraint()
+    recorder.stop()
+    sim = csdl.experimental.JaxSimulator(recorder, gpu=False)
+    for a in ALPHAS[:3]:
+        sim[alpha] = np.array([np.radians(a)])
+        sim.run()
+        sim.compute_totals()
+    a = np.radians(ALPHAS[4])
+    sim[alpha] = np.array([a])
+    sim.run()
+    dD = float(np.asarray(sim.compute_totals()[out.D, alpha]).ravel()[0])
+    assert rom.adjoint.accepted
+    assert bool(rom.paired_updates) == (paired_update != 'warm_start')
+    assert max(rom.orthonormality.values()) < 1e-10, rom.orthonormality
+    h = 1e-5
+    fd = (wt.solve_forward(a + h)[2]["D"] - wt.solve_forward(a - h)[2]["D"]) / (2 * h)
+    PETSc.Sys.Print("PAIRED-ADJOINT-CHECK ({}): dD/dalpha {:.12f}, FD of the ROM solves {:.12f}".format(
+        paired_update, dD, fd))
+    assert abs(fd - dD) < 1e-6 * abs(fd), (fd, dD)
+    if MPI.COMM_WORLD.rank == 0:
+        accepted = [e for e in wt.data_store.adjoint_space_errors if e[2]]
+        worst = max(e[5]['solve'] for e in accepted)
+        PETSc.Sys.Print("PAIRED-ADJOINT-ERROR ({}): {:.3e}".format(paired_update, worst))
+        assert worst < 1e-3
+
+
+@pytest.mark.verification
+@pytest.mark.parametrize("kind", ["euler", "rans"])
+def test_per_output_adjoint_bases(in_tmp_dir, kind):
+    """adjoint_bases='per_output': an adjoint basis per output row, orthonormalized together into the
+    hybrid's Psi. With two output rows the basis holds more adjoint directions than one shared basis
+    would; the derivative at an accepted design is still the ROM's own and its adjoint close to the
+    full-order one."""
+    import csdl_alpha as csdl
+    recorder = csdl.Recorder(inline=False)
+    recorder.start()
+    rom = ReducedOrderModel(rb_size=8, eta_threshold=1e-9, adjoint_snapshots='concatenate', test_space='hybrid',
+                            hybrid_trial='paired', adjoint_bases='per_output')
+    wt = make_windtunnel(kind, rom=rom, suffix="per_output", compute_all_adjoint_errors=True)
+    alpha = csdl.Variable(name='alpha', value=np.array([np.radians(ALPHAS[0])]))
+    alpha.set_as_design_variable()
+    u_vec = wt.evaluate(alpha=alpha)
+    out = wt.postprocessor.evaluate(u_vec, alpha=alpha)
+    out.D.set_as_objective()
+    out.M_pitch.set_as_constraint()
+    recorder.stop()
+    sim = csdl.experimental.JaxSimulator(recorder, gpu=False)
+    for a in ALPHAS[:3]:
+        sim[alpha] = np.array([np.radians(a)])
+        sim.run()
+        sim.compute_totals()
+    assert sorted(rom.adjoint_pods) == [0, 1]
+    assert rom.n_adjoint_snapshots == sum(p.snapshot_matrix.n_snapshots for p in rom.adjoint_pods.values()) > 0
+    a = np.radians(ALPHAS[4])
+    sim[alpha] = np.array([a])
+    sim.run()
+    dD = float(np.asarray(sim.compute_totals()[out.D, alpha]).ravel()[0])
+    assert rom.adjoint.accepted
+    n_state, Psi = rom.hybrid_test_space()
+    assert Psi.shape[1] > rom.adjoint_rb_size          # more than one shared basis would hold
+    # the concatenated basis is W-orthonormal (state and adjoint blocks mutually orthogonal), Psi W^-1-orthonormal
+    assert max(rom.orthonormality.values()) < 1e-10, rom.orthonormality
+    h = 1e-5
+    fd = (wt.solve_forward(a + h)[2]["D"] - wt.solve_forward(a - h)[2]["D"]) / (2 * h)
+    PETSc.Sys.Print("PER-OUTPUT-ADJOINT-CHECK: {} adjoint directions, dD/dalpha {:.12f}, FD {:.12f}".format(
+        Psi.shape[1], dD, fd))
+    assert abs(fd - dD) < 1e-6 * abs(fd), (fd, dD)
+    if MPI.COMM_WORLD.rank == 0:
+        worst = max(e[5]['solve'] for e in wt.data_store.adjoint_space_errors if e[2])
+        PETSc.Sys.Print("PER-OUTPUT-ADJOINT-ERROR: {:.3e}".format(worst))
+        assert worst < 1e-3
+
+
+@pytest.mark.parametrize("adjoint_snapshots", [None, 'augment'])
+def test_per_output_adjoint_bases_need_an_adjoint_basis(adjoint_snapshots):
+    with pytest.raises(ValueError):
+        ReducedOrderModel(rb_size=8, adjoint_snapshots=adjoint_snapshots, adjoint_bases='per_output')
+
+
+def test_paired_update_needs_the_paired_trial_basis():
+    with pytest.raises(ValueError):
+        ReducedOrderModel(rb_size=8, adjoint_snapshots='concatenate', test_space='hybrid', paired_update='newton')
+
+
+@pytest.mark.parametrize("kw", [dict(adjoint_snapshots='concatenate'), dict(adjoint_snapshots=None)])
+def test_dual_corrected_needs_a_separate_adjoint_basis(kw):
+    with pytest.raises(ValueError):
+        ReducedOrderModel(rb_size=5, adjoint_solve='dual_corrected', **kw)
+
+
+@pytest.mark.verification
+@pytest.mark.parametrize("kind,basis_mode,adjoint_bases", [
+    ("euler", "global", "shared"), ("euler", "local_weighted", "shared"), ("rans", "global", "shared"),
+    ("rans", "local_weighted", "shared"), ("euler", "local_weighted", "per_output"),
+    ("rans", "local_weighted", "per_output")])
+def test_dual_corrected_adjoint_is_consistent_and_holds_the_adjoint(in_tmp_dir, kind, basis_mode, adjoint_bases):
+    """adjoint_solve='dual_corrected': the LSPG adjoint plus the dual ROM's adjoint outside its span.
+    At an accepted design the derivative matches central differences of the ROM's solves (the output
+    correction, proportional to the ROM residual, is negligible there) and the adjoint is close to the
+    full-order one. At the rejected designs, the dual-weighted residual correction with the full-order
+    adjoint removes the ROM's first-order output error (the sign convention of output_corrections).
+    With adjoint_bases='per_output' the dual ROM's basis holds an adjoint basis per output row."""
+    import csdl_alpha as csdl
+    recorder = csdl.Recorder(inline=False)
+    recorder.start()
+    rom = ReducedOrderModel(rb_size=4, basis_mode=basis_mode, eta_threshold=1e-9, adjoint_snapshots='separate',
+                            adjoint_rb_size=4, adjoint_solve='dual_corrected', adjoint_bases=adjoint_bases)
+    wt = make_windtunnel(kind, rom=rom, suffix="dual_corrected", compute_all_adjoint_errors=True)
+    alpha = csdl.Variable(name='alpha', value=np.array([np.radians(ALPHAS[0])]))
+    alpha.set_as_design_variable()
+    u_vec = wt.evaluate(alpha=alpha)
+    out = wt.postprocessor.evaluate(u_vec, alpha=alpha)
+    out.D.set_as_objective()
+    out.M_pitch.set_as_constraint()
+    recorder.stop()
+    sim = csdl.experimental.JaxSimulator(recorder, gpu=False)
+    for a in ALPHAS[:3]:
+        sim[alpha] = np.array([np.radians(a)])
+        sim.run()
+        sim.compute_totals()
+    a = np.radians(ALPHAS[4])
+    sim[alpha] = np.array([a])
+    sim.run()
+    dD = float(np.asarray(sim.compute_totals()[out.D, alpha]).ravel()[0])
+    assert rom.adjoint.accepted and rom.adjoint.dual_corrected
+    if adjoint_bases == 'per_output':
+        assert sorted(rom.adjoint_pods) == [0, 1]
+        # more directions than one shared basis would hold, W^-1-orthonormal
+        Psi = rom.adjoint.adjoint_basis.getDenseArray()
+        assert Psi.shape[1] > rom.adjoint_rb_size
+        w = rom.W_dual.w.getArray(readonly=True) if rom.W_dual is not None else np.ones(Psi.shape[0])
+        G = MPI.COMM_WORLD.allreduce(Psi.T @ (w[:, None] * Psi), op=MPI.SUM)
+        assert np.max(np.abs(G - np.eye(G.shape[0]))) < 1e-10
+    h = 1e-5
+    fd = (wt.solve_forward(a + h)[2]["D"] - wt.solve_forward(a - h)[2]["D"]) / (2 * h)
+    PETSc.Sys.Print("DUAL-CORRECTED-CHECK: dD/dalpha {:.12f}, FD of the ROM solves {:.12f}".format(dD, fd))
+    assert abs(fd - dD) < 1e-6 * abs(fd), (fd, dD)
+    if MPI.COMM_WORLD.rank == 0:
+        accepted = [e for e in wt.data_store.adjoint_space_errors if e[2]]
+        worst = max(e[5]['solve'] for e in accepted)
+        PETSc.Sys.Print("DUAL-CORRECTED-ERROR: {:.3e}; output corrections {}".format(
+            worst, wt.data_store.output_corrections))
+        assert worst < 1e-3
+        corrections = wt.data_store.output_corrections
+        assert corrections and all(np.isfinite(c[2:]).all() for c in corrections)
+        for _, _, first_order, with_fom, _, with_dual in corrections:
+            assert abs(first_order + with_fom) < 0.1 * abs(first_order) + 1e-14
+
+
+@pytest.mark.verification
+def test_rom_adjoint_total_derivatives(in_tmp_dir):
+    """attach_rom_adjoint_derivative_comparison: at every design with a rejected ROM solve, the total
+    derivatives with the ROM's adjoint differ from the optimizer's (full-order) ones by the difference
+    of the adjoints' derivative contributions (adjoint_derivative_errors), per output; the optimizer
+    keeps the full-order derivatives."""
+    import csdl_alpha as csdl
+    from dragonfly_sim.utils.dv_sensitivity import attach_rom_adjoint_derivative_comparison
+    recorder = csdl.Recorder(inline=False)
+    recorder.start()
+    rom = ReducedOrderModel(rb_size=4, eta_threshold=1e-15, adjoint_snapshots='separate', adjoint_rb_size=2,
+                            adjoint_solve='dual_corrected')
+    wt = make_windtunnel("euler", rom=rom, suffix="total_derivatives", compute_all_adjoint_errors=True)
+    alpha = csdl.Variable(name='alpha', value=np.array([np.radians(ALPHAS[0])]))
+    alpha.set_as_design_variable()
+    u_vec = wt.evaluate(alpha=alpha)
+    out = wt.postprocessor.evaluate(u_vec, alpha=alpha)
+    out.D.set_as_objective()
+    out.M_pitch.set_as_constraint()
+    recorder.stop()
+    sim = csdl.experimental.JaxSimulator(recorder, gpu=False)
+    attach_rom_adjoint_derivative_comparison(sim, wt, wt.data_store, printer=PETSc.Sys.Print)
+    returned = []
+    for a in ALPHAS[:4]:
+        sim[alpha] = np.array([np.radians(a)])
+        d = sim.compute_optimization_derivatives()
+        returned.append((float(np.ravel(d['df'])[0]), float(np.ravel(d['dc'])[0])))
+    if MPI.COMM_WORLD.rank == 0:
+        records = wt.data_store.rom_adjoint_total_derivatives
+        PETSc.Sys.Print("ROM-ADJOINT-TOTALS: {}".format(records))
+        contributions = {}
+        for eval_idx, row, accepted, errors in wt.data_store.adjoint_derivative_errors:
+            assert not accepted
+            contributions.setdefault(eval_idx, []).append(errors['alpha'][0])
+        # the designs after the first two (too few snapshots for a ROM solve before)
+        assert len(records) == 2 and all(r[0] in contributions for r in records)
+        for eval_idx, df_fom, dc_fom, df_rom, dc_rom in records:
+            diffs = sorted([abs(float(np.ravel(df_rom - df_fom)[0])), abs(float(np.ravel(dc_rom - dc_fom)[0]))])
+            expected = sorted(contributions[eval_idx])
+            assert np.allclose(diffs, expected, rtol=1e-8, atol=1e-14), (diffs, expected)
+            assert min(diffs) > 0.0
+        # the optimizer got the full-order derivatives
+        fom = [(float(np.ravel(r[1])[0]), float(np.ravel(r[2])[0])) for r in records]
+        assert fom == returned[2:]
+
+
+@pytest.mark.verification
+def test_first_order_corrections_are_recorded(in_tmp_dir):
+    """data_store.first_order_corrections: with the ROM never accepted, every design from the second
+    rejected one on gets, per output row, the ROM derivative contributions corrected by their error at
+    the previous design. The uncorrected error is the ROM adjoint's (adjoint_derivative_errors), not that of
+    the other adjoints the adjoint-space diagnostics evaluate after it."""
+    import csdl_alpha as csdl
+    recorder = csdl.Recorder(inline=False)
+    recorder.start()
+    rom = ReducedOrderModel(rb_size=4, eta_threshold=1e-15, adjoint_snapshots='separate', adjoint_rb_size=2,
+                            adjoint_solve='dual_corrected')
+    wt = make_windtunnel("euler", rom=rom, suffix="first_order", compute_all_adjoint_errors=True)
+    alpha = csdl.Variable(name='alpha', value=np.array([np.radians(ALPHAS[0])]))
+    alpha.set_as_design_variable()
+    u_vec = wt.evaluate(alpha=alpha)
+    out = wt.postprocessor.evaluate(u_vec, alpha=alpha)
+    out.D.set_as_objective()
+    out.M_pitch.set_as_constraint()
+    recorder.stop()
+    sim = csdl.experimental.JaxSimulator(recorder, gpu=False)
+    for a in ALPHAS[:5]:
+        sim[alpha] = np.array([np.radians(a)])
+        sim.run()
+        sim.compute_totals()
+    if MPI.COMM_WORLD.rank == 0:
+        managed = wt.data_store.first_order_corrections
+        PETSc.Sys.Print("FIRST-ORDER-CORRECTIONS: {}".format(managed))
+        # designs 3, 4 and 5 have rejected ROM solves (the first two have too few snapshots)
+        assert sorted({(m[0], m[1]) for m in managed}) == [(e, r) for e in (7, 9) for r in (0, 1)]
+        rom_errors = {(e[0], e[1]): e[3] for e in wt.data_store.adjoint_derivative_errors}
+        for eval_idx, row, source, errors in managed:
+            assert source == eval_idx - 2 and np.isfinite(errors['alpha']).all()
+            for k, e in errors.items():
+                assert np.isclose(e[2], rom_errors[eval_idx, row][k][1], rtol=1e-10), (k, e, rom_errors[eval_idx, row])

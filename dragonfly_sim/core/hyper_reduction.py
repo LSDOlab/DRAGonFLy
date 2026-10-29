@@ -73,7 +73,8 @@ from scipy.spatial.distance import cdist
 
 from dragonfly_sim.core.pod import PODBasis
 from dragonfly_sim.core.reduced_order_model import (LSPGSolver, HybridLSPGSolver, HybridLSPGAdjoint,
-                                                     hybrid_test_basis, scaled_jacobian_basis)
+                                                     hybrid_test_basis, scaled_jacobian_basis,
+                                                     orthonormal_state_rows)
 from dragonfly_sim.utils.petsc_utils import set_petsc_vec_array
 from dragonfly_sim.utils.solver_profiling import PROFILER as _PROF
 
@@ -678,6 +679,9 @@ class HyperReducedHybridLSPG(HybridLSPGSolver):
     def _reduced_system(self, model):
         Sr, r_norm = self._weighted_residual(model)
         H, g, self._merit_gradient = self.operator.hybrid_reduced_system(Sr)
+        if self.orthonormal:
+            # the Gram block of the hyper-reduced S A V_s, as the adjoint's (HybridLSPGAdjoint._orthonormalize)
+            H, g = orthonormal_state_rows(H, g, self.n_state)
         return H, g, r_norm
 
 
@@ -693,9 +697,10 @@ class HyperReducedLSPGAdjoint(HybridLSPGAdjoint):
     Owns S, not V or Psi.
     """
 
-    def __init__(self, operator, V, S, comm, parameter_vector, solution, hybrid=None):
+    def __init__(self, operator, V, S, comm, parameter_vector, solution, hybrid=None, orthonormal=False):
         n_state, Psi = (V.getSize()[1], None) if hybrid is None else hybrid
-        super().__init__(V, S, comm, parameter_vector, solution, accepted=False, n_state=n_state, Psi=Psi)
+        super().__init__(V, S, comm, parameter_vector, solution, accepted=False, n_state=n_state, Psi=Psi,
+                         orthonormal=orthonormal and hybrid is not None)
         self.operator = operator
 
     def _factor(self, model):
@@ -705,6 +710,7 @@ class HyperReducedLSPGAdjoint(HybridLSPGAdjoint):
         S = None if self.S is None else self.S.getArray(readonly=True)
         Psi = np.zeros((SAV_hr.shape[0], 0)) if self.Psi is None else self.Psi
         self._Phi = hybrid_test_basis(SAV_hr, S, self.n_state, Psi)
+        self._orthonormalize(SAV_hr[:, :self.n_state])
         model.set_up_solver()
         with model.steady_residual():
             _, AV = scaled_jacobian_basis(model, self.V, self.S)       # the true Jacobian
@@ -785,6 +791,7 @@ class HyperReductionComparison:
         self._compared_key = None
         self._V = self._mean = self._S = None
         self._hybrid = None
+        self._orthonormal = False
         self._solutions = {}
         self._adjoints = {}
 
@@ -916,6 +923,7 @@ class HyperReductionComparison:
         self._S = rom.residual_weight(model)
         # the ROM's hybrid test basis (test_space='hybrid'), which the hyper-reduced solves mirror
         self._hybrid = rom.hybrid_test_space()
+        self._orthonormal = rom.hybrid_state_test == 'orthonormal'
         settings = rom.basis_settings()
         layout = model.u_vec.x.petsc_vec
         reference = layout.getArray(readonly=True).copy()
@@ -963,7 +971,8 @@ class HyperReductionComparison:
                     solver = rom.make_solver(HyperReducedLSPG, self._V, self._S, self._mean, comm, operator=hr)
                 else:
                     solver = rom.make_solver(HyperReducedHybridLSPG, self._V, self._S, self._mean, comm, operator=hr,
-                                             n_state=self._hybrid[0], Psi=self._hybrid[1])
+                                             n_state=self._hybrid[0], Psi=self._hybrid[1],
+                                             orthonormal=self._orthonormal)
                 PETSc.Sys.Print("{} hyper-reduced {} solve".format(name.upper(),
                                                                  "LSPG" if self._hybrid is None else "hybrid"))
                 result = rom.run_passes(model, solver, t0)
@@ -1003,7 +1012,8 @@ class HyperReductionComparison:
             if adj is not None:
                 adj.destroy()
             S = None if self._S is None else self._S.copy()
-            adj = HyperReducedLSPGAdjoint(hr, self._V, S, self.comm, parameter_vector, u_local, hybrid=self._hybrid)
+            adj = HyperReducedLSPGAdjoint(hr, self._V, S, self.comm, parameter_vector, u_local, hybrid=self._hybrid,
+                                          orthonormal=self._orthonormal)
             self._adjoints[name] = adj
         t0 = perf_counter()
         psi = adj.solve(model, rhs_local)
@@ -1021,6 +1031,7 @@ class HyperReductionComparison:
                 obj.destroy()
         self._V = self._mean = self._S = None
         self._hybrid = None
+        self._orthonormal = False
         self._solutions = {}
         self.design = None
         self._compared_key = None
