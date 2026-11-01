@@ -73,7 +73,7 @@ from scipy.spatial.distance import cdist
 
 from dragonfly_sim.core.pod import PODBasis
 from dragonfly_sim.core.reduced_order_model import (LSPGSolver, HybridLSPGSolver, HybridLSPGAdjoint,
-                                                     hybrid_test_basis, scaled_jacobian_basis,
+                                                     FrozenTestSolver, hybrid_test_basis, scaled_jacobian_basis,
                                                      orthonormal_state_rows)
 from dragonfly_sim.utils.petsc_utils import set_petsc_vec_array
 from dragonfly_sim.utils.solver_profiling import PROFILER as _PROF
@@ -499,6 +499,7 @@ class MDEIM(DEIM):
         self.template_vec = None
         self._SAV = None
         self._H = None
+        self._T = self._T_SAV = None
 
     # -- sparsity and snapshots ---------------------------------------------
     @property
@@ -540,10 +541,12 @@ class MDEIM(DEIM):
         return (sel[order] - start).astype(np.int64), order
 
     # -- one solve's operators -----------------------------------------------
-    def prepare(self, model, V, S, hybrid=None):
+    def prepare(self, model, V, S, hybrid=None, test_basis=None):
         """Bind the sampled Jacobian to the rows of the points and build the
         affine operators Phi_l V and H_lp on POD basis V (and, with `hybrid`, those
-        of the hybrid test basis, see DEIM.prepare). Collective."""
+        of the hybrid test basis, see DEIM.prepare; with `test_basis` T, this
+        rank's rows of the frozen ROM's T = S A(u_k) V, the T^T Phi_l V of
+        frozen_reduced_system). Collective."""
         k = V.getSize()[1]
         m = self.n_basis_modes
         if m < 1:
@@ -578,6 +581,9 @@ class MDEIM(DEIM):
             if self._hybrid is not None:
                 # Psi^T S^-1 (S A_l V): the adjoint rows of the hybrid Phi^T A V
                 self._Psi_SAV = self.comm.allreduce(np.einsum('ia,lik->lak', self._Psi_S, self._SAV), op=MPI.SUM)
+            self._T = test_basis
+            self._T_SAV = None if test_basis is None else \
+                self.comm.allreduce(np.einsum('ia,lik->lak', test_basis, self._SAV), op=MPI.SUM)
         self._V = V
 
     def _build_affine_operators(self, V, layout):
@@ -634,12 +640,23 @@ class MDEIM(DEIM):
             g = np.concatenate([merit[:n_state], self.comm.allreduce(self._Psi_S.T @ Sr_local, op=MPI.SUM)])
             return H, g, merit
 
+    def frozen_reduced_system(self, Sr_local):
+        """(T^T S A V, T^T S r, (S A V)^T S r) of the frozen ROM's Petrov-Galerkin
+        step (FrozenTestSolver), T the test basis given to prepare, S A V ~
+        sum_l c_l S A_l V; T^T S r is exact. Collective."""
+        c = self.coefficients()
+        with _PROF.phase("rom:hr_project"):
+            parts = self.comm.allreduce(np.vstack([np.einsum('lik,i->lk', self._SAV, Sr_local),
+                                                   (self._T.T @ Sr_local)[None, :]]), op=MPI.SUM)
+            return np.einsum('l,lak->ak', c, self._T_SAV), parts[-1], c @ parts[:-1]
+
     def scaled_jacobian_basis(self):
         return np.einsum('l,lik->ik', self.coefficients(), self._SAV)
 
     def release(self):
         self._SAV = self._H = None
         self._Psi_SAV = None
+        self._T = self._T_SAV = None
         self._V = None
 
     def destroy(self):
@@ -682,6 +699,23 @@ class HyperReducedHybridLSPG(HybridLSPGSolver):
         if self.orthonormal:
             # the Gram block of the hyper-reduced S A V_s, as the adjoint's (HybridLSPGAdjoint._orthonormalize)
             H, g = orthonormal_state_rows(H, g, self.n_state)
+        return H, g, r_norm
+
+
+class HyperReducedFrozenTestSolver(FrozenTestSolver):
+    """FrozenTestSolver (the ROM's test_space='frozen') whose step comes from an MDEIM
+    prepared with the frozen test basis (`operator`, MDEIM.prepare(test_basis=T)):
+    (T^T S A~ V) da = -T^T S r. The residual and the test basis are exact, so the
+    equations T^T S R(mean + V a) = 0, their solution and its adjoint (FrozenTestAdjoint)
+    are the frozen ROM's; the approximate Jacobian only changes the Newton path."""
+
+    def __init__(self, V, comm, T=None, operator=None, **kwargs):
+        super().__init__(V, comm, T=T, **kwargs)
+        self.operator = operator
+
+    def _reduced_system(self, model):
+        Sr, r_norm = self._weighted_residual(model)
+        H, g, self._merit_gradient = self.operator.frozen_reduced_system(Sr)
         return H, g, r_norm
 
 
@@ -760,17 +794,36 @@ class HyperReductionComparison:
                                         solution, the sampled assembly's
                                         exactness and the approximation error
                                         (full Jacobian assemblies; diagnostic)
+      drive                             None, or 'mdeim': no comparison; the
+                                        method drives the ROM's own solves
+                                        instead (test_space='frozen' only)
 
     The defaults are those of the project-sandbox windtunnel model.
+
+    drive='mdeim' makes the MDEIM the Jacobian of the frozen ROM's Newton loop
+    (HyperReducedFrozenTestSolver): at every freeze (a trust-region center) its
+    basis is built like the ROM's, its points selected and its operators formed
+    with the frozen basis and test basis (freeze), and every solve until the next
+    freeze takes its step from them (frozen_solver). The residual and the test
+    basis stay exact, so the solution and adjoint are the frozen ROM's; what
+    changes is the cost and the convergence of the Newton loop.
     """
 
     def __init__(self, methods=METHODS, deim_n_modes=100, deim_n_points=None, deim_max_rank=None,
                  deim_max_snapshots_per_solve=10, mdeim_n_modes=10, mdeim_n_points=None, mdeim_max_rank=15,
-                 mdeim_max_snapshots_per_solve=4, min_snapshot_norm=None, qr_rank_tol=1e-10, validate=False):
+                 mdeim_max_snapshots_per_solve=4, min_snapshot_norm=None, qr_rank_tol=1e-10, validate=False,
+                 drive=None):
         methods = tuple(methods)
         if not methods or any(m not in METHODS for m in methods):
             raise ValueError("methods must be a nonempty subset of {}, got {}".format(METHODS, methods))
+        if drive not in (None, 'mdeim') or (drive is not None and methods != (drive,)):
+            raise ValueError("drive must be None or 'mdeim' with methods=('mdeim',), got drive={!r}, methods={}".format(
+                drive, methods))
         self.methods = methods
+        self.drive = drive
+        # drive: the operators of the current freeze are usable, and what they are (freeze)
+        self._driving = False
+        self._freeze_info = None
         self.deim_n_modes, self.deim_n_points, self.deim_max_rank = deim_n_modes, deim_n_points, deim_max_rank
         self.mdeim_n_modes, self.mdeim_n_points, self.mdeim_max_rank = mdeim_n_modes, mdeim_n_points, mdeim_max_rank
         self.max_snapshots_per_solve = {'deim': deim_max_snapshots_per_solve,
@@ -796,7 +849,11 @@ class HyperReductionComparison:
         self._adjoints = {}
 
     def set_up(self, model, rom):
-        """Build the DEIM/MDEIM of `model`, following the bases of `rom`."""
+        """Build the DEIM/MDEIM of `model`, following the bases of `rom` (with drive, attached
+        to it as its jacobian_hyper_reduction)."""
+        if self.drive is not None and rom.test_space != 'frozen':
+            raise ValueError("drive='{}' needs a ROM with test_space='frozen', got {!r}".format(
+                self.drive, rom.test_space))
         self.destroy()
         self.comm = model.mesh_obj.mesh.comm
         kw = dict(basis_mode=rom.basis_mode, qr_rank_tol=self.qr_rank_tol, min_snapshot_norm=self.min_snapshot_norm)
@@ -806,7 +863,10 @@ class HyperReductionComparison:
         if 'mdeim' in self.methods:
             self.models['mdeim'] = MDEIM(self.comm, n_modes=self.mdeim_n_modes, n_points=self.mdeim_n_points,
                                          max_rank=self.mdeim_max_rank, **kw)
-        PETSc.Sys.Print("Hyper-reduction comparison: {}; bases follow the ROM's ({})".format(
+        if self.drive is not None:
+            rom.jacobian_hyper_reduction = self
+        PETSc.Sys.Print("Hyper-reduction {}: {}; bases follow the ROM's ({})".format(
+            "comparison" if self.drive is None else "driving the ROM's Newton loop",
             ", ".join("{} ({} modes)".format(n.upper(), h.n_modes) for n, h in self.models.items()),
             rom.basis_mode))
 
@@ -837,6 +897,15 @@ class HyperReductionComparison:
         `basis` is the POD basis of this evaluation's ROM solve (None: none, and
         DEIM, whose snapshots are actions along it, harvests nothing).
         Collective."""
+        self.begin_harvest(model, rom, basis)
+        cap = max(c if c is not None else np.iinfo(np.int32).max for c in self.max_snapshots_per_solve.values())
+        with model.record_fom_jacobians(self._sink, max_jacobians=cap):
+            yield
+
+    def begin_harvest(self, model, rom, basis):
+        """Start the harvest of a FOM solve (harvesting() does): empty buffers, the POD basis
+        and the residual weight. Alone, before harvest_converged_state, for a solve whose
+        incoming state is already converged (no Newton iterates). Collective."""
         self.discard_buffers()
         self._harvest_basis = basis
         S = rom.residual_weight(model)
@@ -844,9 +913,6 @@ class HyperReductionComparison:
         if S is not None:
             S.destroy()
         self._final = False
-        cap = max(c if c is not None else np.iinfo(np.int32).max for c in self.max_snapshots_per_solve.values())
-        with model.record_fom_jacobians(self._sink, max_jacobians=cap):
-            yield
 
     def harvest_converged_state(self, model):
         """Add the steady Jacobian at the model's current (converged FOM)
@@ -905,6 +971,8 @@ class HyperReductionComparison:
         last, with no snapshot added since, is skipped. Returns a list of
         HyperReducedResult. Collective.
         """
+        if self.drive is not None:
+            return []
         pv = np.asarray(parameter_vector, dtype=float).ravel()
         key = (pv.tobytes(), rom.n_snapshots, rom.n_adjoint_snapshots) + \
             tuple(h.n_snapshots for h in self.models.values())
@@ -983,6 +1051,69 @@ class HyperReductionComparison:
         self._compared_key = key
         return results
 
+    # -- driving the frozen ROM (drive) ------------------------------------------
+    def freeze(self, model, rom, frozen):
+        """
+        The operators of the ROM's freeze `frozen` (its dict of V, mean, S, T),
+        at the model's current state (the center's): the basis built like the
+        ROM's, the points and the operators on the frozen bases. Without a
+        snapshot or with a failure, the solves until the next freeze take
+        the exact Jacobian. Collective.
+        """
+        name = self.drive
+        hr = self.models[name]
+        hr.release()
+        self._driving = False
+        t0 = perf_counter()
+        # one snapshot suffices: the center's Jacobian (harvested at its FOM solve), scaled by the
+        # sampled entries, a chord Newton
+        if hr.n_snapshots < 1:
+            PETSc.Sys.Print("{}: no snapshot stored; the ROM solves take the exact Jacobian until the next "
+                            "freeze".format(name.upper()))
+            self._freeze_info = dict(driving=False, n_snapshots=hr.n_snapshots)
+            return False
+        try:
+            with _PROF.phase("rom:" + name + "_basis"):
+                hr.build_basis(rom.basis_settings(), layout_vec=hr.template_vec)
+            if hr.n_basis_modes == 0:
+                raise ValueError("empty basis")
+            with _PROF.phase("rom:" + name + "_select"):
+                hr.select_indices()
+            model.update_derived_fields()
+            hr.prepare(model, frozen['V'], frozen['S'], test_basis=frozen['T'])
+        except ValueError as exc:
+            PETSc.Sys.Print("{}: no operators at this freeze ({}); the ROM solves take the exact Jacobian".format(
+                name.upper(), exc))
+            hr.release()
+            self._freeze_info = dict(driving=False, n_snapshots=hr.n_snapshots)
+            return False
+        offline = perf_counter() - t0
+        self._freeze_info = dict(
+            driving=True, n_modes=hr.n_basis_modes, n_points=int(hr.indices.size), sampled_cells=hr.rjac.n_cells,
+            assembled_cells=hr.rjac.n_closure_cells,
+            total_cells=model.mesh_obj.mesh.topology.index_map(model.mesh_obj.mesh.topology.dim).size_global,
+            conditioning=hr.conditioning(), n_snapshots=hr.n_snapshots, offline_walltime=offline)
+        PETSc.Sys.Print("{} drives the frozen ROM: {} modes, {} points on {} of {} cells ({} assembled), "
+                        "conditioning {:.3e}, {} snapshots; offline wall time {:.3f}".format(
+                            name.upper(), hr.n_basis_modes, hr.indices.size, hr.rjac.n_cells,
+                            self._freeze_info['total_cells'], hr.rjac.n_closure_cells,
+                            self._freeze_info['conditioning'], hr.n_snapshots, offline))
+        self._driving = True
+        return True
+
+    def frozen_solver(self, rom, frozen, S, comm):
+        """The Newton loop of a frozen ROM solve (rom.make_solver) on the operators of
+        the last freeze; None when it has none (the ROM then takes the exact Jacobian)."""
+        if not self._driving:
+            return None
+        return rom.make_solver(HyperReducedFrozenTestSolver, frozen['V'], S, frozen['mean'], comm, T=frozen['T'],
+                               operator=self.models[self.drive])
+
+    def pop_freeze_info(self):
+        """What the last freeze built (a dict, see freeze), once; None if nothing froze since."""
+        info, self._freeze_info = self._freeze_info, None
+        return info
+
     # -- adjoint ---------------------------------------------------------------
     def has_operators(self, parameter_vector):
         return self.design is not None and np.array_equal(
@@ -1035,6 +1166,7 @@ class HyperReductionComparison:
         self._solutions = {}
         self.design = None
         self._compared_key = None
+        self._driving = False
 
     def destroy(self):
         self._release_operators()

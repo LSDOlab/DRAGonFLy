@@ -14,9 +14,9 @@ from mpi4py import MPI
 from petsc4py import PETSc
 
 from dragonfly_sim.core.hyper_reduction import (RestrictedJacobian, DEIM, MDEIM, HyperReducedLSPG,
-                                                HyperReducedLSPGAdjoint, HyperReductionComparison,
-                                                greedy_deim_indices, design_weights)
-from dragonfly_sim.core.reduced_order_model import ReducedOrderModel, LSPGSolver, LSPGAdjoint
+                                                HyperReducedLSPGAdjoint, HyperReducedFrozenTestSolver,
+                                                HyperReductionComparison, greedy_deim_indices, design_weights)
+from dragonfly_sim.core.reduced_order_model import ReducedOrderModel, LSPGSolver, LSPGAdjoint, FrozenTestSolver
 from dragonfly_sim.core.MUSCL_Euler_model import MUSCLEulerModel
 from dragonfly_sim.utils.pod_utils import petsc_dense_from_local_block
 
@@ -224,6 +224,55 @@ def test_hyper_reduced_solver_takes_the_operator_system(in_tmp_dir):
     assert H1 == pytest.approx(H0, rel=1e-12) and g1 == pytest.approx(g0, rel=1e-12, abs=1e-14)
     plain.destroy()
     hyper.destroy()
+
+
+@pytest.mark.parametrize("kind", ["euler", "rans"])
+@pytest.mark.unit_test
+def test_mdeim_frozen_system_is_the_frozen_solvers(in_tmp_dir, kind):
+    """With this state's vec(S A) in its snapshots, the MDEIM's Petrov-Galerkin system on a test basis T
+    (prepare(test_basis=T)) is FrozenTestSolver's, merit gradient included, and
+    HyperReducedFrozenTestSolver takes it."""
+    rom = ReducedOrderModel(rb_size=3)
+    wt = _windtunnel(kind, rom=rom)
+    m = wt.sim_model
+    comm = m.mesh_obj.mesh.comm
+    wt.solve_forward(np.radians(2.0))
+    V = _random_basis(m, 3)
+    T_mat = _random_basis(m, 3, seed=5)
+    T = T_mat.getDenseArray().copy()
+    S = rom.residual_weight(m)
+    mdeim = MDEIM(comm, n_modes=1)
+    assert mdeim.add_values(mdeim.scaled_values(_steady_jacobian(m), S.getArray(readonly=True)), [2.0, 0.0])
+    mdeim.build_basis(None, layout_vec=mdeim.template_vec)
+    mdeim.select_indices()
+    m.update_derived_fields()
+    mdeim.prepare(m, V, S, test_basis=T)
+    plain = rom.make_solver(FrozenTestSolver, V, S, None, comm, T=T)
+    hyper = rom.make_solver(HyperReducedFrozenTestSolver, V, S, None, comm, T=T, operator=mdeim)
+    m.set_up_solver()
+    with m.steady_residual():
+        H0, g0, r0 = plain._reduced_system(m)
+        H1, g1, r1 = hyper._reduced_system(m)
+    assert r1 == r0
+    assert g1 == pytest.approx(g0, rel=1e-12, abs=1e-14 * np.abs(g0).max())
+    assert H1 == pytest.approx(H0, rel=1e-8, abs=1e-10 * np.abs(H0).max())
+    mg0, mg1 = plain._merit_gradient, hyper._merit_gradient
+    assert mg1 == pytest.approx(mg0, rel=1e-7, abs=1e-9 * np.abs(mg0).max())
+    plain.destroy()
+    hyper.destroy()
+    mdeim.destroy()
+    for obj in (S, V, T_mat):
+        obj.destroy()
+
+
+@pytest.mark.unit_test
+def test_driving_options_are_validated():
+    with pytest.raises(ValueError, match="drive must be"):
+        HyperReductionComparison(drive='mdeim')
+    with pytest.raises(ValueError, match="drive must be"):
+        HyperReductionComparison(methods=('deim',), drive='deim')
+    hr = HyperReductionComparison(methods=('mdeim',), drive='mdeim')
+    assert hr.drive == 'mdeim'
 
 
 # ----------------------------------------------------------------------
@@ -636,3 +685,47 @@ def test_hyper_reduced_adjoint_total_derivatives(in_tmp_dir):
         # the optimizer got the full-order derivatives
         fom = [np.array([np.ravel(r[1])[0], np.ravel(r[2])[0]]) for r in rom_records]
         assert all(any(np.array_equal(f, g) for g in returned) for f in fom)
+
+
+@pytest.mark.parametrize("kind", ["euler", "rans"])
+@pytest.mark.verification
+def test_mdeim_driven_frozen_rom_has_the_frozen_roms_solution(in_tmp_dir, kind):
+    """drive='mdeim': the frozen ROM's Newton loop takes its Jacobian from an MDEIM built at the freeze
+    (recorded in mdeim_operator_info) and converges to the solution of the frozen ROM with the exact
+    Jacobian, frozen at the same center; there is no comparison. Needs test_space='frozen'."""
+    comm = MPI.COMM_WORLD
+
+    def frozen_run(hyper_reduction):
+        rom = ReducedOrderModel(rb_size=3, eta_threshold=0.0, min_snapshots=1, test_space='frozen')
+        wt = _windtunnel(kind, rom=rom, hyper_reduction=hyper_reduction)
+        _run_sequence(wt, ALPHAS[:3])
+        center = np.array(wt.previous_solution, copy=True)
+        rom.eta_threshold = np.inf
+        out = []
+        # frozen at the center by its first solve
+        rom.request_freeze()
+        for a in (ALPHAS[2], ALPHAS[4]):
+            wt.previous_solution = center
+            wt._fom_design = None
+            u, _, _ = wt.solve_forward(np.radians(a))
+            wt.eval_idx += 1
+            assert wt.last_solve_rom_accepted and wt.last_rom_result.converged
+            out.append(global_array(comm, u))
+        return wt, out
+
+    _, reference = frozen_run(None)
+    hr = HyperReductionComparison(methods=('mdeim',), drive='mdeim', mdeim_n_modes=4)
+    wt, driven = frozen_run(hr)
+    assert wt.reduced_order_model.jacobian_hyper_reduction is hr
+    for u0, u1 in zip(reference, driven):
+        assert np.linalg.norm(u1 - u0) <= 1e-8 * np.linalg.norm(u0)
+    if comm.rank == 0:
+        ds = wt.data_store
+        assert not ds.mdeim_relative_residuals          # no comparison solves
+        driving = [info for _, info in ds.mdeim_operator_info if info["driving"]]
+        assert driving
+        for info in driving:
+            assert info["sampled_cells"] <= info["assembled_cells"] < info["total_cells"]
+            assert info["offline_walltime"] > 0.0
+    with pytest.raises(ValueError, match="test_space='frozen'"):
+        HyperReductionComparison(methods=('mdeim',), drive='mdeim').set_up(wt.sim_model, ReducedOrderModel(rb_size=3))

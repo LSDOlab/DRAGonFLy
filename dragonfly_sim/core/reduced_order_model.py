@@ -129,6 +129,13 @@ block. Two ways to bring Z to the solution's Jacobian instead of the warm start'
   again from it, until Z changes by less than paired_update_rtol (relative, W-norm, worst column) or
   after paired_update_max_passes re-pairings: one reduced space per solve, for a Jacobian assembly, k
   products with A^T and a ROM solve per re-pairing.
+- paired_update='solution_offset': after the solve, Z is rebuilt at the ROM's solution u* and the
+  offset of the trial space moved to u*, without solving again: the trial space u* + span[V_s, Z(u*)]
+  holds the solution (a = 0) and the test space [S^2 A V_s, Psi] does not depend on Z, so the
+  solution, its residual and Phi are those of the solve; only the adjoint, (Phi^T A V)^T lam = V^T g,
+  sees the new Z, paired with Psi at the Jacobian it is evaluated with. For a Jacobian assembly and k
+  products with A^T per solve. Nothing after the solve reads the offset (the adjoint needs V, S, Psi
+  and A at u* only), so it is not stored.
 
 An LSPG ROM whose trial basis holds the adjoints' preimages A^-1 S^-2 psi (so that its adjoint's
 space span(S^2 A V) holds psi) was tried and removed: exact at the snapshots' Jacobian, but the preimages
@@ -154,8 +161,18 @@ weights and psi_d's dependence on the design frozen and the terms proportional t
 
 the LSPG adjoint of what the dual ROM leaves of the adjoint equations: with D = S^-1,
 D psi = D psi_lspg + (I - Q Q^T) D psi_d, the LSPG adjoint in span(S A V) and the dual ROM's outside it.
-The LSPG forward solve does not see Psi. The output correction is not part of the ROM's outputs yet
-(the windtunnel model records it: data_store.output_corrections).
+The LSPG forward solve does not see Psi. The windtunnel model adds the correction to the outputs of
+an accepted solve (DG_windtunnel_model._dual_output_corrections, through LSPGAdjoint.dual_adjoint), so
+that the optimizer's values are those of the corrected outputs this adjoint differentiates; at a
+rejected solve it records it (data_store.output_corrections).
+
+test_space='galerkin' solves the Galerkin equations V^T R(mean + V a) = 0 instead of LSPG
+(GalerkinSolver: Newton with V^T A V, the line search on LSPG's merit ||S r||), with the Galerkin
+adjoint (V^T A V)^T z = V^T g, psi = V z (adjoint_solve='galerkin'), which is the exact derivative of
+those equations: the test basis V does not depend on the state, so no terms are dropped. The adjoint lies
+in the trial space, so with adjoint_snapshots='concatenate' it holds the adjoint basis (the
+optimality-system POD of Kunisch and Volkwein); with adjoint_snapshots=None the basis is the state's
+alone. The solve does not minimize ||S r||, so its eta is larger than LSPG's at equal accuracy.
 
 test_space='hybrid' ('concatenate' only) changes the forward solve itself: Petrov-Galerkin with
 the concatenated basis V = [V_s, Psi_perp] as trial basis and Phi = [S^2 A V_s, Psi] as test
@@ -169,8 +186,20 @@ Phi instead, Q an orthonormal basis of span(S A V_s) (S A V_s = Q R_s): the same
 reduced equations and adjoint in exact arithmetic; the state rows of the reduced system are those of
 S^2 A V_s multiplied by R_s^-T, R_s from the Cholesky factorization of their Gram block (also in the
 hyper-reduced solves, which hold that block, not S A V_s; orthonormal_state_rows).
+
+test_space='frozen' (for a trust region, utils/trust_region_reduced_basis.py) freezes the ROM at a center u_k,
+the full-order solution at a design the full-order model solved (request_freeze: the next solve, at that
+design and from that solution as warm start, freezes): the basis V, its offset, the residual weight S and the
+test basis S T, T = S A(u_k) V, LSPG's test directions at u_k, stay fixed until the next freeze. The solve is
+Petrov-Galerkin, T^T S R(mean + V a) = 0 (FrozenTestSolver; LSPG at u_k; with an MDEIM driving it,
+core/hyper_reduction.py HyperReducedFrozenTestSolver, the same equations with the step's T^T S A V from the
+MDEIM), and the outputs are corrected with
+the frozen dual, f(u_r) - psi_k^T R(u_r), psi_k the full-order adjoint of f at u_k (recorded by the windtunnel
+model, record_full_order_adjoint). Its adjoint (FrozenTestAdjoint) is the exact derivative of the corrected
+outputs, with no terms dropped, and equals the full-order one at u_k: the model's gradient is the derivative
+of its values at every design, and matches the full-order model's to first order at the center.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from time import perf_counter
 
 import numpy as np
@@ -329,6 +358,7 @@ class LSPGSolver:
             g = self.comm.allreduce(SAV.T @ r, op=MPI.SUM)
         return H, g, r_norm
 
+
     def solve(self, model):
         """
         One pass of the LSPG Gauss-Newton loop: advance model.u_vec, starting
@@ -432,6 +462,69 @@ class LSPGSolver:
         return theta
 
 
+class GalerkinSolver(LSPGSolver):
+    """
+    The reduced Newton loop of test_space='galerkin': the Galerkin equations V^T R(mean + V a) = 0,
+    whose step is (V^T A V) da = -V^T r. The convergence test is on g = V^T r; the line search keeps
+    LSPG's merit ||S r||^2 / 2, with its own slope (along a Galerkin step it need not decrease, in which
+    case the step is taken as is, as in HybridLSPGSolver).
+    """
+
+    def __init__(self, V, comm, **kwargs):
+        super().__init__(V, comm, **kwargs)
+        self._merit_gradient = None
+
+    def _reduced_system(self, model):
+        Sr, r_norm = self._weighted_residual(model)
+        if self._AV is not None and self._AV.getSize()[1] != self.V.getSize()[1]:
+            self._AV.destroy()
+            self._AV = None
+        with _PROF.phase("rom:project"):
+            SAV, self._AV = scaled_jacobian_basis(model, self.V, self.S, self._AV)
+            S = None if self.S is None else self.S.getArray(readonly=True)
+            V = self.V.getDenseArray()
+            r = Sr if S is None else Sr / S
+            H = self.comm.allreduce(V.T @ self._AV.getDenseArray(), op=MPI.SUM)
+            g = self.comm.allreduce(V.T @ r, op=MPI.SUM)
+            self._merit_gradient = self.comm.allreduce(SAV.T @ Sr, op=MPI.SUM)
+        return H, g, r_norm
+
+    def _backtrack(self, model, a, da, theta, phi, slope):
+        # the slope of the merit ||S r||^2 / 2, not of the Galerkin right-hand side
+        return super()._backtrack(model, a, da, theta, phi, float(self._merit_gradient @ da))
+
+
+class FrozenTestSolver(LSPGSolver):
+    """
+    The reduced Newton loop of test_space='frozen': the Petrov-Galerkin equations T^T S R(mean + V a) = 0 with
+    the test basis S T, T = S A(u_k) V the LSPG test directions at a fixed state u_k (the trust-region center,
+    ReducedOrderModel.request_freeze), whose step is (T^T S A V) da = -T^T S r. At u_k these are the LSPG
+    equations; elsewhere the test basis does not move with the state, so the adjoint of the equations has no
+    dropped terms (FrozenTestAdjoint). The line search keeps LSPG's merit ||S r||^2 / 2 with its own slope, as
+    GalerkinSolver's.
+    """
+
+    def __init__(self, V, comm, T=None, **kwargs):
+        super().__init__(V, comm, **kwargs)
+        self.T = T
+        self._merit_gradient = None
+
+    def _reduced_system(self, model):
+        Sr, r_norm = self._weighted_residual(model)
+        if self._AV is not None and self._AV.getSize()[1] != self.V.getSize()[1]:
+            self._AV.destroy()
+            self._AV = None
+        with _PROF.phase("rom:project"):
+            SAV, self._AV = scaled_jacobian_basis(model, self.V, self.S, self._AV)
+            H = self.comm.allreduce(self.T.T @ SAV, op=MPI.SUM)
+            g = self.comm.allreduce(self.T.T @ Sr, op=MPI.SUM)
+            self._merit_gradient = self.comm.allreduce(SAV.T @ Sr, op=MPI.SUM)
+        return H, g, r_norm
+
+    def _backtrack(self, model, a, da, theta, phi, slope):
+        return super()._backtrack(model, a, da, theta, phi, float(self._merit_gradient @ da))
+
+
 class LSPGAdjoint:
     """
     The adjoint of an accepted LSPG solution (Derivatives in the module
@@ -462,6 +555,8 @@ class LSPGAdjoint:
         self.dual_corrected = dual_corrected
         self._Qd = self._Rd = None
         self.last_dual = None
+        # ||W^-1/2 (A^T psi_d - g)|| of the last dual ROM solve (absolute), for error estimates
+        self.last_dual_residual = None
         # adjoint_snapshots='separate': the adjoint basis Psi (a Mat, owned by the ROM) and the
         # weight W^-1/2 (this rank's entries, None: 1) of the least-squares adjoint
         self.adjoint_basis = adjoint_basis
@@ -543,12 +638,41 @@ class LSPGAdjoint:
         self._Qd, self._Rd = tsqr(self.comm, ATPsi)
         self.dual_condition_number = float(np.linalg.cond(self._Rd))
 
-    def _solve_dual_corrected(self, model, rhs, first):
-        """psi = psi_lspg + (I - S P S^-1) psi_d (module docstring), P the orthogonal projection onto
-        span(Q), S A V = Q R; psi_d = Psi z minimizing ||W^-1/2 (A^T Psi z - g)||."""
+    def _solve_dual(self, rhs, first):
+        """psi_d = Psi z minimizing ||W^-1/2 (A^T Psi z - g)||, the dual ROM's adjoint; also last_dual."""
         Dg = rhs if self.dual_weight is None else self.dual_weight * rhs
         z = sp_la.solve_triangular(self._Rd, self.comm.allreduce(self._Qd.T @ Dg, op=MPI.SUM), lower=False)
         psi_d = self.adjoint_basis.getDenseArray() @ z
+        self.last_dual = psi_d
+        res = self._Qd @ (self._Rd @ z) - Dg
+        norms = self.comm.allreduce(np.array([float(res @ res), float(Dg @ Dg)]), op=MPI.SUM)
+        self.last_dual_residual = float(np.sqrt(norms[0]))
+        if first:
+            PETSc.Sys.Print("dual-corrected adjoint: dual ROM over {} adjoint basis vectors, |W^-1/2 (A^T psi_d - g)| / "
+                            "|W^-1/2 g| = {:.3e} (condition {:.3e}); LSPG correction over a basis of width {}, "
+                            "condition {:.3e}".format(
+                                self.adjoint_basis.getSize()[1], np.sqrt(norms[0] / max(norms[1], 1e-300)),
+                                self.dual_condition_number, self.rb_size, float(np.linalg.cond(self._R))))
+        return psi_d
+
+    def dual_adjoint(self, model, rhs_local):
+        """
+        The dual ROM's adjoint psi_d alone (adjoint_solve='dual_corrected'), for the output
+        correction -psi_d^T R(u_r) of the output whose state derivative is rhs_local (owned
+        entries); solve() with the same right-hand side holds the same psi_d. Shares solve()'s
+        factorization, so the model must be at the accepted solution as for solve(). Collective.
+        """
+        if not self.dual_corrected:
+            raise ValueError("dual_adjoint needs adjoint_solve='dual_corrected'")
+        first = self._R is None
+        if first:
+            self._factor(model)
+        return self._solve_dual(np.asarray(rhs_local, dtype=float), first)
+
+    def _solve_dual_corrected(self, model, rhs, first):
+        """psi = psi_lspg + (I - S P S^-1) psi_d (module docstring), P the orthogonal projection onto
+        span(Q), S A V = Q R; psi_d = Psi z minimizing ||W^-1/2 (A^T Psi z - g)||."""
+        psi_d = self._solve_dual(rhs, first)
         b = self.comm.allreduce(self.V.getDenseArray().T @ rhs, op=MPI.SUM)
         y = sp_la.solve_triangular(self._R, b, trans='T', lower=False)
         s = np.ones_like(rhs) if self.S is None else self.S.getArray(readonly=True)
@@ -558,16 +682,6 @@ class LSPGAdjoint:
         psi = psi_d + s * (self._Q @ y)
         if not np.isfinite(np.sqrt(self.comm.allreduce(float(psi @ psi), op=MPI.SUM))):
             raise ValueError("reduced adjoint: non-finite solution")
-        self.last_dual = psi_d
-        if first:
-            res = self._Qd @ (self._Rd @ z) - Dg
-            PETSc.Sys.Print("dual-corrected adjoint: dual ROM over {} adjoint basis vectors, |W^-1/2 (A^T psi_d - g)| / "
-                            "|W^-1/2 g| = {:.3e} (condition {:.3e}); LSPG correction over a basis of width {}, "
-                            "condition {:.3e}".format(
-                                self.adjoint_basis.getSize()[1],
-                                np.sqrt(self.comm.allreduce(float(res @ res), op=MPI.SUM)
-                                        / max(self.comm.allreduce(float(Dg @ Dg), op=MPI.SUM), 1e-300)),
-                                self.dual_condition_number, self.rb_size, float(np.linalg.cond(self._R))))
         return psi
 
     def _factor_least_squares(self, model, SAV):
@@ -665,6 +779,80 @@ class LSPGAdjoint:
         self._Q = self._R = None
         self._Qd = self._Rd = None
         self._T = None
+
+
+class FrozenTestAdjoint(LSPGAdjoint):
+    """
+    The adjoint of test_space='frozen' with the frozen dual of the center (module docstring): an output f is
+    corrected to f(u_r) - psi_k^T R(u_r), psi_k the full-order adjoint of f at the center u_k, and the exact
+    derivative of the corrected output is df/dx|_u - psi^T dR/dx with
+
+        psi = psi_k + S T z,    (T^T S A V)^T z = V^T (g - A^T psi_k),
+
+    A at the ROM solution, T = S A(u_k) V and S frozen with the test basis: nothing depends on the state but
+    A, so no term is dropped. At the center (u_r = u_k, A^T psi_k = g) z = 0 and the derivative is the
+    full-order one. An output without a center adjoint is not corrected and has psi = S T z with V^T g.
+
+    `duals` maps output names to psi_k (this rank's entries); solve() takes the name and the factor s of the
+    right-hand side g = s (df_name/du) (the windtunnel model matches it, DG_windtunnel_model._match_output).
+    """
+    frozen_dual = True
+
+    def __init__(self, V, S, comm, parameter_vector, solution, accepted=True, T=None, duals=None):
+        super().__init__(V, S, comm, parameter_vector, solution, accepted=accepted)
+        self.T = T
+        self.duals = {} if duals is None else duals
+        self._lu = None
+        self._VtATpsi = None
+
+    def _factor(self, model):
+        model.set_up_solver()
+        with model.steady_residual():
+            SAV, AV = scaled_jacobian_basis(model, self.V, self.S)
+            AV_local = AV.getDenseArray()
+            M = self.comm.allreduce(self.T.T @ SAV, op=MPI.SUM)
+            # V^T A^T psi_k = (A V)^T psi_k, per output
+            self._VtATpsi = {name: self.comm.allreduce(AV_local.T @ psi, op=MPI.SUM) for name, psi in self.duals.items()}
+        AV.destroy()
+        self.condition_number = float(np.linalg.cond(M))
+        self._lu = sp_la.lu_factor(M)
+        self._R = np.diag(np.abs(np.diag(self._lu[0])))
+        diag = np.abs(np.diag(self._lu[0]))
+        if not np.all(np.isfinite(self._lu[0])) or diag.min() <= np.finfo(float).eps * diag.max():
+            raise ValueError("frozen-test-space adjoint: T^T S A V is singular to working precision "
+                             "(|U_ii| from {:.3e} to {:.3e})".format(diag.min(), diag.max()))
+
+    def solve(self, model, rhs_local, dual=None):
+        """psi for the right-hand side g (owned entries); dual = (output name, s) with g = s df_name/du, or
+        None (no correction). Collective."""
+        first = self._lu is None
+        if first:
+            self._factor(model)
+        rhs = np.asarray(rhs_local, dtype=float)
+        b = self.comm.allreduce(self.V.getDenseArray().T @ rhs, op=MPI.SUM)
+        name, s = (None, 0.0) if dual is None else dual
+        psi_k = self.duals.get(name)
+        if psi_k is not None:
+            b = b - s * self._VtATpsi[name]
+        z = sp_la.lu_solve(self._lu, b, trans=1)
+        S = np.ones_like(rhs) if self.S is None else self.S.getArray(readonly=True)
+        psi = S * (self.T @ z)
+        if psi_k is not None:
+            psi = psi + s * psi_k
+        if not np.isfinite(np.sqrt(self.comm.allreduce(float(psi @ psi), op=MPI.SUM))):
+            raise ValueError("frozen-test-space adjoint: non-finite solution")
+        PETSc.Sys.Print("frozen-test-space adjoint ({}): condition {:.3e}, |z| {:.3e}".format(
+            "output {} x {:.6g}, frozen dual".format(name, s) if psi_k is not None else "no dual",
+            self.condition_number, float(np.linalg.norm(z))))
+        return psi
+
+    def spaces(self):
+        S = 1.0 if self.S is None else self.S.getArray(readonly=True)[:, None]
+        return S * self.T, None
+
+    def destroy(self):
+        super().destroy()
+        self._lu = None
 
 
 class HybridLSPGSolver(LSPGSolver):
@@ -931,9 +1119,19 @@ class ReducedOrderModel:
                          width of the adjoint basis (default floor(rb_size / 2)) next to a state
                          basis of ceil(rb_size / 2). Per output row with adjoint_bases=
                          'per_output'. The stored rank defaults to 3 times the width
-      adjoint_solve      'lspg', 'galerkin', 'least_squares' or 'dual_corrected' (module docstring)
-      test_space         'lspg' (default) or 'hybrid' ('concatenate' only): the test basis
-                         [S^2 A V_s, Psi] (HybridLSPGSolver), with the adjoint of those equations
+      freeze_basis       build the state and adjoint bases (and the offset) only when a freeze is
+                         requested (request_freeze; a trust region does at each center) and keep them for
+                         the solves until the next: one basis per trust-region iteration, the ROM then a
+                         smooth function of the design within it (default False: a basis per solve)
+      adjoint_solve      'lspg', 'galerkin', 'least_squares', 'dual_corrected' or 'frozen' (test_space
+                         'frozen' only) (module docstring)
+      test_space         'lspg' (default), 'hybrid' ('concatenate' only): the test basis
+                         [S^2 A V_s, Psi] (HybridLSPGSolver), with the adjoint of those equations,
+                         or 'galerkin': the Galerkin equations V^T R = 0 (GalerkinSolver) with the
+                         Galerkin adjoint (adjoint_solve='galerkin'; module docstring), or 'frozen':
+                         Petrov-Galerkin with LSPG's test basis at a trust-region center, frozen there
+                         with the basis and the center's full-order adjoints as frozen dual
+                         (request_freeze, FrozenTestSolver, FrozenTestAdjoint; module docstring)
       hybrid_state_test  'normal_equations' (default: S^2 A V_s) or 'orthonormal' (S Q, the same
                          span; module docstring) for the state part of the hybrid test basis
       hybrid_trial       'adjoint' (default: the trial basis holds the adjoint basis, orthogonalized
@@ -946,7 +1144,9 @@ class ReducedOrderModel:
       paired_update      'warm_start' (default: Z at the solve's warm start), 'newton' (re-paired at
                          every Newton iteration) or 'solution' (re-paired at the ROM's solution and
                          solved again, with paired_update_rtol (1e-3) and paired_update_max_passes
-                         (3)); hybrid_trial='paired' only; module docstring
+                         (3)) or 'solution_offset' (re-paired at the ROM's solution, with the trial
+                         space's offset moved there, for the adjoint only: no re-solve);
+                         hybrid_trial='paired' only; module docstring
 
     After a solve that built a basis, `adjoint` is its LSPGAdjoint (None before the first),
     valid until the next solve; `adjoint.accepted` says whether the solve was accepted, and only
@@ -964,7 +1164,7 @@ class ReducedOrderModel:
                  adjoint_snapshots=None, adjoint_rb_size=None, adjoint_max_rank=None, adjoint_solve=None,
                  test_space='lspg', hybrid_state_test='normal_equations', hybrid_trial='adjoint',
                  paired_update='warm_start', paired_update_rtol=1e-3, paired_update_max_passes=3,
-                 adjoint_bases='shared'):
+                 adjoint_bases='shared', freeze_basis=False):
         if inner_product not in ('l2', 'euclidean'):
             raise ValueError("inner_product must be 'l2' or 'euclidean', got {!r}".format(inner_product))
         if not (state_scaling is None or isinstance(state_scaling, str) and state_scaling == 'freestream'
@@ -1009,19 +1209,32 @@ class ReducedOrderModel:
             raise ValueError("adjoint_snapshots must be None, 'augment', 'separate' or 'concatenate', got "
                              "{!r}".format(adjoint_snapshots))
         if adjoint_solve is None:
-            adjoint_solve = 'least_squares' if adjoint_snapshots == 'separate' else 'lspg'
-        if adjoint_solve not in ('lspg', 'galerkin', 'least_squares', 'dual_corrected'):
-            raise ValueError("adjoint_solve must be 'lspg', 'galerkin', 'least_squares' or 'dual_corrected', got "
-                             "{!r}".format(adjoint_solve))
+            adjoint_solve = 'frozen' if test_space == 'frozen' else 'galerkin' if test_space == 'galerkin' else \
+                'least_squares' if adjoint_snapshots == 'separate' else 'lspg'
+        if adjoint_solve not in ('lspg', 'galerkin', 'least_squares', 'dual_corrected', 'frozen'):
+            raise ValueError("adjoint_solve must be 'lspg', 'galerkin', 'least_squares', 'dual_corrected' or 'frozen', "
+                             "got {!r}".format(adjoint_solve))
+        if (adjoint_solve == 'frozen') != (test_space == 'frozen'):
+            raise ValueError("adjoint_solve='frozen' goes with test_space='frozen' (its exact adjoint) and only with it")
         if adjoint_solve == 'dual_corrected' and (adjoint_snapshots != 'separate' or test_space != 'lspg'):
             raise ValueError("adjoint_solve='dual_corrected' needs adjoint_snapshots='separate' and test_space='lspg'")
         if adjoint_solve == 'least_squares' and adjoint_snapshots not in ('separate', 'concatenate'):
             raise ValueError("adjoint_solve='least_squares' needs an adjoint basis: adjoint_snapshots='separate' "
                              "or 'concatenate'")
-        if test_space not in ('lspg', 'hybrid'):
-            raise ValueError("test_space must be 'lspg' or 'hybrid', got {!r}".format(test_space))
+        if test_space not in ('lspg', 'hybrid', 'galerkin', 'frozen'):
+            raise ValueError("test_space must be 'lspg', 'hybrid', 'galerkin' or 'frozen', got {!r}".format(test_space))
+        if test_space == 'frozen' and adjoint_snapshots is not None:
+            raise ValueError("test_space='frozen' takes the center's full-order adjoints as its frozen dual, not as "
+                             "adjoint snapshots: adjoint_snapshots must be None")
+        if test_space == 'galerkin' and (adjoint_solve != 'galerkin' or adjoint_snapshots == 'separate'):
+            raise ValueError("test_space='galerkin' needs adjoint_solve='galerkin' (its exact adjoint) and the adjoint "
+                             "snapshots, if any, in the basis (adjoint_snapshots None, 'augment' or 'concatenate')")
         if test_space == 'hybrid' and adjoint_snapshots != 'concatenate':
             raise ValueError("test_space='hybrid' needs adjoint_snapshots='concatenate'")
+        if freeze_basis and (adjoint_snapshots == 'concatenate' or test_space not in ('lspg', 'galerkin')):
+            raise ValueError("freeze_basis needs test_space 'lspg' or 'galerkin' and no concatenated basis "
+                             "(test_space='frozen' freezes its basis anyway)")
+        self.freeze_basis = freeze_basis
         self.test_space = test_space
         if hybrid_state_test not in ('normal_equations', 'orthonormal'):
             raise ValueError("hybrid_state_test must be 'normal_equations' or 'orthonormal', got {!r}".format(
@@ -1032,8 +1245,9 @@ class ReducedOrderModel:
         if hybrid_trial == 'paired' and test_space != 'hybrid':
             raise ValueError("hybrid_trial='paired' needs test_space='hybrid'")
         self.hybrid_trial = hybrid_trial
-        if paired_update not in ('warm_start', 'newton', 'solution'):
-            raise ValueError("paired_update must be 'warm_start', 'newton' or 'solution', got {!r}".format(
+        if paired_update not in ('warm_start', 'newton', 'solution', 'solution_offset'):
+            raise ValueError("paired_update must be 'warm_start', 'newton', 'solution' or 'solution_offset', "
+                             "got {!r}".format(
                 paired_update))
         if paired_update != 'warm_start' and hybrid_trial != 'paired':
             raise ValueError("paired_update={!r} needs hybrid_trial='paired'".format(paired_update))
@@ -1080,6 +1294,23 @@ class ReducedOrderModel:
         self.adjoint = None
         # how the basis of the last solve was built (basis_settings)
         self._basis_settings = None
+        # counts the changes to what a solve's bases are built from (snapshots, distance weights);
+        # (design, _reuse_key(), result) of the last solve if it was accepted, for reusable_result
+        self._changes = 0
+        self._last_accepted = None
+        # test_space='frozen': the frozen basis, offset, weight and test basis (dict, None before the first
+        # freeze), whether the next solve freezes, and the full-order adjoints of the last few designs by
+        # output name, {design bytes: {name: this rank's psi}} (record_full_order_adjoint)
+        self._frozen = None
+        self._freeze_requested = False
+        self._full_order_adjoints = {}
+        # test_space='frozen': a core.hyper_reduction.HyperReductionComparison(drive='mdeim') whose
+        # operators, built at every freeze, give the Newton loop its Jacobian (set by its set_up); None:
+        # the exact Jacobian
+        self.jacobian_hyper_reduction = None
+        # freeze_basis: the frozen state basis, its offset and the adjoint basis (dict, None before the
+        # first freeze)
+        self._frozen_basis = None
 
     # ------------------------------------------------------------------
     # Set-up and weights
@@ -1161,7 +1392,10 @@ class ReducedOrderModel:
             PETSc.Sys.Print("ROM distance weighting: the total-derivative norms are all zero or "
                             "not finite; keeping the previous weights")
             return
-        self.distance_sensitivities = weights / weights.mean()
+        weights = weights / weights.mean()
+        if self.distance_sensitivities is None or not np.array_equal(weights, self.distance_sensitivities):
+            self._changes += 1
+        self.distance_sensitivities = weights
         inert = "" if self.basis_mode == 'local_weighted' else \
             " -- NOT IN USE, basis_mode is '{}'".format(self.basis_mode)
         PETSc.Sys.Print("ROM distance weights ({}, {} parameters, mean-normalized): min {:.4e}, "
@@ -1216,7 +1450,12 @@ class ReducedOrderModel:
     @property
     def basis(self):
         """The basis of the last solve: the state POD basis, or with 'concatenate' the
-        concatenated state and adjoint basis. Valid until the next solve."""
+        concatenated state and adjoint basis (with test_space='frozen' the frozen one). Valid until the next
+        solve."""
+        if self._frozen is not None:
+            return self._frozen['V']
+        if self._frozen_basis is not None:
+            return self._frozen_basis['V']
         if self._concatenated_basis is not None:
             return self._concatenated_basis
         return None if self.pod is None else self.pod.basis
@@ -1258,6 +1497,7 @@ class ReducedOrderModel:
         """Add the model's current u_vec as the snapshot at parameter_vector.
         Returns whether it added a basis direction. Collective."""
         self._check_parameter_size(parameter_vector)
+        self._changes += 1
         added = self.pod.snapshot_matrix.process_and_append_to_snapshot_lists(
             model.u_vec.x.petsc_vec, np.asarray(parameter_vector, dtype=float))
         self.pod.snapshot_matrix.print_info()
@@ -1296,6 +1536,7 @@ class ReducedOrderModel:
                          else self.adjoint_pod).snapshot_matrix
         if not (np.isfinite(norm) and norm > 0.0) or target is None:
             return False
+        self._changes += 1
         vec = model.u_vec.x.petsc_vec.duplicate()
         vec.array[:] = psi * (target / norm)
         try:
@@ -1330,11 +1571,81 @@ class ReducedOrderModel:
              if pod.snapshot_matrix.Q is not None]
         return np.column_stack(Q) if Q else None
 
+    # test_space='frozen': the full-order adjoints of this many designs are kept
+    FULL_ORDER_ADJOINT_DESIGNS = 4
+
+    def request_freeze(self):
+        """test_space='frozen': the next solve freezes the ROM (module docstring) at its design, from the
+        model's state at its start (the warm start: the center's full-order solution), with the full-order
+        adjoints recorded for that design as the frozen dual. freeze_basis: the next solve builds the state
+        and adjoint bases (and the offset) at its design, and later solves keep them until the next freeze:
+        one basis per trust-region iteration."""
+        if self.test_space != 'frozen' and not self.freeze_basis:
+            raise ValueError("request_freeze needs test_space='frozen' or freeze_basis=True")
+        self._freeze_requested = True
+        self._last_accepted = None
+
+    def record_full_order_adjoint(self, parameter_vector, name, psi_local):
+        """test_space='frozen': the full-order adjoint psi (this rank's entries) of the output `name` (of its
+        state derivative, unscaled) at design parameter_vector, for the frozen dual of a freeze there."""
+        key = np.asarray(parameter_vector, dtype=float).ravel().tobytes()
+        if key not in self._full_order_adjoints:
+            while len(self._full_order_adjoints) >= self.FULL_ORDER_ADJOINT_DESIGNS:
+                self._full_order_adjoints.pop(next(iter(self._full_order_adjoints)))
+            self._full_order_adjoints[key] = {}
+        self._full_order_adjoints[key][name] = np.array(psi_local, dtype=float)
+
+    def _freeze(self, model, parameter_vector, comm):
+        """Freeze at the model's current state (the solve's warm start) and design. Collective."""
+        if self._frozen is not None:
+            for name in ('V', 'mean', 'S'):
+                if self._frozen[name] is not None:
+                    self._frozen[name].destroy()
+        V = self.pod.basis.copy()
+        mean = None if self.pod.mean is None else self.pod.mean.copy()
+        model.set_up_solver()
+        S = self.residual_weight(model)
+        with model.steady_residual():
+            # the residual first: it updates the state-derived fields the Jacobian reads (RANS)
+            b = model.problem._b.duplicate()
+            model.problem.F(model.u_vec.x.petsc_vec, b)
+            b.destroy()
+            SAV, AV = scaled_jacobian_basis(model, V, S)
+            T = np.array(SAV, copy=True)
+        AV.destroy()
+        duals = dict(self._full_order_adjoints.get(np.asarray(parameter_vector, dtype=float).ravel().tobytes(), {}))
+        self._frozen = dict(V=V, mean=mean, S=S, T=T, duals=duals, design=np.array(parameter_vector, dtype=float))
+        self._freeze_requested = False
+        PETSc.Sys.Print("ROM frozen (test_space='frozen') at design {}: basis width {}, frozen dual for {}".format(
+            np.array2string(np.asarray(parameter_vector, dtype=float), precision=4), V.getSize()[1],
+            sorted(duals) if duals else "no output (no full-order adjoints recorded there)"))
+
     def discard_adjoint(self):
         """Drop the adjoint of the last accepted solve. Collective."""
         if self.adjoint is not None:
             self.adjoint.destroy()
             self.adjoint = None
+
+    def _reuse_key(self):
+        return self._changes, self.rb_size, self.adjoint_rb_size
+
+    def reusable_result(self, parameter_vector):
+        """
+        The result of the last solve, for a re-query of its design without solving again (CSDL re-runs
+        the model before every derivative evaluation): when that solve was accepted, is still accepted
+        at the current eta_threshold, nothing its bases were built from has changed since (snapshots,
+        distance weights, basis sizes), and `adjoint` is still its adjoint. A copy with no iterations
+        and no wall time; None otherwise. Collective (every rank decides alike).
+        """
+        last = self._last_accepted
+        if last is None or self.adjoint is None or not self.adjoint.matches_design(parameter_vector):
+            return None
+        design, key, result = last
+        if key != self._reuse_key() or not np.array_equal(np.asarray(parameter_vector, dtype=float).ravel(), design):
+            return None
+        if not (np.isfinite(result.eta) and result.eta < self.eta_threshold):
+            return None
+        return replace(result, solution=result.solution.copy(), iterations=0, walltime=0.0)
 
     def solve(self, model, parameter_vector):
         """
@@ -1344,6 +1655,14 @@ class ReducedOrderModel:
         snapshots. When the solution is accepted, `adjoint` is its adjoint;
         any earlier one is discarded first. Collective.
         """
+        self._last_accepted = None
+        result = self._solve(model, parameter_vector)
+        if result is not None and result.accepted:
+            self._last_accepted = (np.array(parameter_vector, dtype=float).ravel(), self._reuse_key(),
+                                   replace(result, solution=np.array(result.solution, dtype=float)))
+        return result
+
+    def _solve(self, model, parameter_vector):
         self.discard_adjoint()
         self._check_parameter_size(parameter_vector)
         if self.n_snapshots < self.min_snapshots:
@@ -1352,6 +1671,10 @@ class ReducedOrderModel:
             return None
         t0 = perf_counter()
         comm = model.mesh_obj.mesh.comm
+        if self.test_space == 'frozen':
+            return self._solve_frozen(model, parameter_vector, comm, t0)
+        if self.freeze_basis:
+            return self._solve_frozen_basis(model, parameter_vector, comm, t0)
         concatenate = self.adjoint_snapshots == 'concatenate' and self.n_adjoint_snapshots > 0
         n_adjoint = self.rb_size // 2 if concatenate else 0
         self._build_state_basis(model, parameter_vector, self.rb_size - n_adjoint)
@@ -1360,15 +1683,7 @@ class ReducedOrderModel:
             return None
         self._basis_settings = self._settings_of_last_basis()
 
-        adjoint_basis = None
-        if self.adjoint_snapshots in ('separate', 'concatenate') and self.n_adjoint_snapshots > 0:
-            with _PROF.phase("rom:adjoint_basis"):
-                for pod in self._adjoint_pod_list():
-                    if pod.snapshot_matrix.n_snapshots > 0:
-                        pod.construct_basis(rb_size=self.adjoint_rb_size, layout_vec=model.u_vec.x.petsc_vec,
-                                            snapshot_weights=self._adjoint_snapshot_weights(pod))
-                adjoint_basis = self._combined_adjoint_basis_of(comm) if self.adjoint_bases == 'per_output' \
-                    else self.adjoint_pod.basis
+        adjoint_basis = self._build_adjoint_basis(model, comm)
         if self._concatenated_basis is not None:
             self._concatenated_basis.destroy()
             self._concatenated_basis = None
@@ -1411,13 +1726,16 @@ class ReducedOrderModel:
             solver = self.make_solver(HybridLSPGSolver, V, S, self.pod.mean, comm, trial_update=trial_update,
                                       **hybrid_kw)
         else:
-            solver = self.make_solver(LSPGSolver, V, S, self.pod.mean, comm)
+            solver = self.make_solver(GalerkinSolver if self.test_space == 'galerkin' else LSPGSolver, V, S,
+                                      self.pod.mean, comm)
         self.paired_updates = []
         try:
             result = self.run_passes(model, solver, t0)
             if hybrid and paired and self.paired_update == 'solution':
                 result, solver = self._repair_at_solution(model, comm, S, adjoint_basis, Z, hybrid_kw, result,
                                                           solver, t0)
+            elif hybrid and paired and self.paired_update == 'solution_offset':
+                self._repair_for_adjoint(model, comm, adjoint_basis, Z, result)
             elif hybrid and paired and self.paired_update == 'newton':
                 PETSc.Sys.Print("ROM paired update: Z re-paired {} times; last change {:.3e}".format(
                     len(self.paired_updates), self.paired_updates[-1] if self.paired_updates else np.nan))
@@ -1444,6 +1762,102 @@ class ReducedOrderModel:
                                    accepted=result.accepted, adjoint_basis=adjoint_basis, dual_weight=dual_weight,
                                    galerkin=self.adjoint_solve == 'galerkin',
                                    dual_corrected=self.adjoint_solve == 'dual_corrected' and adjoint_basis is not None)
+        return result
+
+    def _build_adjoint_basis(self, model, comm):
+        """The adjoint basis Psi of a solve (adjoint_snapshots 'separate' and 'concatenate', once there are
+        adjoint snapshots; else None), after the state basis: a Mat owned by the ROM. Collective."""
+        if self.adjoint_snapshots not in ('separate', 'concatenate') or self.n_adjoint_snapshots == 0:
+            return None
+        with _PROF.phase("rom:adjoint_basis"):
+            for pod in self._adjoint_pod_list():
+                if pod.snapshot_matrix.n_snapshots > 0:
+                    pod.construct_basis(rb_size=self.adjoint_rb_size, layout_vec=model.u_vec.x.petsc_vec,
+                                        snapshot_weights=self._adjoint_snapshot_weights(pod))
+            return self._combined_adjoint_basis_of(comm) if self.adjoint_bases == 'per_output' \
+                else self.adjoint_pod.basis
+
+    def _destroy_frozen_basis(self):
+        if self._frozen_basis is not None:
+            for obj in self._frozen_basis.values():
+                if isinstance(obj, (PETSc.Mat, PETSc.Vec)):
+                    obj.destroy()
+            self._frozen_basis = None
+
+    def _solve_frozen_basis(self, model, parameter_vector, comm, t0):
+        """freeze_basis: build the state and adjoint bases at this design if a freeze was requested (or none
+        happened yet), else keep the frozen ones; then the solve and its adjoint as without the freeze
+        (test_space 'lspg' or 'galerkin'). Collective."""
+        if self._freeze_requested or self._frozen_basis is None:
+            if not self._freeze_requested:
+                PETSc.Sys.Print("ROM: freeze_basis without a freeze request; freezing the basis at this design")
+            self._build_state_basis(model, parameter_vector, self.rb_size)
+            if self.pod.basis is None or self.pod.basis.getSize()[1] == 0:
+                PETSc.Sys.Print("ROM: empty POD basis; skipping the ROM solve")
+                return None
+            self._basis_settings = self._settings_of_last_basis()
+            Psi = self._build_adjoint_basis(model, comm)
+            self._destroy_frozen_basis()
+            self._frozen_basis = dict(V=self.pod.basis.copy(), mean=None if self.pod.mean is None else self.pod.mean.copy(),
+                                      Psi=None if Psi is None else Psi.copy(),
+                                      design=np.array(parameter_vector, dtype=float))
+            self._freeze_requested = False
+            PETSc.Sys.Print("ROM basis frozen (freeze_basis) at design {}: {} state{} vectors".format(
+                np.array2string(np.asarray(parameter_vector, dtype=float), precision=4),
+                self._frozen_basis['V'].getSize()[1],
+                "" if Psi is None else ", {} adjoint".format(Psi.getSize()[1])))
+        fb = self._frozen_basis
+        V, adjoint_basis = fb['V'], fb['Psi']
+        model.set_up_solver()
+        with _PROF.phase("rom:weights"):
+            S = self.residual_weight(model)
+        solver = self.make_solver(GalerkinSolver if self.test_space == 'galerkin' else LSPGSolver, V, S, fb['mean'],
+                                  comm)
+        try:
+            result = self.run_passes(model, solver, t0)
+        except BaseException:
+            if S is not None:
+                S.destroy()
+            raise
+        self.last_solver = solver
+        if self.adjoint_solve not in ('least_squares', 'dual_corrected'):
+            adjoint_basis = None
+        dual_weight = None if adjoint_basis is None or self.W is None else \
+            1.0 / np.sqrt(self.W.w.getArray(readonly=True))
+        self.adjoint = LSPGAdjoint(V, S, comm, parameter_vector, result.solution,
+                                   accepted=result.accepted, adjoint_basis=adjoint_basis, dual_weight=dual_weight,
+                                   galerkin=self.adjoint_solve == 'galerkin',
+                                   dual_corrected=self.adjoint_solve == 'dual_corrected' and adjoint_basis is not None)
+        return result
+
+    def _solve_frozen(self, model, parameter_vector, comm, t0):
+        """test_space='frozen' (module docstring): freeze first if requested (or never frozen), then the
+        Petrov-Galerkin solve with the frozen bases. Collective."""
+        if self._freeze_requested or self._frozen is None:
+            if not self._freeze_requested:
+                PETSc.Sys.Print("ROM: test_space='frozen' without a freeze request; freezing at this design")
+            self._build_state_basis(model, parameter_vector, self.rb_size)
+            if self.pod.basis is None or self.pod.basis.getSize()[1] == 0:
+                PETSc.Sys.Print("ROM: empty POD basis; skipping the ROM solve")
+                return None
+            self._basis_settings = self._settings_of_last_basis()
+            self._freeze(model, parameter_vector, comm)
+            if self.jacobian_hyper_reduction is not None:
+                self.jacobian_hyper_reduction.freeze(model, self, self._frozen)
+        frozen = self._frozen
+        S = frozen['S'].copy()
+        hr = self.jacobian_hyper_reduction
+        solver = None if hr is None else hr.frozen_solver(self, frozen, S, comm)
+        if solver is None:
+            solver = self.make_solver(FrozenTestSolver, frozen['V'], S, frozen['mean'], comm, T=frozen['T'])
+        try:
+            result = self.run_passes(model, solver, t0)
+        except BaseException:
+            S.destroy()
+            raise
+        self.last_solver = solver
+        self.adjoint = FrozenTestAdjoint(frozen['V'], S, comm, parameter_vector, result.solution,
+                                         accepted=result.accepted, T=frozen['T'], duals=frozen['duals'])
         return result
 
     def _orthonormality(self, comm, V, n_state, Psi):
@@ -1591,6 +2005,26 @@ class ReducedOrderModel:
         result.iterations = iterations
         return result, solver
 
+    def _repair_for_adjoint(self, model, comm, Psi, Z, result):
+        """
+        paired_update='solution_offset': rebuild Z = W^-1 A^T Psi at the ROM's solution (the model's
+        u_vec, which is not changed) and replace the concatenated basis with it, for the adjoint; the
+        trial space's offset is the solution, so the solve stands as it is (module docstring). Records
+        (change of Z, 0 iterations, eta) in paired_updates. Collective.
+        """
+        if not np.isfinite(result.eta):
+            return
+        with _PROF.phase("rom:basis"):
+            Z_new = self._paired_trial_directions(model, Psi)
+            self._concatenated_basis.destroy()
+            self._concatenated_basis = self._concatenate(comm, self.pod.basis, Z_new)
+        change = self._paired_change(comm, Z, Z_new)
+        self.paired_updates.append((change, 0, result.eta))
+        self.orthonormality = self._orthonormality(comm, self._concatenated_basis.getDenseArray(),
+                                                   self.pod.basis.getSize()[1], Psi.getDenseArray())
+        PETSc.Sys.Print("ROM paired update: Z re-paired at the solution (offset moved there) for the adjoint; "
+                        "changed by {:.3e}".format(change))
+
     def _concatenate(self, comm, V_state, V_adjoint):
         """
         [V_state, Psi_perp]: the state basis as it is (W-orthonormal, from the POD) and the
@@ -1705,6 +2139,12 @@ class ReducedOrderModel:
 
     def destroy(self):
         self.discard_adjoint()
+        if self._frozen is not None:
+            for name in ('V', 'mean', 'S'):
+                if self._frozen[name] is not None:
+                    self._frozen[name].destroy()
+            self._frozen = None
+        self._destroy_frozen_basis()
         if self.pod is not None:
             self.pod.destroy()
             self.pod = None

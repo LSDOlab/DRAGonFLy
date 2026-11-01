@@ -13,40 +13,45 @@ adiabatic no-slip, the y = 0 symmetry plane slip. The L3 grid is wall-resolved (
 wall-merged XDMF variant coarsens exactly those layers, so it is not meant
 for RANS.
 
-The same problem as wing_opt_rans.py, with the flow solves accelerated by the POD reduced-order model
-(core/reduced_order_model.py) and the output-sensitivity weights on its snapshot distance. Every full-order
-solve adds a snapshot at its design (shape variables, then alpha). Once there are two, each evaluation builds a
-local_weighted basis at the new design and solves the reduced least-squares problem; the result is accepted when
-its residual is below eta_threshold, and otherwise the full-order solve runs (and adds a snapshot). Where the
-reduced solution is accepted, the derivatives use the adjoint of the reduced equations.
+The same problem as wing_opt_rans.py, solved by the trust-region reduced-basis method (TR-RB) of
+examples/airfoil_opt_rans_trmm.py --method trrb --model frozen --constraints sqp (utils/trust_region_reduced_basis.py;
+Keil, Mechelli, Ohlberger, Schindler and Volkwein, ESAIM: M2AN 2021). Each iteration has a center, a design the
+full-order model solved, with its full-order adjoints of the drag and the three constraints:
 
-The local_weighted basis weights the snapshots by their distance to the new design. The shape variables and
-alpha have very different units and influence, so a total-derivative probe (utils/dv_sensitivity.py) reads the
-derivatives of the drag and of the constraints that the optimizer computes anyway, and weights each parameter
-in that distance by ||dF/dp_j||. The weights come from the previous design point. Before the first gradient
-there are none, and the distance is unweighted (as it is without the probe).
+- The model is the POD reduced-order model (core/reduced_order_model.py) frozen at the center
+  (test_space='frozen'): a local_weighted state basis of --rb-size vectors built there, Petrov-Galerkin with
+  LSPG's test basis at the center, and the outputs corrected with the center's adjoints (the frozen dual). Its
+  values and gradients are the full-order ones at the center, and its gradients the exact derivatives of its
+  values elsewhere.
+- The subproblem is SLSQP on the model's drag, lift and moments within a box around the center, cut back to the
+  trust region, the designs where the ROM's calibrated relative error estimate (its residual) stays below
+  delta. The full-order model at the result decides by the ratio rho of the actual to the predicted decrease
+  of the L1 merit (constraint weight 10) whether it becomes the next center; every full-order solve is also a
+  snapshot.
+- --hyper-reduction mdeim (the default) gives the ROM's Newton loop the Jacobian of an MDEIM
+  (core/hyper_reduction.py, HyperReductionComparison drive='mdeim'), trained on the Jacobians of the
+  full-order Newton iterates and rebuilt at every center like the ROM's basis. The residual and the frozen
+  test basis stay exact, so the ROM's solutions and adjoints are those without it; each Newton iteration
+  assembles the Jacobian on a few dozen sampled cells instead of on the whole mesh.
 
-    OMP_NUM_THREADS=1 mpirun -n 8 python wing_opt_rans_pod.py [--hyper-reduction {both,deim,mdeim,none}]
+The local_weighted basis weights the snapshots by their distance to the center. The shape variables and alpha
+have very different units and influence, so a total-derivative probe (utils/dv_sensitivity.py) reads the
+derivatives of the drag and of the constraints that the full-order evaluations compute anyway, and weights each
+parameter in that distance by ||dF/dp_j||. Before the first gradient there are none, and the distance is
+unweighted.
 
-The ROM's basis concatenates a state basis and an adjoint basis of the same size per output (the optimizer's
-full-order adjoints are snapshots), and its reduced solve is the paired hybrid (LSPG for the states, the adjoint
-basis for the adjoints, each paired with a trial direction W^-1 A^T psi), with the adjoint of those same
-equations.
+    OMP_NUM_THREADS=1 mpirun -n 8 python wing_opt_rans_pod.py [--hyper-reduction {mdeim,none}] [--rb-size 20]
 
-DEIM and MDEIM (core/hyper_reduction.py) run beside the ROM for comparison (--hyper-reduction, default both):
-trained on the Jacobians of the full-order solves, they solve every design the ROM solves, with its basis and
-hybrid test space, and the adjoint of every derivative, consistent with their own solves (linearized about their
-solutions, through the true Jacobian, which costs one full assembly per design). Their accuracy, timing and phase profiles (records 'deim', 'deim_offline',
-'adjoint_deim' and the MDEIM ones) are stored in the DataStore (DEIM_* / MDEIM_*). The optimization itself is
-unchanged. examples/hyperreduction_comparison.py summarizes the saved DataStore.
+The trust-region iterations are stored in data_store.trust_region_iterations, and the DataStore in
+Result_dicts/TRRB_<suffix>.npy (also when the run stops early).
 
 Memory. An MDEIM snapshot is the whole Jacobian, vec(S A): the condensed RANS Jacobian couples every cell to the
 cells two facets away (25 for an interior hex), ~900 nonzeros per cell, ~1.6e8 on the L3 grid (estimated), so
-~1.3 GB per snapshot over all ranks. The stored basis holds mdeim_max_rank of them (twice that while a snapshot
-is added), the harvest buffer mdeim_max_snapshots_per_solve + 1, and building the operators one more (plus its
-sparsity), hence the small values below: ~6 * 1.3 GB stored, ~16 GB at peak. DEIM's snapshots are state-sized
-(1.1e6 entries): 200 stored and 11 * rb_size buffered, ~3 GB. The ROM's adjoint snapshots are state-sized too:
-adjoint_max_rank = 15 per output row, 60 in all, ~0.5 GB.
+~1.3 GB per snapshot over all ranks. The stored basis holds --mdeim-max-rank of them (twice that while a snapshot
+is added), the harvest buffer --mdeim-snapshots-per-solve + 1, and building the operators one more (plus its
+sparsity), hence the small defaults: ~6 * 1.3 GB stored, ~16 GB at peak. The ROM's state snapshots are
+state-sized (1.1e6 entries, max_rank 60, ~0.5 GB). The freeze at each center, the ROM's adjoints and the
+full-order adjoints still assemble the exact Jacobian once per design (past 33 GB on 4 ranks, see below).
 """
 import argparse
 import os
@@ -58,7 +63,6 @@ from petsc4py import PETSc
 import csdl_alpha as csdl
 
 from modopt import CSDLAlphaProblem
-from modopt import COBYLA, SLSQP, PySLSQP
 
 from dragonfly_sim.utils.mesh_manager_utils import wing_inner_bdry_function
 from dragonfly_sim.utils.mesh_io_utils import load_dolfinx_mesh
@@ -67,6 +71,7 @@ from dragonfly_sim.core.RANS_model import CompressibleRANSModel
 from dragonfly_sim.core.reduced_order_model import ReducedOrderModel
 from dragonfly_sim.core.hyper_reduction import HyperReductionComparison
 from dragonfly_sim.utils.dv_sensitivity import attach_total_derivative_probe
+from dragonfly_sim.utils.trust_region_reduced_basis import TrustRegionReducedBasis
 from dragonfly_sim.core.postprocessor import DG_postprocessor
 
 from dragonfly_sim.utils.ffd_dv_utils import spanwise_linear_bounds
@@ -79,9 +84,25 @@ MESH_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="RANS wing drag minimization with the POD ROM")
-    parser.add_argument("--hyper-reduction", choices=["both", "deim", "mdeim", "none"], default="both",
-                        help="run DEIM and/or MDEIM beside the ROM for comparison (default both)")
+    parser = argparse.ArgumentParser(description="RANS wing drag minimization with TR-RB on the frozen POD ROM")
+    parser.add_argument("--basis", choices=["local_weighted", "global"], default="local_weighted",
+                        help="the state basis built at every center: local weighted about the center (default) "
+                             "or the global POD basis of the snapshots")
+    parser.add_argument("--rb-size", type=int, default=20, help="state basis vectors, at most (default 20)")
+    parser.add_argument("--hyper-reduction", choices=["mdeim", "none"], default="mdeim",
+                        help="the Jacobian of the ROM's Newton loop from an MDEIM (default) or exact")
+    parser.add_argument("--mdeim-modes", type=int, default=4, help="MDEIM basis width (default 4)")
+    parser.add_argument("--mdeim-max-rank", type=int, default=6,
+                        help="MDEIM stored snapshot rank (default 6; memory, see the module docstring)")
+    parser.add_argument("--mdeim-snapshots-per-solve", type=int, default=1,
+                        help="Newton Jacobians harvested per full-order solve, besides the converged one (default 1)")
+    parser.add_argument("--delta0", type=float, default=0.1,
+                        help="initial trust region: the ROM's estimated relative error (default 0.1)")
+    parser.add_argument("--subproblem-maxiter", type=int, default=10, help="SLSQP iterations per subproblem "
+                                                                          "(default 10)")
+    parser.add_argument("--max-iterations", type=int, default=100, help="trust-region iterations (default 100)")
+    parser.add_argument("--max-full-order", type=int, default=150,
+                        help="full-order solves of new designs, at most (default 150)")
     args = parser.parse_args()
 
     # The Simple Transonic Wing's L3 grid: 12 structured blocks in CGNS, read with PyVista and merged
@@ -180,59 +201,38 @@ if __name__ == '__main__':
     recorder = csdl.Recorder(inline=False)
     recorder.start()
 
-    # The POD reduced-order model. The basis is local to each design (local_weighted); rb_size columns,
-    # from a snapshot matrix truncated at 3 rb_size directions. eta_threshold is the relative residual
-    # ||R||/||u|| below which the reduced solution replaces the full-order solve; the optimizer's ftol is 1e-6,
-    # so 1e-8 leaves the reduced solution's error well below it. distance_weighting='total_derivative' is the
-    # default and is spelled out for clarity: it only acts once the probe below has supplied weights.
-    #
-    # The full-order adjoints the optimizer solves (four output rows: drag and the three constraints) are
-    # snapshots too (adjoint_snapshots='concatenate'). Each output row keeps its adjoints in a snapshot matrix of
-    # its own and gets an adjoint basis of the same size, adjoint_rb_size = 5 (adjoint_bases='per_output'); the
-    # four bases are orthonormalized together in W^-1 into Psi, of up to 4 * 5 = 20 directions (fewer where they
-    # share directions). On the OAT15A airfoil (examples/airfoil_opt_rans_pod.py) per-output bases cut the drag
-    # gradient error in the second half of a 30-iteration run from 20% to 7% against one shared basis of 5, at a
-    # 5x larger forward residual. The reduced solve is the paired hybrid: test basis [S^2 A V_s, Psi] (LSPG's for
-    # the 5 state vectors, Psi itself), trial basis [V_s, W^-1 A^T Psi] (hybrid_trial='paired', A at the solve's
-    # warm start), so that each adjoint test direction has its trial partner. The reduced adjoint is that of these
-    # equations (the exact derivative of the ROM's outputs, the basis fixed per design) and lies in a space that
-    # holds Psi. With the adjoint basis itself as trial directions (hybrid_trial='adjoint') the reduced system was
-    # nearly singular on a transonic RANS case and its adjoint ~100x less accurate than its space allowed; LSPG
-    # with the adjoints' preimages A^-1 S^-2 psi in the trial basis (tried and removed) did not extrapolate to
-    # other designs (docs/src/reduced_order_modeling.md). Each row's snapshot matrix keeps adjoint_max_rank
-    # directions, one per design: 15 keeps ~15 designs per row (4 * 15 vectors, ~0.5 GB over all ranks). With
-    # compute_all_adjoint_errors, adjoint_space_errors records how far each full-order adjoint is from the reduced
-    # adjoint's space and how close the reduced adjoint comes to it.
-    rom = ReducedOrderModel(rb_size=10, basis_mode='local_weighted', eta_threshold=1e-15,
-                            distance_weighting='total_derivative', cubic_cutoff=0.8,
-                            adjoint_snapshots='concatenate', test_space='hybrid', hybrid_trial='paired',
-                            adjoint_bases='per_output', adjoint_rb_size=5, adjoint_max_rank=15)
+    # The POD reduced-order model, frozen at every trust-region center (test_space='frozen', module docstring):
+    # rb_size state vectors from the snapshots (max_rank 60 stored directions), no adjoint snapshots (the center's
+    # full-order adjoints are its frozen dual). The trust region sets eta_threshold per evaluation: 0 at the centers
+    # and trial points (the full-order model), inf in the subproblems (the ROM at any finite residual: rho, not
+    # eta, judges the model). distance_weighting='total_derivative' only acts once the probe below has supplied
+    # weights.
+    weighting = dict(distance_weighting='total_derivative', cubic_cutoff=0.8) \
+        if args.basis == 'local_weighted' else {}
+    rom = ReducedOrderModel(rb_size=args.rb_size, basis_mode=args.basis, max_rank=60, eta_threshold=0.0,
+                            min_snapshots=1, test_space='frozen', **weighting)
 
-    # DEIM and MDEIM beside the ROM, for comparison only (their bases follow the ROM's local_weighted one).
-    # DEIM: deim_n_modes >= rb_size (its basis spans S A V), the sandbox's 100 modes; MDEIM: the memory
-    # of its Jacobian-sized snapshots sets n_modes, max_rank and the harvest (module docstring)
-    hr_methods = {"none": (), "deim": ("deim",), "mdeim": ("mdeim",), "both": ("deim", "mdeim")}[
-        args.hyper_reduction]
-    hyper_reduction = HyperReductionComparison(methods=hr_methods, deim_n_modes=100,
-                                               deim_max_snapshots_per_solve=10, mdeim_n_modes=4,
-                                               mdeim_max_rank=6, mdeim_max_snapshots_per_solve=1) \
-        if hr_methods else None
+    # The MDEIM driving the ROM's Newton loop; its basis follows the ROM's (local_weighted about the center).
+    # The memory of its Jacobian-sized snapshots sets n_modes, max_rank and the harvest (module docstring)
+    hyper_reduction = HyperReductionComparison(
+        methods=("mdeim",), drive="mdeim", mdeim_n_modes=args.mdeim_modes, mdeim_max_rank=args.mdeim_max_rank,
+        mdeim_max_snapshots_per_solve=args.mdeim_snapshots_per_solve) if args.hyper_reduction == "mdeim" else None
 
     csdl_flow_model = DG_windtunnel_model(mesh_from_file, boundary_dict, shape,
                                           mesh_inner_bdry_function=wing_inner_bdry_function,
                                           poly_order=poly_o, gamma=1.4,
-                                          filename_suffix="wing_opt_rans_local_weightedPOD_L3mesh_p=0_M=0_75",
+                                          filename_suffix="wing_opt_rans_trrb_frozen_{}{}{}_L3mesh_p=0_M=0_75".format(
+                                              args.basis, args.rb_size,
+                                              "_mdeim" if hyper_reduction is not None else ""),
                                           asm_overlap=1, ilu_levels=2,
                                           model_class=CompressibleRANSModel,
                                           model_kwargs={'Re': Re},
                                           reduced_order_model=rom,
-                                          # diagnostics, stored in the DataStore: the error of the ROM
-                                          # adjoint against the full-order one for every derivative (also
-                                          # where the ROM is rejected, evaluated at the full-order state;
-                                          # the optimizer's adjoint is unchanged), and the phase breakdown
-                                          # (assembly, linear solves, ROM, and the DEIM/MDEIM solves and
-                                          # adjoints of the comparison) of every solve
-                                          compute_all_adjoint_errors=True,
+                                          # no comparison of the ROM adjoints with full-order ones (it would
+                                          # cost a full-order adjoint per output row of every ROM gradient);
+                                          # the phase breakdown (assembly, linear solves, ROM, MDEIM) of every
+                                          # solve is stored in the DataStore
+                                          compute_all_adjoint_errors=False,
                                           profile_phases=True,
                                           hyper_reduction=hyper_reduction)
     # Pseudo-transient continuation from the free stream needs many more steps
@@ -264,12 +264,17 @@ if __name__ == '__main__':
                            "ksp_dgmres_max_eigen": 60, "ksp_pc_side": "right",
                            "ksp_norm_type": "unpreconditioned"}
     # Free the solver's matrices after each forward solve and the adjoint's
-    # after each design's adjoints, so the two never coexist (rebuilt when next needed).
+    # after each design's adjoints, so the two never coexist (rebuilt when next needed). Unlike on the
+    # 2D airfoil (airfoil_opt_rans_trmm.py) the ROM solves rebuild the Newton problem too: the exact
+    # Jacobian's memory does not leave room to keep it.
     csdl_flow_model.release_solver_memory = True
     # No per-evaluation mesh_deformation file; the solution files are still written
     csdl_flow_model.write_mesh_deformation = False
     # One solution frame per design (CSDL evaluates each design twice)
     csdl_flow_model.write_once_per_design = True
+    # Solution frames of the full-order solves only (the centers and trial points): the subproblems evaluate
+    # hundreds of designs with the ROM
+    csdl_flow_model.write_rom_solutions = False
     csdl_flow_model.set_up_sim()
     csdl_flow_model.set_adjoint_options(cell_centre_matrix=True, cache_jacobians=True, structured_gradient=True,
                                         cache_jacvec_operators=True)
@@ -393,37 +398,46 @@ if __name__ == '__main__':
     sim = csdl.experimental.JaxSimulator(recorder, gpu=False)
 
     # The probe wraps the simulator's derivative evaluation, so it sees each design's objective gradient and
-    # constraint Jacobian (no extra solves) and hands their column norms to the ROM. The design variables are
-    # the ROM's snapshot parameters (shape variables, then alpha), in the same order. A mismatch in their
-    # number is caught here (the weights would not fit); the probe never breaks the optimization itself.
-    attach_total_derivative_probe(sim, printer=PETSc.Sys.Print,
-                                  on_norms=rom.set_distance_sensitivities,
-                                  max_entries=32)
-
-    # PETSc.Sys.Print("starting sim run...")
-    # sim.run()
-    # PETSc.Sys.Print("finished sim run")
-    
-    # test accuracy of simulation object
-    # print("Starting check_totals...")
-    # sim.check_totals(step_size=1e-6)
+    # constraint Jacobian (no extra solves) and hands their column norms to the ROM's local_weighted basis. The
+    # design variables are the ROM's snapshot parameters (shape variables, then alpha), in the same order. A
+    # mismatch in their number is caught here (the weights would not fit); the probe never breaks the
+    # optimization itself.
+    if rom.basis_mode == 'local_weighted':
+        attach_total_derivative_probe(sim, printer=PETSc.Sys.Print, on_norms=rom.set_distance_sensitivities,
+                                      max_entries=32)
 
     PETSc.Sys.Print("Defining optimization problem...")
+    prob = CSDLAlphaProblem(problem_name='shape_opt', simulator=sim)
 
-    prob = CSDLAlphaProblem(problem_name='shape_opt',simulator=sim)
-    # optimizer = COBYLA(prob, solver_options={'maxiter':400, 'catol':1e-6, 'rhobeg': 0.025}, turn_off_outputs=True)
+    # The error indicator is the frozen ROM's residual (indicator='residual'), which needs no per-output estimates
+    trrb = TrustRegionReducedBasis(prob, csdl_flow_model, indicator='residual', delta0=args.delta0,
+                                   constraints='sqp', acceptance='ratio',
+                                   max_subproblem_iterations=args.subproblem_maxiter,
+                                   max_iterations=args.max_iterations, max_full_order=args.max_full_order,
+                                   printer=PETSc.Sys.Print)
 
-    # modopt writes its outputs into a timestamped folder that every rank would
-    # create at once (a FileExistsError race): only rank 0 writes them
-    optimizer = SLSQP(prob, solver_options={'ftol':1e-6, 'maxiter':150},
-                      turn_off_outputs=mesh_from_file.comm.Get_rank() != 0)
-    # optimizer = PySLSQP(prob, solver_options={'acc':1e-8, 'maxiter':100})
-
-    PETSc.Sys.Print("Solving optimization problem...")
-
-    optimizer.solve()
-
-    # save data store file
-    if mesh_from_file.comm.Get_rank() == 0:
-        csdl_flow_model.data_store.write_store_to_numpy_file(save_filename="SLSQP_POD_{}.npy".format(csdl_flow_model.filename_suffix))
-    optimizer.print_results()
+    PETSc.Sys.Print("Solving optimization problem (TR-RB, frozen {} ROM of {} vectors, {} Jacobian)...".format(
+        args.basis, args.rb_size, "MDEIM" if hyper_reduction is not None else "exact"))
+    try:
+        trrb.solve()
+        PETSc.Sys.Print("Trust-region iterations:\n" + trrb.summary())
+        # the final center's full-order values, unscaled (the problem scales the drag by its baseline and each
+        # constraint by its limit's magnitude, in the order declared above), and how far each constraint is
+        # inside its limit, relative to it (negative: violated)
+        D_baseline = baseline_forces["D"]
+        D_fom = trrb.center['f'] * D_baseline
+        constraints = (("L", L_baseline, 1.0), ("M_root_bending", baseline_moments["root_bending"]["M"], -1.0),
+                       ("M_pitch", baseline_moments["pitch"]["M"], 1.0))
+        margins = []
+        for (name, limit, side), c in zip(constraints, trrb.center['c']):
+            value = c * abs(limit)
+            margins.append("{} {:.8f} (margin {:+.3e})".format(name, value, side * (value - limit) / abs(limit)))
+        PETSc.Sys.Print("Final design, full order (nondimensional): D {:.8f} (D / D_baseline {:.6f}), {}; {} after "
+                        "{} iterations and {} full-order solves".format(
+                            D_fom, D_fom / D_baseline, ", ".join(margins), trrb.reason, len(trrb.iterations),
+                            trrb.n_full_order))
+    finally:
+        # the DataStore also when the run stops early
+        if mesh_from_file.comm.Get_rank() == 0:
+            csdl_flow_model.data_store.write_store_to_numpy_file(
+                save_filename="TRRB_{}.npy".format(csdl_flow_model.filename_suffix))

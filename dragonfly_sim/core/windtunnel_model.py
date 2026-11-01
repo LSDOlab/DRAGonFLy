@@ -112,6 +112,9 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         the ROM and FOM, and are recorded against them in data_store (the DEIM_* / MDEIM_*
         records); the optimizer's solutions and adjoints are unchanged. A diagnostic: it adds
         their solves and harvesting to every evaluation (and to its 'forward' phase record).
+        With drive='mdeim' (a frozen ROM only) there is no comparison: the MDEIM, trained the
+        same way, gives the ROM's Newton loop its Jacobian, and what it built at each freeze
+        is recorded in data_store.mdeim_operator_info.
         """
         super().__init__()
 
@@ -205,6 +208,10 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         # rom_adjoint_shadow(): the reverse products use the rejected ROM's adjoint
         self._rom_adjoint_shadow = False          # rom_adjoint_shadow(): the method, 'rom', 'deim' or 'mdeim'
         self._rom_adjoint_shadow_failed = False
+        # (accepted ROM solution, {output name: correction}) of _dual_output_corrections, else None
+        self._output_corrections = None
+        # whether the last forward solve returned the ROM's solution (utils/staged_optimization reads it)
+        self.last_solve_rom_accepted = False
 
         # Naming suffix for exported files
         self.filename_suffix = filename_suffix
@@ -261,6 +268,10 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         # evaluation, so their labels have gaps.
         self.write_once_per_design = False
         self._last_written_design = None
+        # Write the output frame of an evaluation whose solution is an accepted ROM solution;
+        # False: only the frames of full-order solutions (a trust region evaluates hundreds of
+        # designs with the ROM)
+        self.write_rom_solutions = True
 
 
         # Discretization and physics-related parameters
@@ -379,6 +390,7 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
             self.mesh, self.sim_model, self.WALL_TAG,
             moments=self.moments,
             p_inf_dim=101325.)
+        self.postprocessor.output_correction = self._output_correction_for
 
         if self.reduced_order_model is not None:
             self.reduced_order_model.set_up(self.sim_model)
@@ -484,9 +496,17 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         finally:
             self.reduced_order_model = rom
         self.sim_model.last_solve_converged = converged
-        if np.isfinite(np.linalg.norm(solution)):
+        if self._keeps_warm_start(solution, converged):
             self.previous_solution = solution
         return solution, converged, self.postprocessor.forces_and_coefficients(solution)
+
+    def _keeps_warm_start(self, solution, converged):
+        """Whether a solution becomes the warm start of the next solve: when it converged and is finite (the
+        first one when finite). A solve that failed at a hard design ends in a state the next design's
+        solve may not recover from (e.g. a pressure at the positivity floor), even at a design that converged
+        before. Collective."""
+        finite = np.isfinite(np.linalg.norm(solution))
+        return bool(finite and (converged or self.previous_solution is None))
 
     def enable_profiling(self, enabled=True, barriers=True, reset=True):
         """Phase timing of the flow solves, the mesh motion, the ROM and the adjoint
@@ -509,6 +529,7 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         if postprocessor.sim_model is not self.sim_model or postprocessor.mesh_obj is not self.mesh:
             raise ValueError("the postprocessor must be built on this windtunnel model's mesh and sim_model")
         self.postprocessor = postprocessor
+        postprocessor.output_correction = self._output_correction_for
 
     def _record_phases(self, kind, eval_idx, before):
         # the phase times spent since the snapshot `before` (None: profiling off); collective
@@ -586,6 +607,8 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
             PETSc.Sys.Print("Mesh is not valid, skipping simulations.")
             output_vals['u_vec'] = np.zeros((self.sim_model.u_vec.x.petsc_vec.local_size,))
             self._fom_design = None
+            self._output_corrections = None
+            self.last_solve_rom_accepted = False
             if self.reduced_order_model is not None:
                 self.reduced_order_model.discard_adjoint()
             return
@@ -603,22 +626,26 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         PETSc.Sys.Print("setting u_vec output...")
         output_vals['u_vec'] = solution_output
 
-        # Warm start: keep the accepted solution unless it has blown up
-        if np.isfinite(np.linalg.norm(solution_output)):
+        # Warm start: keep the accepted solution if it converged (_keeps_warm_start)
+        if self._keeps_warm_start(solution_output, solution_converged):
             PETSc.Sys.Print("Updating warm start solution")
             self.previous_solution = solution_output
         else:
-            PETSc.Sys.Print("Not updating warm start solution, using previous value")
+            PETSc.Sys.Print("Not updating warm start solution (the solve did not converge), using the previous one")
 
         design = np.concatenate([[alpha], np.ravel(shape_parameters)
                                  if shape_parameters is not None else []])
+        source = "ROM" if self.last_solve_rom_accepted else "FOM"
         if (self.write_once_per_design and self._last_written_design is not None
                 and np.array_equal(design, self._last_written_design)):
             PETSc.Sys.Print("Same design as the last written frame: not writing eval_idx {}".format(
                 self.eval_idx))
-        else:
-            PETSc.Sys.Print("Writing aligned output frame at eval_idx {} (FOM solution)".format(
+        elif self.last_solve_rom_accepted and not self.write_rom_solutions:
+            PETSc.Sys.Print("ROM solution: not writing eval_idx {} (write_rom_solutions is off)".format(
                 self.eval_idx))
+        else:
+            PETSc.Sys.Print("Writing aligned output frame at eval_idx {} ({} solution)".format(
+                self.eval_idx, source))
             # we write the deformation and the solution outputs to the same time step indices
             with _PROF.phase("output:solution"):
                 if mesh_node_motions is not None:
@@ -669,28 +696,52 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         """
         # the forward solve needs the memory of the last design's adjoint operators
         self._release_adjoint_cache()
+        self._output_corrections = None
+        self.last_solve_rom_accepted = False
+        # the ROM result of this evaluation (None: no ROM solve) and the output error estimates of
+        # _dual_output_corrections, for error-aware optimizers (utils/trust_region_reduced_basis.py)
+        self.last_rom_result = None
+        self.rom_output_estimates = None
         rom = self.reduced_order_model
         if rom is None:
             return self._run_fom_solve()
         repeat = self._fom_design is not None and np.array_equal(parameter_vector, self._fom_design[0])
-        if not (repeat and rom.adjoint is not None and rom.adjoint.matches_design(parameter_vector)):
+        # a re-evaluation of the design the ROM solved and accepted last keeps that solution and its
+        # adjoint, unless its bases would now be built differently (ReducedOrderModel.reusable_result)
+        reused = None if repeat or rom.run_fom_every_evaluation else rom.reusable_result(parameter_vector)
+        if not (repeat and rom.adjoint is not None and rom.adjoint.matches_design(parameter_vector)) \
+                and reused is None:
             rom.discard_adjoint()
-        # else: the adjoint of the ROM solve that was rejected for this design (see below)
+        # else: the adjoint of the ROM solve that was rejected for this design (see below), or of the
+        # reused one
         rom_result = rom_forces = None
         if repeat:
             PETSc.Sys.Print("Re-evaluating the design the FOM solved last: skipping the ROM")
+        elif reused is not None:
+            PETSc.Sys.Print("Re-evaluating the design the ROM solved last: reusing its solution (eta {:.3e})".format(
+                reused.eta))
+            self.sim_model.set_u_vec(reused.solution)
+            rom_result = reused
+            rom_forces = self._log_rom_solve(rom_result)
         else:
             self.sim_model.interpolate_solution_vector(self.previous_solution)
             phases_before = self._phase_snapshot()
             rom_result = rom.solve(self.sim_model, parameter_vector)
             self._record_phases("rom", self.eval_idx, phases_before)
+            self._log_driving_hyper_reduction()
             if rom_result is not None:
                 rom_forces = self._log_rom_solve(rom_result)
+        self.last_rom_result = rom_result
         accept_rom = rom_result is not None and rom_result.accepted
+        if accept_rom:
+            # at the ROM solution, before anything moves the model away from it
+            self._dual_output_corrections(rom_result.solution)
         if accept_rom and not rom.run_fom_every_evaluation:
             PETSc.Sys.Print("Accepting ROM solution")
-            self._compare_hyper_reduced(parameter_vector, rom_result, rom_forces, None, None)
+            if reused is None:
+                self._compare_hyper_reduced(parameter_vector, rom_result, rom_forces, None, None)
             self._fom_design = None
+            self.last_solve_rom_accepted = True
             return rom_result.solution, True
 
         # the hyper-reduction comparison trains on the Jacobians of a FOM solve of a new design
@@ -710,6 +761,7 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
                 # the ROM keeps no snapshot of this design, so neither does the comparison
                 self.hyper_reduction.discard_buffers()
             self._fom_design = None
+            self.last_solve_rom_accepted = True
             return rom_result.solution, True
 
         PETSc.Sys.Print("Accepting FOM solution")
@@ -735,6 +787,107 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         self._fom_design = (np.array(parameter_vector, dtype=float), converged)
         return solution_fom, fom_converged
 
+    def _dual_output_corrections(self, solution):
+        """
+        adjoint_solve='dual_corrected': the dual-weighted residual corrections -psi_d^T R(u_r) of the
+        differentiated outputs (D, L, M_<name>) at the accepted ROM solution u_r, psi_d the dual ROM's
+        adjoint for the output's state derivative (LSPGAdjoint.dual_adjoint, the psi_d of the reduced
+        adjoint CSDL asks for later). The postprocessor adds them to its CSDL outputs
+        (_output_correction_for), so that the optimizer gets the values of the corrected outputs
+        f(u_r) - psi_d^T R(u_r), whose derivative that reduced adjoint gives. Recorded in
+        data_store.ROM_output_corrections. Collective.
+
+        Also the error estimates rom_output_estimates, {output name: ||W^-1/2 R(u_r)|| ||W^-1/2 (A^T psi_d
+        - g)||}: the leading term Delta_pr ||r_du|| of the bound of Keil et al. (ESAIM: M2AN 2021, Prop. 2.5)
+        on the error of the corrected output, with the stability constant of A taken as 1. Not a bound
+        here: an indicator, with an unknown constant.
+        """
+        adjoint = self.reduced_order_model.adjoint
+        if adjoint is not None and getattr(adjoint, "frozen_dual", False):
+            self._frozen_dual_corrections(adjoint, solution)
+            return
+        if adjoint is None or not getattr(adjoint, "dual_corrected", False):
+            return
+        comm = self.mesh.mesh.comm
+        with _PROF.phase("rom:output_correction"):
+            gradients = self._output_state_gradients(solution)
+            r = self._residual_at(solution, solution)
+            # the reduced adjoint's factorization takes the Jacobian at the model's state
+            self.sim_model.set_u_vec(solution)
+            dual_weight = getattr(adjoint, "dual_weight", None)
+            Dr = r if dual_weight is None else dual_weight * r
+            primal = float(np.sqrt(comm.allreduce(float(Dr @ Dr), op=MPI.SUM)))
+            corrections, estimates = {}, {}
+            for name, g in gradients.items():
+                corrections[name] = -comm.allreduce(float(adjoint.dual_adjoint(self.sim_model, g) @ r), op=MPI.SUM)
+                estimates[name] = primal * adjoint.last_dual_residual
+        self._output_corrections = (np.array(solution, dtype=float), corrections)
+        self.rom_output_estimates = estimates
+        if comm.Get_rank() == 0:
+            self.data_store.ROM_output_corrections += [(self.eval_idx, dict(corrections))]
+        PETSc.Sys.Print("dual-corrected ROM outputs: corrections -psi_d^T R(u_r) " + ", ".join(
+            "{} {:.6e}".format(name, value) for name, value in corrections.items()))
+
+    def _frozen_dual_corrections(self, adjoint, solution):
+        """test_space='frozen': the corrections -psi_k^T R(u_r) of the outputs with a frozen dual psi_k (the
+        center's full-order adjoint; FrozenTestAdjoint), added to the CSDL outputs as those of
+        _dual_output_corrections. Collective."""
+        comm = self.mesh.mesh.comm
+        with _PROF.phase("rom:output_correction"):
+            r = self._residual_at(solution, solution)
+            corrections = {name: -comm.allreduce(float(psi @ r), op=MPI.SUM) for name, psi in adjoint.duals.items()}
+        self._output_corrections = (np.array(solution, dtype=float), corrections)
+        if comm.Get_rank() == 0:
+            self.data_store.ROM_output_corrections += [(self.eval_idx, dict(corrections))]
+        PETSc.Sys.Print("frozen-dual ROM outputs: corrections -psi_k^T R(u_r) " + ", ".join(
+            "{} {:.6e}".format(name, value) for name, value in corrections.items()))
+
+    def _output_state_gradients(self, solution):
+        """{output name: this rank's entries of its state derivative} at `solution` (owned entries), on the
+        current mesh and angle of attack, for D, L and M_<name> of every moment. Collective."""
+        pp = self.postprocessor
+        pp.set_angle_of_attack(self.sim_model.farfield_conditions['alpha'])
+        pp.refresh_geometry_dependent_reference_quantities()
+        gradients = {"D": pp.compute_D_deriv(solution), "L": pp.compute_L_deriv(solution)}
+        for spec in pp.moment_specs:
+            gradients["M_" + spec.name] = pp.compute_moment_deriv(solution, spec)
+        return {name: np.asarray(g, dtype=float) for name, g in gradients.items()}
+
+    # a right-hand side of the adjoint is an output's state derivative times s when its distance from that
+    # direction is below this, relative
+    OUTPUT_MATCH_RTOL = 1e-8
+
+    def _match_output(self, rhs, solution):
+        """(output name, s) with rhs = s (d output / du) at `solution` (both owned entries), None if rhs is no
+        output's: which output an adjoint right-hand side belongs to. Collective."""
+        comm = self.mesh.mesh.comm
+        rhs = np.asarray(rhs, dtype=float)
+        rr = comm.allreduce(float(rhs @ rhs), op=MPI.SUM)
+        best = None
+        for name, g in self._output_state_gradients(solution).items():
+            gg, gr = comm.allreduce(np.array([float(g @ g), float(g @ rhs)]), op=MPI.SUM)
+            if gg <= 0.0:
+                continue
+            s = gr / gg
+            d = rhs - s * g
+            distance = np.sqrt(max(comm.allreduce(float(d @ d), op=MPI.SUM), 0.0) / max(rr, 1e-300))
+            if best is None or distance < best[2]:
+                best = (name, float(s), float(distance))
+        if best is None or best[2] > self.OUTPUT_MATCH_RTOL:
+            PETSc.Sys.Print("adjoint right-hand side matches no output (closest {}); no frozen dual".format(best))
+            return None
+        return best[0], best[1]
+
+    def _output_correction_for(self, u_vec):
+        """The corrections of _dual_output_corrections, {output name: correction}, if u_vec (owned
+        entries) is the accepted ROM solution they belong to, else None: DG_postprocessor.compute adds
+        them to its outputs. Collective."""
+        stored = self._output_corrections
+        match = stored is not None and np.array_equal(np.asarray(u_vec, dtype=float), stored[0])
+        if not self.mesh.mesh.comm.allreduce(bool(match), op=MPI.LAND):
+            return None
+        return stored[1]
+
     def _log_rom_solve(self, result):
         # coefficients of the ROM solution, logged like the FOM's
         with _PROF.phase("post:coefficients"):
@@ -747,6 +900,7 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
             self.data_store.ROM_force_coefficients += [(self.eval_idx, cd, cl) + cms]
             self.data_store.ROM_meets_threshold += [(self.eval_idx, result.accepted)]
             self.data_store.ROM_lspg_converged += [(self.eval_idx, result.converged)]
+            self.data_store.rom_iterations += [(self.eval_idx, result.iterations)]
         PETSc.Sys.Print("ROM coefficients: c_d: {}, c_l: {}".format(cd, cl) + self._moment_log_string(cms))
         return (cd, cl) + cms
 
@@ -813,7 +967,7 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         converge). The model's u_vec keeps the optimizer's solution. Collective.
         """
         hr = self.hyper_reduction
-        if hr is None or rom_result is None:
+        if hr is None or rom_result is None or hr.drive is not None:
             return
         model = self.sim_model
         model.u_vec.x.scatter_forward()
@@ -865,6 +1019,13 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         if res.validation is not None:
             PETSc.Sys.Print("{} validation: {}".format(M, res.validation))
 
+    def _log_driving_hyper_reduction(self):
+        # hyper_reduction drive: the operators of a freeze in the ROM solve just run
+        hr = self.hyper_reduction
+        info = None if hr is None or hr.drive is None else hr.pop_freeze_info()
+        if info is not None and self.mesh.mesh.comm.Get_rank() == 0:
+            getattr(self.data_store, hr.drive + "_operator_info").append((self.eval_idx, dict(info)))
+
     def _log_hyper_reduction_snapshots(self, counts):
         if self.mesh.mesh.comm.Get_rank() == 0:
             for m, (offered, added) in counts.items():
@@ -900,9 +1061,9 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         if self.sim_model.incoming_state_converged():
             residual_norm = self.sim_model.residual_vec_physical.norm()
             if harvest:
-                # no Newton iterates, and the comparison learns nothing from this solve
-                self.hyper_reduction.discard_buffers()
-                harvest = False
+                # no Newton iterates: the Jacobian at the (converged) state alone, e.g. at the
+                # baseline design of an optimization, solved before it started
+                self.hyper_reduction.begin_harvest(self.sim_model, self.reduced_order_model, harvest_basis)
         else:
             self.sim_model.set_up_solver()
             harvesting = self.hyper_reduction.harvesting(self.sim_model, self.reduced_order_model, harvest_basis) \
@@ -1004,7 +1165,12 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
             # compute_jacvec_product then uses like the full-order one
             rom_start = perf_counter()
             with _PROF.phase("rom:adjoint"):
-                d_residuals['u_vec'] = adjoint.solve(self.sim_model, d_outputs['u_vec'])
+                if getattr(adjoint, "frozen_dual", False):
+                    dual = self._match_output(d_outputs['u_vec'], u_vec)
+                    self.sim_model.set_u_vec(u_vec)
+                    d_residuals['u_vec'] = adjoint.solve(self.sim_model, d_outputs['u_vec'], dual=dual)
+                else:
+                    d_residuals['u_vec'] = adjoint.solve(self.sim_model, d_outputs['u_vec'])
             rom_walltime = perf_counter() - rom_start
             self._log_adjoint("rom", pre_apply_inverse_jacobian_time)
             psi_fom = None
@@ -1020,6 +1186,13 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         self._fom_adjoint(input_vals, u_vec, alpha, mesh_node_motions, d_outputs, d_residuals,
                           pre_apply_inverse_jacobian_time)
         self._add_adjoint_snapshot(parameter_vector, d_residuals['u_vec'])
+        if rom is not None and rom.test_space == 'frozen':
+            # the frozen dual of a freeze at this design: the adjoint of the output this row belongs to
+            match = self._match_output(d_outputs['u_vec'], u_vec)
+            self.sim_model.set_u_vec(u_vec)
+            if match is not None and match[1] != 0.0:
+                rom.record_full_order_adjoint(parameter_vector, match[0],
+                                              np.asarray(d_residuals['u_vec'], dtype=float) / match[1])
         psi_rom = None
         if (self.compute_all_adjoint_errors and adjoint is not None and not adjoint.accepted
                 and adjoint.matches_design(parameter_vector)):
@@ -1456,7 +1629,7 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
                                 adjoint.condition_number, self._contribution_string(contribution),
                                 np.round(shares[0], 4), np.round(shares[1], 4)))
         try:
-            record.append(self._min_residual_adjoint(adjoint, test, psi_fom, row))
+            record.append(self._min_residual_adjoint(adjoint, test, psi_fom, row, adjoint_part))
         except Exception as exc:
             # a diagnostic must not stop the optimization
             PETSc.Sys.Print("ROM adjoint space: the minimum-residual comparison failed: {!r}".format(exc))
@@ -1464,14 +1637,18 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
         if comm.Get_rank() == 0:
             self.data_store.adjoint_space_errors += [tuple(record)]
 
-    def _min_residual_adjoint(self, adjoint, test, psi_fom, row):
+    def _min_residual_adjoint(self, adjoint, test, psi_fom, row, adjoint_part=None):
         """
         For comparison with the reduced adjoint: the minimum-residual adjoint over the same space,
         psi = T z minimizing ||D (A^T T z - g)||, T an orthonormal basis of the space, g the adjoint's
         right-hand side, A the Jacobian at the reduced adjoint's linearization point (A^T T formed
         once per reduced adjoint, for all its output rows) and D the state scales (W^-1/2). Not the
         derivative of the reduced solve, but what a stable solve on that space gives. Returns {'dual': relative error in the dual norm, '2-norm': in the
-        2-norm, 'contributions': as adjoint_derivative_errors}. Collective.
+        2-norm, 'contributions': as adjoint_derivative_errors, 'singular_values': those of D A^T T}.
+        With adjoint_part (the adjoint basis Psi in the space, e.g. the hybrid test space's adjoint
+        block) the same over span(Psi) alone, under 'adjoint_basis': whether the rest of the space
+        (the hybrid's state test directions S^2 A V_s) makes the least-squares adjoint worse.
+        Collective.
         """
         comm = self.mesh.mesh.comm
         scale = self._dual_norm_scale()
@@ -1496,20 +1673,40 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
             x.destroy()
             y.destroy()
             Q, R = tsqr(comm, d[:, None] * ATT)
-            self._min_residual_cache = cache = (adjoint, T, ATT, Q, R)
-        _, T, ATT, Q, R = cache
+            sub = None
+            if adjoint_part is not None and adjoint_part.shape[1] > 0:
+                # span(Psi) within the space: T_a = T C, C the coordinates of an orthonormal basis of
+                # span(Psi), so A^T T_a = (A^T T) C without more products with A^T
+                C = comm.allreduce(T.T @ orthonormal_columns(comm, np.asarray(adjoint_part, dtype=float)),
+                                   op=MPI.SUM)
+                sub = (T @ C,) + tuple(tsqr(comm, d[:, None] * (ATT @ C)))
+            self._min_residual_cache = cache = (adjoint, (T, Q, R), sub)
+        _, full, sub = cache
         g = np.asarray(self._adjoint_rhs, dtype=float)
-        z = sp_la.solve_triangular(R, comm.allreduce(Q.T @ (d * g), op=MPI.SUM), lower=False)
-        psi = T @ z
 
         def rel(v, w):
             return np.sqrt(comm.allreduce(float((v - w) @ (v - w)), op=MPI.SUM)
                            / max(comm.allreduce(float(w @ w), op=MPI.SUM), 1e-300))
-        out = {'dual': float(rel(d * psi, d * psi_fom)), '2-norm': float(rel(psi, psi_fom)),
-               'contributions': self._contribution_errors(psi, psi_fom)}
+
+        def least_squares(T, Q, R):
+            psi = T @ sp_la.solve_triangular(R, comm.allreduce(Q.T @ (d * g), op=MPI.SUM), lower=False)
+            return {'dual': float(rel(d * psi, d * psi_fom)), '2-norm': float(rel(psi, psi_fom)),
+                    'contributions': self._contribution_errors(psi, psi_fom),
+                    'singular_values': np.linalg.svd(R, compute_uv=False)}
+        out = least_squares(*full)
         PETSc.Sys.Print("ROM adjoint space (output row {}): the minimum-residual adjoint over the same space has "
                         "relative error {:.3e} (dual norm), {:.3e} (2-norm); derivative contributions: {}".format(
                             row, out['dual'], out['2-norm'], self._contribution_string(out['contributions'])))
+        if sub is not None:
+            out['adjoint_basis'] = least_squares(*sub)
+            sv, sva = out['singular_values'], out['adjoint_basis']['singular_values']
+            PETSc.Sys.Print("ROM adjoint space (output row {}): the minimum-residual adjoint over the adjoint basis "
+                            "alone ({} of {} directions) has relative error {:.3e} (dual norm), {:.3e} (2-norm); "
+                            "derivative contributions: {}; singular values of D A^T T: space {:.2e} .. {:.2e}, "
+                            "adjoint basis {:.2e} .. {:.2e}".format(
+                                row, sva.size, sv.size, out['adjoint_basis']['dual'], out['adjoint_basis']['2-norm'],
+                                self._contribution_string(out['adjoint_basis']['contributions']),
+                                sv.max(), sv.min(), sva.max(), sva.min()))
         return out
 
     def _dual_norm_scale(self):

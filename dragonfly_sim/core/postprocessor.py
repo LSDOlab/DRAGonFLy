@@ -65,6 +65,10 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
         self.mesh_obj = Mesh_obj
         self.sim_model = sim_model
         self.wall_meshtag_val = wall_meshtag_val
+        # callable(u_vec) -> {output name: correction} or None, added to the differentiated outputs
+        # (D, L, M_<name>; not the coefficients) in compute: DG_windtunnel_model sets it to its
+        # dual-corrected ROM's output corrections. Collective; the derivatives are left as they are
+        self.output_correction = None
         self.moment_specs = self._parse_moments(moments)
 
         # Reference quantities
@@ -445,6 +449,14 @@ class DG_postprocessor(csdl.CustomExplicitOperation):
                     spec.name, np.round(spec.point_array, 6), np.round(spec.direction_array, 6),
                     np.round(moment_val, 6), np.round(output_vals['c_m_' + spec.name], 6),
                     np.round(moment_val * self.moment_scale, 6)))
+
+            correction = None if self.output_correction is None else self.output_correction(u_vec)
+            if correction:
+                for name, value in correction.items():
+                    output_vals[name] = output_vals[name] + value
+                PETSc.Sys.Print("corrected outputs: " + ", ".join(
+                    "{}: {} (correction {:.3e})".format(name, np.round(output_vals[name], 8), value)
+                    for name, value in correction.items()))
         else:
             PETSc.Sys.Print("Mesh or solution is not valid, setting outputs to high drag.")
             output_vals['L'], output_vals['c_l'] = 0.0, 0.0

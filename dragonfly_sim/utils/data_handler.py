@@ -45,6 +45,7 @@ class DataStore():
         # wall time, eta, (eval_idx, c_d, c_l, c_m_1, ...) like
         # FOM_force_coefficients, whether eta met the acceptance threshold,
         # whether the LSPG solver itself is considered converged (ROM_lspg_converged),
+        # its Newton iterations (rom_iterations, (eval_idx, n)),
         # and (eval_idx, dc_d, dc_l, dc_m_1, ...) ROM - FOM when the FOM also ran;
         # the snapshot singular values after every snapshot added
         self.ROM_walltime = []
@@ -52,6 +53,7 @@ class DataStore():
         self.ROM_force_coefficients = []
         self.ROM_meets_threshold = []
         self.ROM_lspg_converged = []
+        self.rom_iterations = []
         self.rom_coefficient_errors = []
         self.global_snapshot_sing_vals_per_iteration = []
 
@@ -102,6 +104,23 @@ class DataStore():
         # the sum of the first and that adjoint's term; psi_d is the dual ROM's adjoint
         # (adjoint_solve='dual_corrected', whose corrected outputs use it).
         self.output_corrections = []
+
+        # Per accepted ROM solve with adjoint_solve='dual_corrected': (eval_idx, {output name: -psi_d^T R(u_r)}),
+        # the corrections DG_windtunnel_model._dual_output_corrections adds to the outputs the optimizer gets
+        # (D, L, M_<name>; ROM_outputs holds the uncorrected f(u_r))
+        self.ROM_output_corrections = []
+
+        # Per SLSQP run of utils/staged_optimization.StagedROMOptimization (and per stage it ended at a restart
+        # point without a run): (eval_idx of the full-order evaluation it started from, stage, eta_threshold,
+        # merit there, why it ended ('stall', 'no progress', 'restarts', 'budget' or SLSQP's message), major iterations)
+        self.optimization_runs = []
+
+        # Per iteration of utils/trust_region_optimization.TrustRegionModelManagement: a dict with the iteration,
+        # eval_idx, trust-region radius, the merit at the center, of the model and of the full-order model at the
+        # trial point, predicted and actual decrease, rho, whether the step was accepted, its length, the model
+        # ('rom', 'linear' or 'fom'), the subproblem's evaluations and full-order solves, the full-order solves so
+        # far and SLSQP's message
+        self.trust_region_iterations = []
 
         # First-order model management (DG_windtunnel_model._log_first_order_correction), per reduced
         # adjoint of a rejected ROM solve after the first: (eval_idx, output row, eval_idx of mu_0 (the
@@ -166,7 +185,9 @@ class DataStore():
         #                           relative, and |u - u_ROM| relative to |u_ROM|), the L2
         #                           norms of compute_L2_norm; nan where the FOM did not run
         #   <m>_operator_info       (eval_idx, {n_modes, n_points, sampled_cells,
-        #                           assembled_cells, total_cells, conditioning, n_snapshots})
+        #                           assembled_cells, total_cells, conditioning, n_snapshots});
+        #                           with drive, one per freeze, with 'driving' (whether it
+        #                           built operators) and 'offline_walltime'
         #   <m>_validation          (eval_idx, {...}) with validate=True
         #                           (utils/hyper_reduction_validation.py)
         #   <M>_outputs             {name: [(eval_idx, value)]} like ROM_outputs

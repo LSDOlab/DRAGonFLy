@@ -342,6 +342,46 @@ def test_windtunnel_accepts_the_rom_between_snapshots(in_tmp_dir, kind, eta_thre
         assert m.relative_residual_norm(m._assemble_physical_residual()) < eta_threshold
 
 
+@pytest.mark.unit_test
+def test_windtunnel_reuses_the_rom_solution_of_a_requeried_design(in_tmp_dir, monkeypatch):
+    """A re-evaluation of the design the ROM solved and accepted last returns that solution and keeps its
+    adjoint without solving again; a stricter eta_threshold, or a new snapshot, makes it solve again."""
+    rom = ReducedOrderModel(rb_size=5, eta_threshold=1e-9)
+    wt = make_windtunnel("euler", rom=rom, suffix="reuse")
+    for a in ALPHAS[:3]:
+        wt.solve_forward(np.radians(a))
+        wt.eval_idx += 1
+    solves = []
+    solve = rom.solve
+    monkeypatch.setattr(rom, "solve", lambda *args: solves.append(1) or solve(*args))
+    a = np.radians(ALPHAS[3])
+
+    u, converged, outputs = wt.solve_forward(a)
+    wt.eval_idx += 1
+    assert converged and wt.last_solve_rom_accepted and len(solves) == 1
+    adjoint, eta = rom.adjoint, rom._last_accepted[2].eta
+    u_again, converged, outputs_again = wt.solve_forward(a)
+    wt.eval_idx += 1
+    assert converged and wt.last_solve_rom_accepted and len(solves) == 1
+    assert np.array_equal(u_again, u) and outputs_again == outputs
+    assert rom.adjoint is adjoint
+    if MPI.COMM_WORLD.rank == 0:
+        ds = wt.data_store
+        assert [acc for _, acc in ds.ROM_meets_threshold][-2:] == [True, True]
+        assert ds.ROM_walltime[-1][1] == 0.0 and ds.rom_relative_residuals[-1][1] == eta
+
+    # a stricter eta_threshold rejects the stored solution: the ROM solves again
+    rom.eta_threshold = 0.5 * eta
+    assert rom.reusable_result(np.array([a])) is None
+    rom.eta_threshold = 1e-9
+    assert rom.reusable_result(np.array([a])) is not None
+    # a new snapshot changes the bases a solve would build
+    rom.add_snapshot(wt.sim_model, np.array([np.radians(ALPHAS[4])]))
+    assert rom.reusable_result(np.array([a])) is None
+    wt.solve_forward(a)
+    assert len(solves) == 2
+
+
 @pytest.mark.parametrize("kind, eta_threshold", [("euler", 1e-9), ("rans", 1e-7)])
 @pytest.mark.verification
 def test_windtunnel_rom_adjoint(in_tmp_dir, kind, eta_threshold):
@@ -1158,12 +1198,12 @@ def test_orthonormal_hybrid_state_test_changes_the_basis_not_the_rom(in_tmp_dir)
 
 
 @pytest.mark.verification
-@pytest.mark.parametrize("paired_update", ["warm_start", "newton", "solution"])
+@pytest.mark.parametrize("paired_update", ["warm_start", "newton", "solution", "solution_offset"])
 @pytest.mark.parametrize("kind", ["euler", "rans"])
 def test_paired_hybrid_adjoint_is_consistent_and_holds_the_adjoint(in_tmp_dir, kind, paired_update):
     """hybrid_trial='paired': the trial directions paired with the adjoint test directions Psi are
-    W^-1 A^T Psi, with the Jacobian at the warm start, at every Newton iteration or at the solution
-    (paired_update). The derivative at an accepted design is the hybrid ROM's own (central differences
+    W^-1 A^T Psi, with the Jacobian at the warm start, at every Newton iteration or at the solution,
+    re-solved or for the adjoint only (paired_update). The derivative at an accepted design is the hybrid ROM's own (central differences
     of its solves), and its adjoint is close to the full-order one."""
     import csdl_alpha as csdl
     recorder = csdl.Recorder(inline=False)
@@ -1255,6 +1295,58 @@ def test_per_output_adjoint_bases_need_an_adjoint_basis(adjoint_snapshots):
         ReducedOrderModel(rb_size=8, adjoint_snapshots=adjoint_snapshots, adjoint_bases='per_output')
 
 
+@pytest.mark.verification
+@pytest.mark.parametrize("adjoint_snapshots", [None, 'concatenate'])
+@pytest.mark.parametrize("kind", ["euler", "rans"])
+def test_galerkin_rom_adjoint_is_consistent(in_tmp_dir, kind, adjoint_snapshots):
+    """test_space='galerkin': the Galerkin solve V^T R = 0 and its adjoint psi = V z. The derivative at
+    an accepted design is the Galerkin ROM's own (central differences of its solves), on the state
+    basis alone and on the concatenated state-adjoint basis, whose adjoint is then close to the
+    full-order one."""
+    import csdl_alpha as csdl
+    recorder = csdl.Recorder(inline=False)
+    recorder.start()
+    # the Galerkin solve does not minimize the residual: eta 3e-9 on the RANS case with the concatenated basis
+    rom = ReducedOrderModel(rb_size=8, eta_threshold=1e-8, adjoint_snapshots=adjoint_snapshots,
+                            test_space='galerkin')
+    assert rom.adjoint_solve == 'galerkin'
+    wt = make_windtunnel(kind, rom=rom, suffix="galerkin", compute_all_adjoint_errors=True)
+    alpha = csdl.Variable(name='alpha', value=np.array([np.radians(ALPHAS[0])]))
+    alpha.set_as_design_variable()
+    u_vec = wt.evaluate(alpha=alpha)
+    out = wt.postprocessor.evaluate(u_vec, alpha=alpha)
+    out.D.set_as_objective()
+    out.M_pitch.set_as_constraint()
+    recorder.stop()
+    sim = csdl.experimental.JaxSimulator(recorder, gpu=False)
+    for a in ALPHAS[:3]:
+        sim[alpha] = np.array([np.radians(a)])
+        sim.run()
+        sim.compute_totals()
+    a = np.radians(ALPHAS[4])
+    sim[alpha] = np.array([a])
+    sim.run()
+    dD = float(np.asarray(sim.compute_totals()[out.D, alpha]).ravel()[0])
+    assert rom.adjoint.accepted and rom.adjoint.galerkin
+    h = 1e-5
+    fd = (wt.solve_forward(a + h)[2]["D"] - wt.solve_forward(a - h)[2]["D"]) / (2 * h)
+    PETSc.Sys.Print("GALERKIN-ADJOINT-CHECK ({}): dD/dalpha {:.12f}, FD of the ROM solves {:.12f}".format(
+        adjoint_snapshots, dD, fd))
+    assert abs(fd - dD) < 1e-6 * abs(fd), (fd, dD)
+    if MPI.COMM_WORLD.rank == 0:
+        worst = max(e[3] for e in wt.data_store.adjoint_errors if e[5])
+        PETSc.Sys.Print("GALERKIN-ADJOINT-ERROR ({}): {:.3e}".format(adjoint_snapshots, worst))
+        if adjoint_snapshots == 'concatenate':
+            assert worst < 1e-3
+
+
+def test_galerkin_test_space_needs_the_galerkin_adjoint():
+    with pytest.raises(ValueError):
+        ReducedOrderModel(rb_size=8, test_space='galerkin', adjoint_solve='lspg')
+    with pytest.raises(ValueError):
+        ReducedOrderModel(rb_size=8, test_space='galerkin', adjoint_snapshots='separate')
+
+
 def test_paired_update_needs_the_paired_trial_basis():
     with pytest.raises(ValueError):
         ReducedOrderModel(rb_size=8, adjoint_snapshots='concatenate', test_space='hybrid', paired_update='newton')
@@ -1273,9 +1365,9 @@ def test_dual_corrected_needs_a_separate_adjoint_basis(kw):
     ("rans", "local_weighted", "per_output")])
 def test_dual_corrected_adjoint_is_consistent_and_holds_the_adjoint(in_tmp_dir, kind, basis_mode, adjoint_bases):
     """adjoint_solve='dual_corrected': the LSPG adjoint plus the dual ROM's adjoint outside its span.
-    At an accepted design the derivative matches central differences of the ROM's solves (the output
-    correction, proportional to the ROM residual, is negligible there) and the adjoint is close to the
-    full-order one. At the rejected designs, the dual-weighted residual correction with the full-order
+    At an accepted design the CSDL outputs are the ROM's corrected by -psi_d^T R(u_r)
+    (ROM_output_corrections), the derivative matches central differences of those corrected outputs
+    and the adjoint is close to the full-order one. At the rejected designs, the dual-weighted residual correction with the full-order
     adjoint removes the ROM's first-order output error (the sign convention of output_corrections).
     With adjoint_bases='per_output' the dual ROM's basis holds an adjoint basis per output row."""
     import csdl_alpha as csdl
@@ -1301,6 +1393,20 @@ def test_dual_corrected_adjoint_is_consistent_and_holds_the_adjoint(in_tmp_dir, 
     sim.run()
     dD = float(np.asarray(sim.compute_totals()[out.D, alpha]).ravel()[0])
     assert rom.adjoint.accepted and rom.adjoint.dual_corrected
+    # the error estimates of the corrected outputs (TR-RB's indicator): one per output, finite and positive
+    estimates = wt.rom_output_estimates
+    assert sorted(estimates) == ["D", "L", "M_pitch"] and all(np.isfinite(v) and v > 0.0 for v in estimates.values())
+    assert wt.last_rom_result is not None and wt.last_rom_result.accepted
+    D_csdl = float(np.asarray(sim[out.D]).ravel()[0])
+    if MPI.COMM_WORLD.rank == 0:
+        ds = wt.data_store
+        eval_idx, correction = ds.ROM_output_corrections[-1]
+        D_rom = dict(ds.ROM_outputs["D"])[eval_idx]
+        PETSc.Sys.Print("DUAL-CORRECTED-OUTPUT: D_rom {:.12e}, correction {:.3e}, CSDL D {:.12e}".format(
+            D_rom, correction["D"], D_csdl))
+        assert sorted(correction) == ["D", "L", "M_pitch"]
+        assert correction["D"] != 0.0
+        assert D_csdl == pytest.approx(D_rom + correction["D"], rel=1e-14, abs=1e-15)
     if adjoint_bases == 'per_output':
         assert sorted(rom.adjoint_pods) == [0, 1]
         # more directions than one shared basis would hold, W^-1-orthonormal
@@ -1310,8 +1416,14 @@ def test_dual_corrected_adjoint_is_consistent_and_holds_the_adjoint(in_tmp_dir, 
         G = MPI.COMM_WORLD.allreduce(Psi.T @ (w[:, None] * Psi), op=MPI.SUM)
         assert np.max(np.abs(G - np.eye(G.shape[0]))) < 1e-10
     h = 1e-5
-    fd = (wt.solve_forward(a + h)[2]["D"] - wt.solve_forward(a - h)[2]["D"]) / (2 * h)
-    PETSc.Sys.Print("DUAL-CORRECTED-CHECK: dD/dalpha {:.12f}, FD of the ROM solves {:.12f}".format(dD, fd))
+    corrected = []
+    for ah in (a + h, a - h):
+        sim[alpha] = np.array([ah])
+        sim.run()
+        assert rom.adjoint.accepted
+        corrected.append(float(np.asarray(sim[out.D]).ravel()[0]))
+    fd = (corrected[0] - corrected[1]) / (2 * h)
+    PETSc.Sys.Print("DUAL-CORRECTED-CHECK: dD/dalpha {:.12f}, FD of the corrected outputs {:.12f}".format(dD, fd))
     assert abs(fd - dD) < 1e-6 * abs(fd), (fd, dD)
     if MPI.COMM_WORLD.rank == 0:
         accepted = [e for e in wt.data_store.adjoint_space_errors if e[2]]
@@ -1323,6 +1435,154 @@ def test_dual_corrected_adjoint_is_consistent_and_holds_the_adjoint(in_tmp_dir, 
         assert corrections and all(np.isfinite(c[2:]).all() for c in corrections)
         for _, _, first_order, with_fom, _, with_dual in corrections:
             assert abs(first_order + with_fom) < 0.1 * abs(first_order) + 1e-14
+
+
+@pytest.mark.unit_test
+def test_freeze_basis_keeps_the_basis_until_the_next_freeze(in_tmp_dir):
+    """freeze_basis: the local weighted basis is built at the design of the solve after request_freeze and
+    kept, offset included, for the solves at other designs (one basis per trust-region iteration); the next
+    freeze builds it again. Without freeze_basis the basis of every solve is its own design's."""
+    comm = MPI.COMM_WORLD
+    bases = {}
+    for freeze in (True, False):
+        rom = ReducedOrderModel(rb_size=2, basis_mode='local_weighted', eta_threshold=0.0, distance_weighting=None,
+                                freeze_basis=freeze)
+        wt = make_windtunnel("euler", rom=rom, suffix="freeze_basis_{}".format(freeze))
+        for a in ALPHAS[:4]:
+            wt.solve_forward(np.radians(a))
+        assert rom.n_snapshots == 4
+        rom.eta_threshold = np.inf
+        if freeze:
+            rom.request_freeze()
+        seen = []
+        for a in (2.3, 2.05, 2.55):
+            _, converged, _ = wt.solve_forward(np.radians(a))
+            assert converged and wt.last_solve_rom_accepted
+            seen.append(global_array(comm, rom.basis.getDenseArray().copy()))
+        bases[freeze] = seen
+        if freeze:
+            assert all(np.array_equal(V, seen[0]) for V in seen[1:])
+            rom.request_freeze()
+            wt.solve_forward(np.radians(2.55))
+            assert not np.allclose(global_array(comm, rom.basis.getDenseArray()), seen[0])
+    assert not np.allclose(bases[False][2], bases[False][0])
+    # the frozen basis is the basis of the design it was frozen at
+    assert np.allclose(bases[True][0], bases[False][0])
+    with pytest.raises(ValueError, match="freeze_basis needs"):
+        ReducedOrderModel(rb_size=4, adjoint_snapshots='concatenate', freeze_basis=True)
+
+
+@pytest.mark.unit_test
+def test_frozen_test_space_options_are_validated():
+    with pytest.raises(ValueError, match="adjoint_snapshots must be None"):
+        ReducedOrderModel(rb_size=5, test_space='frozen', adjoint_snapshots='separate')
+    with pytest.raises(ValueError, match="goes with test_space='frozen'"):
+        ReducedOrderModel(rb_size=5, adjoint_solve='frozen')
+    with pytest.raises(ValueError, match="request_freeze needs"):
+        ReducedOrderModel(rb_size=5).request_freeze()
+    assert ReducedOrderModel(rb_size=5, test_space='frozen').adjoint_solve == 'frozen'
+
+
+@pytest.mark.verification
+@pytest.mark.parametrize("basis_mode", ["global", "local_weighted"])
+@pytest.mark.parametrize("kind", ["euler", "rans"])
+def test_frozen_test_space_is_exact_at_the_center_and_consistent_away_from_it(in_tmp_dir, kind, basis_mode):
+    """test_space='frozen': frozen at a design the full-order model solved (whose derivative evaluation
+    recorded the full-order adjoints of D and M_pitch), the ROM's corrected outputs and their total
+    derivatives are the full-order ones at that center; away from it the total derivatives are the exact
+    derivatives of the corrected outputs (central differences of the ROM solves, frozen at the same center).
+    With a local weighted basis the weights are about the center."""
+    import csdl_alpha as csdl
+    recorder = csdl.Recorder(inline=False)
+    recorder.start()
+    rom = ReducedOrderModel(rb_size=5, basis_mode=basis_mode, eta_threshold=0.0, min_snapshots=1, test_space='frozen')
+    wt = make_windtunnel(kind, rom=rom, suffix="frozen_" + basis_mode)
+    alpha = csdl.Variable(name='alpha', value=np.array([np.radians(ALPHAS[0])]))
+    alpha.set_as_design_variable()
+    u_vec = wt.evaluate(alpha=alpha)
+    out = wt.postprocessor.evaluate(u_vec, alpha=alpha)
+    out.D.set_as_objective()
+    out.M_pitch.set_as_constraint()
+    recorder.stop()
+    sim = csdl.experimental.JaxSimulator(recorder, gpu=False)
+
+    def values_and_totals():
+        totals = sim.compute_totals()
+        return (np.array([float(np.ravel(sim[out.D])[0]), float(np.ravel(sim[out.M_pitch])[0])]),
+                np.array([float(np.ravel(totals[out.D, alpha])[0]), float(np.ravel(totals[out.M_pitch, alpha])[0])]))
+
+    # full-order snapshots (eta_threshold 0 rejects the ROM); the last design is the center
+    for a in ALPHAS[:3]:
+        sim[alpha] = np.array([np.radians(a)])
+        sim.run()
+        fom_values, fom_totals = values_and_totals()
+    assert not wt.last_solve_rom_accepted
+    center = np.array(wt.previous_solution, copy=True)
+
+    def rom_run(a):
+        """The ROM at a, from the center's solution, without the full-order repeat of the center."""
+        wt.previous_solution = center
+        wt._fom_design = None
+        sim[alpha] = np.array([a])
+        sim.run()
+        assert wt.last_solve_rom_accepted
+
+    rom.eta_threshold = np.inf
+    rom.request_freeze()
+    rom_run(np.radians(ALPHAS[2]))
+    assert rom.adjoint.frozen_dual and sorted(rom.adjoint.duals) == ["D", "M_pitch"]
+    values, totals = values_and_totals()
+    PETSc.Sys.Print("FROZEN-CENTER {} {}: values {} vs full order {}; totals {} vs {}".format(
+        kind, basis_mode, values, fom_values, totals, fom_totals))
+    assert np.allclose(values, fom_values, rtol=1e-9, atol=1e-13)
+    assert np.allclose(totals, fom_totals, rtol=1e-6, atol=1e-10)
+
+    a = np.radians(ALPHAS[4])
+    rom_run(a)
+    values, totals = values_and_totals()
+    h = 1e-5
+    corrected = []
+    for ah in (a + h, a - h):
+        rom_run(ah)
+        corrected.append(np.array([float(np.ravel(sim[out.D])[0]), float(np.ravel(sim[out.M_pitch])[0])]))
+    fd = (corrected[0] - corrected[1]) / (2 * h)
+    PETSc.Sys.Print("FROZEN-CHECK {} {}: totals {} vs central differences {}".format(kind, basis_mode, totals, fd))
+    assert np.allclose(totals, fd, rtol=1e-6), (totals, fd)
+    # still frozen at the center: the corrections are those of the frozen dual, not zero
+    if MPI.COMM_WORLD.rank == 0:
+        _, correction = wt.data_store.ROM_output_corrections[-1]
+        assert sorted(correction) == ["D", "M_pitch"] and correction["D"] != 0.0
+
+
+@pytest.mark.verification
+def test_rom_solutions_are_not_written_when_write_rom_solutions_is_off(in_tmp_dir, monkeypatch):
+    """write_rom_solutions=False: an evaluation whose accepted solution is the ROM's writes no output frame; the
+    full-order ones still do, at their eval_idx."""
+    import csdl_alpha as csdl
+    recorder = csdl.Recorder(inline=False)
+    recorder.start()
+    rom = ReducedOrderModel(rb_size=5, eta_threshold=1e-9)
+    wt = make_windtunnel("euler", rom=rom, suffix="write_rom")
+    wt.write_rom_solutions = False
+    written = []
+    write = wt.sim_model.write_solution_output
+    monkeypatch.setattr(wt.sim_model, "write_solution_output",
+                        lambda counter, solution_array=None: (written.append(counter),
+                                                              write(counter, solution_array=solution_array)))
+    alpha = csdl.Variable(name='alpha', value=np.array([np.radians(ALPHAS[0])]))
+    alpha.set_as_design_variable()
+    u_vec = wt.evaluate(alpha=alpha)
+    wt.postprocessor.evaluate(u_vec, alpha=alpha).D.set_as_objective()
+    recorder.stop()
+    sim = csdl.experimental.JaxSimulator(recorder, gpu=False)
+    evaluations = []
+    for a in ALPHAS:
+        sim[alpha] = np.array([np.radians(a)])
+        idx = wt.eval_idx
+        sim.run()
+        evaluations.append((idx, wt.last_solve_rom_accepted))
+    assert any(rom for _, rom in evaluations) and not all(rom for _, rom in evaluations)
+    assert written == [idx for idx, rom in evaluations if not rom]
 
 
 @pytest.mark.verification

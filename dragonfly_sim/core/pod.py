@@ -386,6 +386,9 @@ class PODBasis:
     # singular values of the centred, weighted snapshots below this fraction of
     # the largest carry no direction and give no basis vector
     BASIS_RANK_RTOL = 1e-12
+    # a centred column below this times its uncentred size (and the offset's share of it) is one the offset
+    # cancels: the warm start's own snapshot, zero up to roundoff
+    CENTRED_COLUMN_RTOL = 1e-10
 
     def __init__(self, comm, n_dofs, basis_mode='global', subtract_mean=None,
                  mean_weighting='snapshot_weights', IP_matrix=None, max_rank=None, qr_rank_tol=1e-10,
@@ -667,7 +670,15 @@ class PODBasis:
                 self.mean = U.createVecLeft()
                 self.mean.getArray()[:] = U.getDenseArray() @ g_c
                 self.mean.assemble()
-                K = K - np.outer(g_c, (weight_mat * state[:, None]).sum(axis=0))
+                centred_weights = (weight_mat * state[:, None]).sum(axis=0)
+                scale = np.linalg.norm(K, axis=0) + np.linalg.norm(g_c) * centred_weights
+                K = K - np.outer(g_c, centred_weights)
+                # the column the offset cancels (a warm start that is a snapshot) keeps a roundoff residue,
+                # which the rank cut below, relative to the largest singular value, takes for a direction
+                # when the other columns' weights are small (cubic weights far from the query point): it is
+                # dropped relative to its own size
+                vanished = np.linalg.norm(K, axis=0) <= self.CENTRED_COLUMN_RTOL * scale
+                K[:, vanished] = 0.0
 
             # SVD of K: small (rank x num_cols), replicated, so dense scipy
             t0 = perf_counter()

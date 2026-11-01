@@ -834,6 +834,27 @@ class TestPODCentering:
             Xc = (X - u0[:, None]) * weights[None, :]
             assert np.abs(Xc - self._projector(V, w_dofs) @ Xc).max() < 1e-10 * np.abs(Xc).max()
 
+    @pytest.mark.unit_test
+    def test_snapshot_warm_start_drops_the_vanishing_direction_under_small_weights(self):
+        """As above with the other snapshots' weights 1e-6 of the warm start's (cubic weights near the
+        query point): the roundoff left of the vanishing column is not a direction."""
+        with self._case('warm_start') as (pod, template, X, w_dofs):
+            u0 = X[:, 2].copy()
+            weights = np.full(self.N_SNAPSHOTS, 1e-6)
+            weights[2] = 1.0
+            rstart, rend = template.getOwnershipRange()
+            u0_vec = template.duplicate()
+            set_petsc_vec_array(u0_vec, u0[rstart:rend])
+            try:
+                pod.construct_basis(rb_size=self.N_SNAPSHOTS, layout_vec=template, warm_start=u0_vec,
+                                    snapshot_weights=weights)
+            finally:
+                u0_vec.destroy()
+            V = np.vstack(MPI.COMM_WORLD.allgather(pod.basis.getDenseArray().copy()))
+            assert V.shape[1] == self.N_SNAPSHOTS - 1
+            Xc = X - u0[:, None]
+            assert np.abs(Xc - self._projector(V, w_dofs) @ Xc).max() < 1e-8 * np.abs(Xc).max()
+
     @pytest.mark.verification
     def test_untruncated_affine_hull_does_not_depend_on_the_offset(self):
         """Untruncated, mean-centred and warm-start-centred (on a snapshot)
