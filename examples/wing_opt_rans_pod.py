@@ -103,6 +103,9 @@ if __name__ == '__main__':
     parser.add_argument("--max-iterations", type=int, default=100, help="trust-region iterations (default 100)")
     parser.add_argument("--max-full-order", type=int, default=150,
                         help="full-order solves of new designs, at most (default 150)")
+    parser.add_argument("--write-every-iteration", action="store_true",
+                        help="write the DataStore (Result_dicts/TRRB_<suffix>.npy) after every trust-region "
+                             "iteration, replacing the previous one, instead of only at the end")
     args = parser.parse_args()
 
     # The Simple Transonic Wing's L3 grid: 12 structured blocks in CGNS, read with PyVista and merged
@@ -409,11 +412,14 @@ if __name__ == '__main__':
     PETSc.Sys.Print("Defining optimization problem...")
     prob = CSDLAlphaProblem(problem_name='shape_opt', simulator=sim)
 
-    # The error indicator is the frozen ROM's residual (indicator='residual'), which needs no per-output estimates
+    # The error indicator is the frozen ROM's residual (indicator='residual'), which needs no per-output estimates.
+    # With --write-every-iteration the DataStore file is rewritten after every iteration, not only at the end
+    data_store_file = "TRRB_{}.npy".format(csdl_flow_model.filename_suffix)
     trrb = TrustRegionReducedBasis(prob, csdl_flow_model, indicator='residual', delta0=args.delta0,
                                    constraints='sqp', acceptance='ratio',
                                    max_subproblem_iterations=args.subproblem_maxiter,
                                    max_iterations=args.max_iterations, max_full_order=args.max_full_order,
+                                   data_store_file=data_store_file if args.write_every_iteration else None,
                                    printer=PETSc.Sys.Print)
 
     PETSc.Sys.Print("Solving optimization problem (TR-RB, frozen {} ROM of {} vectors, {} Jacobian)...".format(
@@ -439,5 +445,4 @@ if __name__ == '__main__':
     finally:
         # the DataStore also when the run stops early
         if mesh_from_file.comm.Get_rank() == 0:
-            csdl_flow_model.data_store.write_store_to_numpy_file(
-                save_filename="TRRB_{}.npy".format(csdl_flow_model.filename_suffix))
+            csdl_flow_model.data_store.write_store_to_numpy_file(save_filename=data_store_file)

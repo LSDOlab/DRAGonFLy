@@ -335,9 +335,10 @@ class DG_windtunnel_model(csdl.experimental.CustomImplicitOperation):
                                    deformation=self.shape_parameterized and self.write_mesh_deformation)
 
         if self.shape_parameterized:
-            # The JAX-based IDWarp implementation as mesh warper
+            # The JAX-based IDWarp implementation as mesh warper. err_tol is its kd-tree pruning tolerance
+            # (IDWarp_jax); it is fixed when the warp is built, in the constructor, so it has to be passed here
             self.mesh_warper = IDWarp_jax(self.mesh, wall_meshtag_val=self.WALL_TAG,
-                                          anchor_meshtag_vals=(self.FARFIELD_TAG,))
+                                          anchor_meshtag_vals=(self.FARFIELD_TAG,), err_tol=1e-5)
 
             PETSc.Sys.Print("Initialized mesh warping object")
 

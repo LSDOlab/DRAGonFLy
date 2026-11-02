@@ -174,6 +174,8 @@ class TrustRegionReducedBasis(TrustRegionModelManagement):
         constraints='sqp': the initial and largest box radius r_k (inf-norm, scaled design variables).
     merit_weight, ftol : float
         constraints='sqp': the L1 merit's constraint weight, and SLSQP's ftol (also the stopping test).
+    data_store_file : str or None
+        Write the DataStore after every iteration, as TrustRegionModelManagement.
     """
 
     MAX_AL_UPDATES = 5
@@ -185,11 +187,12 @@ class TrustRegionReducedBasis(TrustRegionModelManagement):
                  feasibility_tol=1e-5, penalty0=10.0, max_subproblem_iterations=20, max_armijo=20,
                  max_iterations=40, max_full_order=80, delta_min=1e-8, delta_max=1.0, calibration_window=3,
                  active_eps=1e-3, constraints='augmented_lagrangian', acceptance=None, eta_accept=0.1,
-                 radius0=0.25, radius_max=2.0, merit_weight=10.0, ftol=1e-6,
+                 radius0=0.25, radius_max=2.0, merit_weight=10.0, ftol=1e-6, data_store_file=None,
                  printer=print):
         super().__init__(prob, windtunnel, model='rom', delta0=delta0, delta_max=delta_max, delta_min=delta_min,
                          eta_accept=eta_accept, merit_weight=merit_weight, subproblem_maxiter=max_subproblem_iterations,
-                         ftol=ftol, max_iterations=max_iterations, max_full_order=max_full_order, printer=printer)
+                         ftol=ftol, max_iterations=max_iterations, max_full_order=max_full_order,
+                         data_store_file=data_store_file, printer=printer)
         if indicator not in ('ncd', 'residual'):
             raise ValueError("indicator must be 'ncd' or 'residual', got {!r}".format(indicator))
         if indicator == 'ncd' and (output_names is None or output_scales is None):
@@ -753,9 +756,7 @@ class TrustRegionReducedBasis(TrustRegionModelManagement):
         it = dict(base, eval_idx=self.windtunnel.eval_idx - 1, kind=kind, accepted=accepted,
                   full_order_total=self.n_full_order)
         it.update(values)
-        self.iterations.append(it)
-        if self.windtunnel.mesh.mesh.comm.Get_rank() == 0:
-            self.windtunnel.data_store.trust_region_iterations += [dict(it)]
+        self._store_iteration(it)
 
     def summary(self):
         """One line per iteration."""

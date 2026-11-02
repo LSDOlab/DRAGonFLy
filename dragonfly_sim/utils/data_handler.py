@@ -274,11 +274,17 @@ class DataStore():
 
     def write_store_to_numpy_file(self, save_folder="Result_dicts", save_filename="POD_deployment.npy"):
         save_location = save_folder + "/" + save_filename
+        if not save_location.endswith(".npy"):
+            save_location += ".npy"         # as np.save names it
         os.makedirs(save_folder, exist_ok=True)
         # create dictionary with all data
         data_dict = self.compile_store_in_dict()
-        # save data_dict to location
-        np.save(save_location, data_dict)
+        # save data_dict to location: written next to it and then renamed over it, so that a file written
+        # repeatedly during a run (e.g. after every trust-region iteration) is never left half-written
+        partial = os.path.join(save_folder, "." + os.path.basename(save_location) + ".partial")
+        with open(partial, "wb") as fh:
+            np.save(fh, data_dict)
+        os.replace(partial, save_location)
         print("Saved data dictionary to {}".format(save_location))
 
     def open_dict_and_import_data(self, file_folder="Result_dicts", filename="POD_deployment.npy"):

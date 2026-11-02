@@ -58,11 +58,16 @@ class TrustRegionModelManagement:
     max_iterations, max_full_order : int
         Bounds on the iterations and on the full-order solves (centers, trial points and the
         subproblems' full-order evaluations).
+    data_store_file : str or None
+        If given, the windtunnel's DataStore is written to Result_dicts/<data_store_file>
+        (DataStore.write_store_to_numpy_file) after every iteration, replacing the previous iteration's
+        file, so that a run stopped early leaves its data up to the last finished iteration. None (the
+        default): the iterations are only recorded in the DataStore.
     """
 
     def __init__(self, prob, windtunnel, model='rom', delta0=0.25, delta_max=2.0, delta_min=1e-4, eta_accept=0.1,
                  eta_shrink=0.25, eta_expand=0.75, merit_weight=10.0, subproblem_maxiter=20, ftol=1e-6,
-                 max_iterations=50, max_full_order=300, printer=print):
+                 max_iterations=50, max_full_order=300, data_store_file=None, printer=print):
         if model not in ('rom', 'fom'):
             raise ValueError("model must be 'rom' or 'fom', got {!r}".format(model))
         if model == 'rom' and windtunnel.reduced_order_model is None:
@@ -82,6 +87,7 @@ class TrustRegionModelManagement:
         self.ftol = ftol
         self.max_iterations = max_iterations
         self.max_full_order = max_full_order
+        self.data_store_file = data_store_file
         self.printer = printer
         # per iteration: dict (see _record)
         self.iterations = []
@@ -340,9 +346,18 @@ class TrustRegionModelManagement:
                   model_merit=phi_model, trial_merit=phi_t, pred=pred, ared=ared, rho=rho, accepted=accepted,
                   step=step, model=kind, evaluations=evals, full_order_evaluations=evals_fom,
                   full_order_total=self.n_full_order, message=message)
+        self._store_iteration(it)
+
+    def _store_iteration(self, it):
+        """Keep the record `it` of a finished iteration, and add it to the DataStore (rank 0), which is then
+        written to data_store_file if one is given, replacing the last iteration's file."""
         self.iterations.append(it)
-        if self.windtunnel.mesh.mesh.comm.Get_rank() == 0:
-            self.windtunnel.data_store.trust_region_iterations += [dict(it)]
+        if self.windtunnel.mesh.mesh.comm.Get_rank() != 0:
+            return
+        data_store = self.windtunnel.data_store
+        data_store.trust_region_iterations += [dict(it)]
+        if self.data_store_file is not None:
+            data_store.write_store_to_numpy_file(save_filename=self.data_store_file)
 
     def summary(self):
         """One line per iteration."""
