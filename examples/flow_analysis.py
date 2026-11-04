@@ -91,7 +91,7 @@ def build_model(dolfinx_mesh, model="sa", mach=0.5, alpha_deg=0.0, Re=6e6, geome
                 limiter_eps=1e-2, jacobian_mode="compact_pc", ff_beta=0.5, ff_relax_length=50.0,
                 inner_bdry_function=None, euler_muscl=False, wall_tags=None, symmetry_tags=None,
                 preconditioning=None, preconditioning_floor=1.0, shock_capturing=None, fluid="air",
-                water_speed=5.0, poly_order=0):
+                water_speed=5.0, poly_order=0, moving_mesh=False, symmetry_plane=True):
     """
     Build a ready-to-solve model on `dolfinx_mesh`.
 
@@ -118,10 +118,14 @@ def build_model(dolfinx_mesh, model="sa", mach=0.5, alpha_deg=0.0, Re=6e6, geome
     (core/shock_capturing.py).
 
     The body (inner boundary) is the model's wall: slip for Euler, adiabatic
-    no-slip otherwise. In 3D the y = 0 plane is a symmetry (slip) plane.
+    no-slip otherwise. In 3D the y = 0 plane is a symmetry (slip) plane (a half
+    wing) unless symmetry_tags names the symmetry planes, or symmetry_plane=False
+    (a full body: every boundary but the wall is far field).
     poly_order: the DG degree of the viscous models (p >= 1: DG with interior
     penalty, see core/RANS_model.py; muscl is then ignored). The quadrature
-    degree is raised to at least 2p + 1.
+    degree is raised to at least 2p + 1. moving_mesh writes the residual on a
+    moving mesh (CompressibleEulerModel.enable_mesh_motion; core/body_motion.py
+    moves it).
     Returns (mesh_obj, model, transverse); transverse is the
     TransverseFarfield for "riemann2" (attach it to the time integrator),
     else None.
@@ -166,7 +170,7 @@ def build_model(dolfinx_mesh, model="sa", mach=0.5, alpha_deg=0.0, Re=6e6, geome
     sym_tags = []
     outer = ~inner_mask
     sym = mesh_obj.symmetry_facet_mask  # the mesh's symmetry tags, if used
-    if sym is None and dolfinx_mesh.topology.dim == 3:
+    if sym is None and dolfinx_mesh.topology.dim == 3 and symmetry_plane:
         sym = (mesh_obj.bdry_midpoints[:, 1] <= 1e-6) & ~inner_mask
     if sym is not None:
         sym_tags = [(sym, SYMMETRY_TAG)]
@@ -180,6 +184,8 @@ def build_model(dolfinx_mesh, model="sa", mach=0.5, alpha_deg=0.0, Re=6e6, geome
     if model == "euler" and euler_muscl:
         install_euler_muscl(flow, limiter, limiter_eps)
     flow.define_trial_testfunctions()
+    if moving_mesh:
+        flow.enable_mesh_motion()
     flow.compute_initial_conditions_from_farfield()
     flow.interpolate_solution_vector()
     transverse = None
@@ -199,7 +205,8 @@ class ForceCoefficients:
     c_l, c_d, the friction part of c_d, and c_m from the model's wall force
     density (pressure, plus viscous traction for a viscous model). 2D:
     S_ref = c_ref = 1. 3D (half wing, y spanwise): as DG_postprocessor, S_ref
-    is half the wall's z-projected area and c_ref = S_ref / span.
+    is half the wall's z-projected area and c_ref = S_ref / span. The moment
+    reference point can follow a moving body (set_centre).
     """
 
     def __init__(self, model, mesh_obj, alpha_deg, wall_tag=WALL_TAG, aero_centre=None):
@@ -226,13 +233,18 @@ class ForceCoefficients:
         u = model.u_vec
         force = model.wall_force_density(u, n)
         friction = force - model.thermo(u).p * n
-        lever = ufl.SpatialCoordinate(msh) - ufl.as_vector(list(centre))
+        self.centre = dolfinx.fem.Constant(msh, np.array(centre, dtype=np.float64))
+        lever = ufl.SpatialCoordinate(msh) - self.centre
         qS = q_inf * S_ref
         self.S_ref, self.c_ref = S_ref, c_ref
         self._forms = [dolfinx.fem.form(ufl.dot(force, ufl.as_vector(lift_vec)) / qS * ds),
                        dolfinx.fem.form(ufl.dot(force, ufl.as_vector(drag_vec)) / qS * ds),
                        dolfinx.fem.form(ufl.dot(friction, ufl.as_vector(drag_vec)) / qS * ds),
                        dolfinx.fem.form(moment_integrand(force, lever, dim) / (qS * c_ref) * ds)]
+
+    def set_centre(self, centre):
+        """Move the moment reference point (e.g. with the body)."""
+        self.centre.value[:] = centre
 
     def __call__(self):
         """(c_l, c_d, c_d_friction, c_m) of the current state. Collective."""

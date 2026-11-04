@@ -137,7 +137,9 @@ class BarterDarmofalAV:
 
         # the viscosity: blend towards first-order dissipation on the cell values
         h = m.mesh_obj.h_min
-        lam = 0.5 * (m._lambda_max_expr(U('+'), h('+')) + m._lambda_max_expr(U('-'), h('-')))
+        w = m.grid_velocity
+        lam = 0.5 * (m._lambda_max_expr(U('+'), h('+'), None if w is None else w('+'))
+                     + m._lambda_max_expr(U('-'), h('-'), None if w is None else w('-')))
         coeff = self.C * lam * ufl.avg(sigma)
         if self.directional:
             if G is None:

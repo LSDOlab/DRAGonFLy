@@ -312,19 +312,20 @@ class Mesh():
             self._dof_to_node_map = perm
         return self._dof_to_node_map
 
-    def nodal_function(self, node_values):
+    def nodal_function(self, node_values, out=None):
         """An (n_owned_nodes, gdim) nodal array as a Function on coordinate_space.
 
-        The Function is reused between calls.
+        Written into ``out`` if given, else into a Function reused between calls.
         """
         V = self.coordinate_space
-        if self._nodal_function is None:
-            self._nodal_function = dolfinx.fem.Function(V)
+        if out is None:
+            if self._nodal_function is None:
+                self._nodal_function = dolfinx.fem.Function(V)
+            out = self._nodal_function
         n_local_dofs = V.dofmap.index_map.size_local * V.dofmap.index_map_bs
-        self._nodal_function.x.array[:n_local_dofs] = \
-            (self.dof_to_node_map @ node_values).reshape(-1)
-        self._nodal_function.x.scatter_forward()
-        return self._nodal_function
+        out.x.array[:n_local_dofs] = (self.dof_to_node_map @ node_values).reshape(-1)
+        out.x.scatter_forward()
+        return out
 
     # ==================================================================
     # Deformation
@@ -370,7 +371,7 @@ class Mesh():
                 and bool(np.array_equal(stored, design)))
         return bool(self.mesh.comm.allreduce(same, op=MPI.MIN))
 
-    def apply_node_motions(self, node_motions, design=None):
+    def apply_node_motions(self, node_motions, design=None, quiet=False):
         """Move the mesh to baseline + ``node_motions`` and re-check its cells.
 
         ``node_motions`` is (n_owned_nodes, gdim) in geometry-node order.
@@ -385,6 +386,9 @@ class Mesh():
         returns the current ``is_valid`` without touching the mesh, so the
         deformation is built once per design. A different ``design`` resets
         the nodes and warps again. ``design=None`` always warps.
+
+        ``quiet`` (the per-time-step motion of core/body_motion.py) checks
+        only that no cell is inverted, without the quality report.
         """
         if design is not None:
             design = np.array(design, dtype=np.float64, copy=True).ravel()
@@ -407,7 +411,10 @@ class Mesh():
         geom_vec.scatter_forward()
         x[:] = geom_vec.array.reshape(-1, 3)
 
-        self._update_quality()
+        if quiet:
+            self._check_valid()
+        else:
+            self._update_quality()
         self._notify_geometry_listeners()
         self._deformation_design = design
         return self.is_valid
@@ -438,6 +445,26 @@ class Mesh():
             q[name] = dolfinx.fem.Function(V0)
         self._quality = q
         return q
+
+    def _check_valid(self):
+        """Set is_valid (no cell's Jacobian determinant changed sign from the
+        baseline mesh's, nor vanished) and return it, printing nothing unless
+        a cell is inverted. Collective."""
+        q = self._setup_quality()
+        if "jac_sign0" not in q:
+            x = self.mesh.geometry.x.copy()
+            self.mesh.geometry.x[:] = self.baseline_nodes
+            q["jac"].interpolate(q["jac_expr"])
+            q["jac_sign0"] = np.sign(q["jac"].x.array)
+            self.mesh.geometry.x[:] = x
+        q["jac"].interpolate(q["jac_expr"])
+        a = q["jac"].x.array * q["jac_sign0"]
+        min_jac = self.mesh.comm.allreduce(a.min() if a.size else np.inf, op=MPI.MIN)
+        self.is_valid = bool(min_jac > 0)
+        if not self.is_valid:
+            PETSc.Sys.Print("WARNING: Mesh has inverted or zero-volume cells (min Jacobian determinant "
+                            "{:.3e})!".format(min_jac))
+        return self.is_valid
 
     def _update_quality(self):
         """Evaluate, print and (if configured) write the quality metrics; set is_valid."""

@@ -19,6 +19,11 @@ Low-Mach preconditioning (Weiss & Smith) enters in two places only:
 (dissipation_jump; the second line is exact to first order in the jump).
 At U_r = c both reduce to the unpreconditioned flux, which is what a state
 without inv_Ur2 evaluates.
+
+On a moving mesh the states carry the facet's velocity w (ThermoState.w):
+their physical flux is then F - U (x) w and every wave speed is taken with
+the relative velocity u - w, which turns each flux into its ALE form
+without any change here; the dissipation jump stays the one of U.
 """
 import ufl
 
@@ -45,9 +50,10 @@ def wave_speeds(th, n):
     """
     The signed extremal wave speeds (u'_n - c', u'_n + c') of the
     (preconditioned) normal flux Jacobian, with n the normal they are taken
-    along. Without preconditioning these are u.n -+ c.
+    along. Without preconditioning these are u.n -+ c. On a moving mesh u is
+    the velocity relative to it.
     """
-    un = ufl.dot(th.u, n)
+    un = ufl.dot(th.u_rel, n)
     if th.inv_Ur2 is None:
         c = ufl.sqrt(sound_speed_squared(th))
         return un - c, un + c
@@ -59,8 +65,9 @@ def wave_speeds(th, n):
 
 def spectral_radius(th):
     """The largest wave speed |u| + c (|u'| + c' with preconditioning), the
-    inverse time scale of the pseudo-time step at h = 1."""
-    speed = ufl.sqrt(ufl.dot(th.u, th.u))
+    inverse time scale of the pseudo-time step at h = 1 (u relative to the
+    mesh)."""
+    speed = ufl.sqrt(ufl.dot(th.u_rel, th.u_rel))
     if th.inv_Ur2 is None:
         return speed + ufl.sqrt(sound_speed_squared(th))
     a = 0.5 * (1.0 - th.inv_c2 / th.inv_Ur2)
@@ -81,11 +88,13 @@ def dissipation_jump(th_p, th_m):
     return dU + coeff * (th_m.p - th_p.p) * w
 
 
-def slip_wall_state(V, n, n_mean):
-    """The mirror state of V: normal velocity reversed, everything else kept."""
+def slip_wall_state(V, n, n_mean, w=None):
+    """The mirror state of V: normal velocity reversed (relative to the wall's
+    velocity w on a moving mesh), everything else kept."""
     d = n_mean - 2
     u = ufl.as_vector([V[1 + i] for i in range(d)])
-    u_ref = u - 2.0 * ufl.dot(u, n) * n
+    un = ufl.dot(u, n) if w is None else ufl.dot(u - w, n)
+    u_ref = u - 2.0 * un * n
     return ufl.as_vector([V[0]] + [u_ref[i] for i in range(d)] + [V[1 + d]])
 
 
@@ -170,6 +179,8 @@ def hllc_flux(th_p, th_m, n):
     """
     if th_p.inv_Ur2 is not None:
         raise NotImplementedError("hllc_flux has no preconditioned form; use hll_flux or llf_flux")
+    if th_p.w is not None:
+        raise NotImplementedError("hllc_flux has no moving-mesh form; use hll_flux or llf_flux")
     sl_p, sr_p = wave_speeds(th_p, n)
     sl_m, sr_m = wave_speeds(th_m, n)
     SL = ufl.min_value(sl_p, sl_m)

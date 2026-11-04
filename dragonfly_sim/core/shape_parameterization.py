@@ -225,6 +225,11 @@ class WallFFD:
 
         self._probe_points = []
 
+    @property
+    def centroid(self):
+        """The centroid of the (baseline) block: the mean of its corners."""
+        return self.corners.reshape(-1, self.dim).mean(axis=0)
+
     def _project(self, points):
         if points.shape[0] == 0:
             return np.zeros((0, self.dim))

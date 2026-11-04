@@ -45,6 +45,9 @@ class ThermoState:
     The state V = (p', u, T, phi) of one evaluation point (a cell, or one
     facet trace) with its thermodynamics. Every field is a UFL expression.
     inv_Ur2 is 1/U_r^2 of the low-Mach preconditioning, None without it.
+    w is the velocity of the mesh at the point (arbitrary Lagrangian-Eulerian
+    form, core/body_motion.py), None on a fixed mesh: the flux is then the one
+    through a face moving with w, F - U (x) w, and the waves travel at u - w.
     """
     p: object
     u: object
@@ -59,6 +62,12 @@ class ThermoState:
     inv_c2: object
     inv_Ur2: object = None
     material: object = field(default=None, repr=False)
+    w: object = None
+
+    @property
+    def u_rel(self):
+        """The velocity relative to the mesh, u - w (u on a fixed mesh)."""
+        return self.u if self.w is None else self.u - self.w
 
     @property
     def H(self):
@@ -74,12 +83,13 @@ class ThermoState:
 
     def flux(self):
         """The inviscid flux tensor, (n_state, dim): rho u, rho u (x) u + p' I,
-        rho u H, rho u phi."""
+        rho u H, rho u phi; less U (x) w on a moving mesh."""
         rho, u, d = self.rho, self.u, self.u.ufl_shape[0]
         I = ufl.Identity(d)
         rows = [rho * u] + [rho * u[i] * u + self.p * I[i, :] for i in range(d)]
         rows += [rho * self.H * u] + [rho * s * u for s in self.phi]
-        return ufl.as_tensor(rows)
+        F = ufl.as_tensor(rows)
+        return F if self.w is None else F - ufl.outer(self.U, self.w)
 
     def normal_flux(self, n):
         return ufl.dot(self.flux(), n)

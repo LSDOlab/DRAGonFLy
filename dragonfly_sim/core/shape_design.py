@@ -67,11 +67,15 @@ class FFDShapeParameterization:
     margin, projection_newton_tol : see ``WallFFD``.
     inner_bdry_rel_tol, inner_bdry_overset_margin : containment test of
         ``inner_boundary_function``.
+    body_motion : optional core/body_motion.py:PrescribedMotion, a rigid-body
+        motion of the deformed wall for time-dependent runs; bound to this
+        block at ``setup`` (its rotation centre defaults to the block's
+        centroid).
     """
 
     def __init__(self, shape, degree=2, block_corner_list=None, layers=(), margin=1e-4,
                  projection_newton_tol=1e-12, inner_bdry_rel_tol=1e-6,
-                 inner_bdry_overset_margin=1e-4):
+                 inner_bdry_overset_margin=1e-4, body_motion=None):
         self.shape = tuple(int(n) for n in shape)
         self.degree = degree
         self.block_corner_list = block_corner_list
@@ -85,6 +89,7 @@ class FFDShapeParameterization:
         self.projection_newton_tol = projection_newton_tol
         self.inner_bdry_rel_tol = inner_bdry_rel_tol
         self.inner_bdry_overset_margin = inner_bdry_overset_margin
+        self.body_motion = body_motion
 
         self.ffd = None
         self._wall_facets = None
@@ -119,6 +124,8 @@ class FFDShapeParameterization:
         self._wall_facets = wall_facets
         for layer in self.layers:
             layer.setup(self)
+        if self.body_motion is not None:
+            self.body_motion.bind(self.ffd)
 
     @property
     def dim(self):

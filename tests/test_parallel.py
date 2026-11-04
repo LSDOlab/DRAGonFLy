@@ -26,7 +26,7 @@ LAUNCHES = {
                               "test_shock_capturing.py"],
     "caches_and_moments": ["test_mesh_deformation_cache.py", "test_incoming_state_converged.py",
                            "test_meshwarping_cache.py", "test_moments.py", "test_adjoint_reuse.py",
-                           "test_boundary_tags.py"],
+                           "test_boundary_tags.py", "test_body_motion.py"],
 }
 TIMEOUT = 900
 

@@ -276,15 +276,19 @@ class CompressibleRANSModel:
     # No-slip wall
     # ------------------------------------------------------------------
     def noslip_wall_state(self, U):
-        d = self.flow.dimensions
-        return self.flow.with_aux(concat_state(ufl.as_vector([U[0]] + [0.0] * d + [U[1 + d]]),
+        """The wall state: the interior p' and T, the wall's velocity (zero,
+        or the mesh velocity on a moving mesh) and the wall scalars."""
+        d, w = self.flow.dimensions, self.flow.grid_velocity
+        u_w = [0.0] * d if w is None else [w[i] for i in range(d)]
+        return self.flow.with_aux(concat_state(ufl.as_vector([U[0]] + u_w + [U[1 + d]]),
                                                self._boundary_scalars("wall", U, None)), U)
 
     def define_noslip_wall_bc(self, meshtag):
         """
         Adiabatic no-slip wall. The inviscid flux is the exact flux of the
         wall state, (0, p' n, 0, 0): no mass, energy or scalar flux through
-        the wall, the interior pressure on it. Conduction is dropped from the
+        the wall, the interior pressure on it (on a moving wall, whose
+        velocity the fluid takes, (0, p' n, p' w.n, 0): the pressure's work). Conduction is dropped from the
         viscous flux, which is the q.n = 0 condition.
         """
         flow = self.flow

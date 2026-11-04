@@ -136,6 +136,8 @@ class CompressibleEulerModel():
         self.boundary_scalars = None
         self.freestream_scalars = None
         self.wall_bc = None
+        # the mesh velocity (CG1) on a moving mesh, None on a fixed one (enable_mesh_motion)
+        self.grid_velocity = None
         self.wall_traction = None
         self.time_scale_terms = []
         self.preconditioning_speeds = []
@@ -469,11 +471,14 @@ class CompressibleEulerModel():
         """The mean-flow slice (p', u, T) of a state expression."""
         return mean_flow(U, self.n_mean)
 
-    def thermo(self, V):
+    def thermo(self, V, w=None):
         """The ThermoState (core/materials.py) of a state expression V: the
         conserved state, the physical flux and the material derivatives. V
-        may be the mean flow alone."""
-        return thermo(self.material, V, self.n_mean, min(self.n_extra, V.ufl_shape[0] - self.n_mean))
+        may be the mean flow alone. w: the mesh velocity at the point, which
+        makes the flux and the waves those relative to the moving mesh."""
+        th = thermo(self.material, V, self.n_mean, min(self.n_extra, V.ufl_shape[0] - self.n_mean))
+        th.w = w
+        return th
 
     def embed(self, x):
         """A vector (or the rows of a tensor) over the conserved components,
@@ -512,7 +517,7 @@ class CompressibleEulerModel():
         inc = ufl.dot(ufl.diff(self.conserved(Vv), Vv), dV)
         if not self.preconditioning:
             return inc
-        th = self.low_mach_preconditioning(self.thermo(V_old), V_old, self.mesh_obj.h_min)
+        th = self.low_mach_preconditioning(self.thermo(V_old, self.grid_velocity), V_old, self.mesh_obj.h_min)
         d = self.dimensions
         w = ufl.as_vector([1.0] + [th.u[i] for i in range(d)] + [th.H] + list(th.phi))
         return inc + (th.inv_Ur2 - th.inv_c2) * dV[0] * self.embed(w)
@@ -524,6 +529,7 @@ class CompressibleEulerModel():
 
             1/U_r^2 = max(1/c^2, 1/max(|u|, eps u_inf, sqrt(|dp'|/rho), cutoffs)^2),
 
+        (u relative to the mesh on a moving one)
         with smooth maxima (kinks stall Newton). The 1/c^2 floor caps U_r at
         c, so the preconditioning switches itself off wherever the flow is
         sonic or faster; for an incompressible fluid (1/c^2 = 0) it is
@@ -534,7 +540,7 @@ class CompressibleEulerModel():
         """
         if not self.preconditioning:
             return th
-        Ur2 = smooth_max(ufl.dot(th.u, th.u), (self.preconditioning_floor * self.u_ref_const) ** 2)
+        Ur2 = smooth_max(ufl.dot(th.u_rel, th.u_rel), (self.preconditioning_floor * self.u_ref_const) ** 2)
         if pressure_jump is not None:
             Ur2 = smooth_max(Ur2, ufl.sqrt(pressure_jump ** 2 + 1e-24) / th.rho)
         for term in self.preconditioning_speeds:
@@ -542,10 +548,10 @@ class CompressibleEulerModel():
         th.inv_Ur2 = smooth_max(th.inv_c2, 1.0 / Ur2)
         return th
 
-    def _flux_states(self, V_a, V_b, h):
+    def _flux_states(self, V_a, V_b, h, w=None):
         """ThermoStates of a facet's two states, preconditioned with the
-        facet's pressure jump."""
-        th_a, th_b = self.thermo(V_a), self.thermo(V_b)
+        facet's pressure jump; w is the facet's velocity on a moving mesh."""
+        th_a, th_b = self.thermo(V_a, w), self.thermo(V_b, w)
         dp = V_a[0] - V_b[0]
         return (self.low_mach_preconditioning(th_a, V_a, h, dp),
                 self.low_mach_preconditioning(th_b, V_b, h, dp))
@@ -581,14 +587,14 @@ class CompressibleEulerModel():
         wall). The boundary_terms plug-ins add their terms (e.g. viscous
         fluxes) to the same integral.
         """
-        n, h = self.mesh_obj.n, self.mesh_obj.h_min
+        n, h, w = self.mesh_obj.n, self.mesh_obj.h_min, self.grid_velocity
         U_b = self.with_aux(U_b)
         if inviscid_flux == "llf":
-            f = boundary_flux(*self._flux_states(self.u_vec, U_b, h), n)
+            f = boundary_flux(*self._flux_states(self.u_vec, U_b, h, w), n)
         elif inviscid_flux == "numerical":
-            f = self.flux_function(*self._flux_states(self.u_vec, U_b, h), n)
+            f = self.flux_function(*self._flux_states(self.u_vec, U_b, h, w), n)
         elif inviscid_flux == "exact":
-            f = self.thermo(U_b).normal_flux(n)
+            f = self.thermo(U_b, w).normal_flux(n)
         else:
             raise ValueError("inviscid_flux must be 'llf', 'numerical' or 'exact'")
         F = ufl.inner(self.embed(f), self.v_vec) * self.forms.ds(meshtag)
@@ -601,7 +607,7 @@ class CompressibleEulerModel():
 
     def define_slipwall_bc(self, meshtag):
         # define the weak form term for natural enforcement of the slip wall boundary condition
-        u_wall = slip_wall_state(self.mean_flow(self.u_vec), self.mesh_obj.n, self.n_mean)
+        u_wall = slip_wall_state(self.mean_flow(self.u_vec), self.mesh_obj.n, self.n_mean, self.grid_velocity)
         self.add_boundary_condition(meshtag, self._boundary_state(u_wall, "slip"), "slip")
 
     def define_wall_bc(self, meshtag):
@@ -663,21 +669,23 @@ class CompressibleEulerModel():
     def compute_interior_integral_terms(self):
         U, v, n = self.u_vec, self.v_vec, self.mesh_obj.n
         # the volume term vanishes at p = 0 (grad v = 0); kept for the form's generality
-        F = -ufl.inner(ufl.grad(v), self.embed(self.thermo(U).flux())) * self.forms.dx
+        F = -ufl.inner(ufl.grad(v), self.embed(self.thermo(U, self.grid_velocity).flux())) * self.forms.dx
         U_p, U_m = self.face_traces() if self.face_traces is not None else (U('+'), U('-'))
-        h = self.mesh_obj.h_min
-        F_num = self.flux_function(*self._flux_states(U_p, U_m, 0.5 * (h('+') + h('-'))), n('+'))
+        h, w = self.mesh_obj.h_min, self.grid_velocity
+        F_num = self.flux_function(*self._flux_states(U_p, U_m, 0.5 * (h('+') + h('-')),
+                                                      None if w is None else w('+')), n('+'))
         F += ufl.inner(self.embed(F_num), v('+') - v('-')) * self.forms.dS
         for term in self.residual_terms:
             F += term()
         return F
 
-    def _lambda_max_expr(self, U, h=None):
+    def _lambda_max_expr(self, U, h=None, w=None):
         """The largest wave speed |u| + c of the state U, |u'| + c' with
         low-Mach preconditioning (Euler_utils.spectral_radius); h is the
-        length of the preconditioning's cutoffs (h_min by default)."""
+        length of the preconditioning's cutoffs (h_min by default), w the
+        mesh velocity (u relative to it)."""
         h = self.mesh_obj.h_min if h is None else h
-        th = self.low_mach_preconditioning(self.thermo(self.mean_flow(U)), U, h)
+        th = self.low_mach_preconditioning(self.thermo(self.mean_flow(U), w), U, h)
         return spectral_radius(th)
 
     def wall_force_density(self, U, n):
@@ -766,6 +774,27 @@ class CompressibleEulerModel():
             raise RuntimeError("enable_time_stepping must be called before set_up_solver")
         self._time_stepping = {"dual_time": bool(dual_time)}
         return self._make_time_integrator()
+
+    def enable_mesh_motion(self):
+        """
+        Write the residual on a moving mesh (arbitrary Lagrangian-Eulerian):
+        every flux is the one through a face moving with the mesh velocity
+        grid_velocity, a CG1 vector Function on mesh_obj.coordinate_space
+        that a motion (core/body_motion.py:MeshMotionUpdater) sets before
+        each time step; walls move with it; and the physical time term keeps
+        the geometric conservation law (core/time_integration.py). Zero
+        until set, which leaves the residual the fixed-mesh one. Call before
+        the boundary conditions are defined (they read it) and before
+        enable_time_stepping. Returns grid_velocity. p = 0 only: the time
+        term's cell volumes are the finite-volume ones.
+        """
+        if self.poly_order > 0:
+            raise NotImplementedError("moving meshes are implemented for p = 0 only")
+        if self.bcs or self.F is not None:
+            raise RuntimeError("enable_mesh_motion must be called before the boundary conditions and the weak form")
+        if self.grid_velocity is None:
+            self.grid_velocity = dolfinx.fem.Function(self.mesh_obj.coordinate_space, name="grid_velocity")
+        return self.grid_velocity
 
     def _make_time_integrator(self):
         from dragonfly_sim.core.time_integration import TimeTerm, TimeIntegrator

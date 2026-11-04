@@ -125,8 +125,9 @@ def test_checkpoint_round_trip(tmp_path):
         load_checkpoint(path, [model.u_vec])
 
 
-def _farfield_square(n=6, transverse=False, beta=0.0):
-    """Euler on a square with the characteristic far field all round."""
+def _farfield_square(n=6, transverse=False, beta=0.0, moving=False, material=None, farfield=None):
+    """Euler on a square with the characteristic far field all round
+    (moving: written on a moving mesh, see _wobble)."""
     from dragonfly_sim.core.mesh_manager import Mesh
     from dragonfly_sim.core.Euler_model import CompressibleEulerModel
     from cases import jittered_square
@@ -136,12 +137,14 @@ def _farfield_square(n=6, transverse=False, beta=0.0):
     meta = {'quadrature_degree': 1}
     mesh_obj.form_manager.build_boundary_measure(measure_metadata=meta)
     mesh_obj.form_manager.build_cell_and_interior_facet_measures(measure_metadata=meta)
-    model = CompressibleEulerModel(mesh_obj)
+    model = CompressibleEulerModel(mesh_obj, material=material)
     model.residual_conv_limit, model.max_newton_iterations = 1e-10, 50
     model.report_positivity_limiter = False
-    model.define_farfield_conditions(FREESTREAM)
+    model.define_farfield_conditions(farfield or FREESTREAM)
     model.define_elements_functionspaces()
     model.define_trial_testfunctions()
+    if moving:
+        model.enable_mesh_motion()
     model.compute_initial_conditions_from_farfield()
     model.interpolate_solution_vector()
     tf = TransverseFarfield(model, 6, beta=beta, relax_length=1.0) if transverse else None
@@ -338,7 +341,7 @@ def test_transient_matches_the_conservative_trajectory():
                                    err_msg="step {}".format(k + 1))
 
 
-def _box_model(material=None, preconditioning=None, n=10, farfield=None):
+def _box_model(material=None, preconditioning=None, n=10, farfield=None, moving=False):
     """Euler in a closed box (slip walls all round), seeded with a smooth
     flow in the solver's units. The walls take the interior numerical flux
     against the mirror state, which carries exactly no mass or energy (the
@@ -358,7 +361,9 @@ def _box_model(material=None, preconditioning=None, n=10, farfield=None):
     model.define_farfield_conditions(farfield or FREESTREAM)
     model.define_elements_functionspaces()
     model.define_trial_testfunctions()
-    mirror = slip_wall_state(model.mean_flow(model.u_vec), model.mesh_obj.n, model.n_mean)
+    if moving:
+        model.enable_mesh_motion()
+    mirror = slip_wall_state(model.mean_flow(model.u_vec), model.mesh_obj.n, model.n_mean, model.grid_velocity)
     model.add_boundary_condition(2, mirror, "slip", inviscid_flux="numerical")
     model.compute_weakform()
     c = model.functionspaces["V"].tabulate_dof_coordinates()
@@ -408,6 +413,96 @@ def test_closed_box_conserves_mass_and_energy_in_time(fluid):
     for k in (0, 3):                          # mass, energy
         assert abs(after[k] - before[k]) <= 1e-11 * abs(before[k]), (k, before[k], after[k])
     assert abs(after[1] - before[1]) > 1e-6   # momentum is not conserved: the walls push
+
+
+# ----------------------------------------------------------------------
+# moving meshes (core/body_motion.py; the GCL time term of TimeTerm)
+# ----------------------------------------------------------------------
+WATER = {'U': 5.0, 'T': 293.0, 'p': 101325.0, 'alpha': 0.0}
+
+
+def _wobble(model, integrator, amplitude=0.08, omega=3.0):
+    """Attach a motion of the interior nodes of the unit square (the boundary
+    fixed) that shears and stretches every cell."""
+    from dragonfly_sim.core.body_motion import MeshMotionUpdater
+    mesh_obj = model.mesh_obj
+    x0 = mesh_obj.baseline_nodes[:mesh_obj.n_owned_nodes, :2]
+    bump = np.sin(np.pi * x0[:, 0]) * np.sin(np.pi * x0[:, 1])
+    shape = np.column_stack([bump, 0.5 * bump * x0[:, 0]])
+    return MeshMotionUpdater(model, lambda t: amplitude * np.sin(omega * t) * shape).attach(integrator)
+
+
+@pytest.mark.parametrize("fluid", ["air", "water"])
+@pytest.mark.verification
+def test_moving_mesh_preserves_the_free_stream(fluid):
+    """A uniform flow stays uniform to round-off on a deforming mesh, for BDF1
+    and variable-step BDF2: the swept-volume part of the GCL time term
+    balances the mesh velocity in the fluxes exactly."""
+    from dragonfly_sim.core.materials import ConstantDensity
+    model, _ = (_farfield_square(8, moving=True) if fluid == "air" else
+                _farfield_square(8, moving=True, material=ConstantDensity(), farfield=WATER))
+    u0 = model.u_vec.x.array.copy()
+    integrator = model.enable_time_stepping()
+    model.set_up_solver()
+    integrator.verbose = False
+    integrator.start()
+    _wobble(model, integrator)
+    control = StepSizeController(dt=0.1, dt_start=0.03, growth=1.7)
+    for _ in range(6):
+        assert integrator.advance(control, order=2, newton_rtol=1e-12, newton_atol=1e-13).accepted
+    assert MPI.COMM_WORLD.allreduce(float(np.abs(model.grid_velocity.x.array).max()), MPI.MAX) > 0.02
+    np.testing.assert_allclose(model.u_vec.x.array, u0, rtol=0, atol=1e-12)
+
+
+@pytest.mark.parametrize("fluid", ["air", "water"])
+@pytest.mark.verification
+def test_closed_box_on_a_moving_mesh_conserves_mass_and_energy(fluid):
+    """In a closed box whose interior nodes move, sum_K V_K U_K (V_K the GCL
+    cell volumes) of mass and energy stays constant to round-off over
+    variable-step BDF2 steps, and the GCL volumes track the geometric ones."""
+    import dolfinx
+    import ufl
+    from dragonfly_sim.core.materials import ConstantDensity
+    model = (_box_model(moving=True) if fluid == "air" else
+             _box_model(material=ConstantDensity(), farfield=WATER, moving=True))
+    integrator = model.enable_time_stepping()
+    model.set_up_solver()
+    integrator.verbose = False
+    integrator.start()
+    _wobble(model, integrator)
+    term = integrator.term
+    Q = term.vol_n.function_space
+    U = model.conserved(model.u_vec)
+    forms = [dolfinx.fem.form(U[k] / model.mesh_obj.cell_volume * ufl.TestFunction(Q) * ufl.dx) for k in (0, 3)]
+    n = Q.dofmap.index_map.size_local
+
+    def totals():
+        out = []
+        for f in forms:
+            vec = dolfinx.fem.assemble_vector(f)
+            vec.scatter_reverse(dolfinx.la.InsertMode.add)
+            out.append(MPI.COMM_WORLD.allreduce(float(vec.array[:n] @ term.vol_n.x.array[:n]), MPI.SUM))
+        return np.array(out)
+
+    before = totals()
+    control = StepSizeController(dt=0.1, dt_start=0.05, growth=1.5)
+    for _ in range(5):
+        assert integrator.advance(control, order=2, newton_rtol=1e-12, newton_atol=1e-13, newton_max_it=30).accepted
+    after = totals()
+    np.testing.assert_allclose(after, before, rtol=1e-12)
+    assert 1e-7 < term.volume_drift() < 1e-3
+
+
+@pytest.mark.verification
+def test_mesh_motion_enabled_on_a_fixed_mesh_changes_nothing():
+    """With the moving-mesh forms but no motion the steps are the fixed-mesh ones."""
+    states = []
+    for moving in (False, True):
+        model, _ = _farfield_square(moving=moving)
+        _perturb(model)
+        _run_steps(model, None, 3)
+        states.append(model.u_vec.x.array.copy())
+    np.testing.assert_allclose(states[1], states[0], rtol=0, atol=1e-12)
 
 
 @pytest.mark.skipif(MPI.COMM_WORLD.size > 1, reason="serial comparison of fields")

@@ -593,6 +593,15 @@ class IDWarp_jax(csdl.CustomExplicitOperation):
                 self.mesh.mesh.comm.allreduce(local_max, op=MPI.MAX), perf_counter() - t0))
         self._log_memory("after compute")
 
+    def warp(self, bdry_motions):
+        """The forward warp outside CSDL: (M_global, dim) replicated wall
+        motions -> (N_local, dim) mesh-node motions, as ``compute`` gives
+        them, without its reuse cache and log line (the per-time-step mesh
+        motion of core/body_motion.py). No collectives."""
+        wall = self._project(np.asarray(bdry_motions, dtype=np.float64))
+        Xv = self._warp(self._Xs0 + self._expand(wall), _NO_PITCH)
+        return self._assemble_motions(wall, Xv - self._Xv0)
+
     def compute_jacvec_product(self, input_vals, output_vals, d_inputs, d_outputs, mode):
         """Matrix-free VJP. Only reverse mode is supported.
 

@@ -33,6 +33,24 @@ Modes (all one step loop, TimeIntegrator._newton_step):
 Switching a term off sets its Constant to exactly zero, so the compiled
 forms stay valid across modes; a model with neither term enabled never
 builds them at all (the plain Newton solve is unchanged).
+
+Moving meshes (model.grid_velocity, core/body_motion.py): the physical
+term is the BDF derivative of |K| U, with the cell volumes of the earlier
+levels kept as DG0 fields V^n, V^{n-1}, and the new level's volume the one
+the geometric conservation law (GCL) assigns,
+
+    a0 V^{n+1} = dt G_K - a1 V^n - a2 V^{n-1},    G_K = sum over faces of w.n |f|,
+
+so that a0 V^{n+1} + a1 V^n + a2 V^{n-1} equals dt times the volume the
+faces sweep, exactly, whatever the motion and the step ratio. Divided by
+|K| (the residual's cell volume) the term reads
+
+    inv_dt [a1 V^n/|K| (U^n - U) + a2 V^{n-1}/|K| (U^{n-1} - U)] + U G_K / |K|,
+
+which on a fixed mesh (G = 0, V = |K|) is the fixed-mesh term exactly, and
+with the ALE fluxes (F - U (x) w) preserves a uniform flow to round-off.
+V^{n+1} differs from the geometric |K^{n+1}| at the order of the scheme; the
+spatial terms use the geometric volumes.
 """
 from dataclasses import dataclass, field
 
@@ -192,11 +210,23 @@ class TimeTerm:
         self.U_old = dolfinx.fem.Function(V, name="u_old")
         for f in (self.U_n, self.U_nm1, self.U_old):
             f.x.array[:] = model.u_vec.x.array
+        # moving mesh: the GCL cell volumes of the levels n and n-1 (module docstring)
+        self.ale = self.physical and model.grid_velocity is not None
+        if self.ale:
+            self.dt = dolfinx.fem.Constant(msh, 0.0)
+            Q = dolfinx.fem.functionspace(msh, ("DG", 0))
+            self.vol_n = dolfinx.fem.Function(Q, name="vol_n")
+            self.vol_nm1 = dolfinx.fem.Function(Q, name="vol_nm1")
+            q, f = ufl.TestFunction(Q), model.forms
+            wn = ufl.dot(model.grid_velocity, model.mesh_obj.n)
+            self._volume_form = dolfinx.fem.form(q * ufl.dx(domain=msh))
+            self._sweep_form = dolfinx.fem.form(wn('+') * (q('+') - q('-')) * f.dS + wn * q * f.ds)
+            self.reset_volumes()
 
     def local_inverse_time_scale(self, U):
         """w_K = lambda_max / h_min plus the model's time_scale_terms."""
         m = self.model
-        w = m._lambda_max_expr(U) / m.mesh_obj.h_min
+        w = m._lambda_max_expr(U, w=m.grid_velocity) / m.mesh_obj.h_min
         for term in m.time_scale_terms:
             w = w + term(U)
         return w
@@ -208,17 +238,66 @@ class TimeTerm:
             w = self.local_inverse_time_scale(self.U_old)
             F = F + w * self.inv_cfl * ufl.inner(m.pseudo_time_increment(self.U_old, u - self.U_old),
                                                  v) * dx
-        if self.physical:
+        if self.physical and not self.ale:
             a0, a1, a2 = self.a
             U = m.conserved
             F = F + self.inv_dt * ufl.inner(a0 * U(u) + a1 * U(self.U_n) + a2 * U(self.U_nm1), v) * dx
+        elif self.physical:
+            _, a1, a2 = self.a
+            U, K, f = m.conserved, m.mesh_obj.cell_volume, m.forms
+            Uu = U(u)
+            F = F + self.inv_dt * ufl.inner(a1 * self.vol_n / K * (U(self.U_n) - Uu)
+                                            + a2 * self.vol_nm1 / K * (U(self.U_nm1) - Uu), v) * dx
+            # dt G_K U: the swept volume's part, a0 V^{n+1} + a1 V^n + a2 V^{n-1}, of U's coefficient;
+            # inv_dt dt rather than 1, so that switching the physical term off removes it too
+            wn = ufl.dot(m.grid_velocity, m.mesh_obj.n)
+            F = F + self.inv_dt * self.dt * (wn('+') * (ufl.inner(Uu('+'), v('+')) - ufl.inner(Uu('-'), v('-')))
+                                             * f.dS + wn * ufl.inner(Uu, v) * f.ds)
         return F
+
+    # -- moving mesh: the GCL volumes ------------------------------------
+    def _assemble_dg0(self, form):
+        """The owned cells' values of a DG0 vector form."""
+        vec = dolfinx.fem.assemble_vector(form)
+        vec.scatter_reverse(dolfinx.la.InsertMode.add)
+        return vec.array[:vec.index_map.size_local].copy()
+
+    def _set(self, f, values):
+        n = f.function_space.dofmap.index_map.size_local
+        f.x.array[:n] = values
+        f.x.scatter_forward()
+
+    def reset_volumes(self):
+        """V^n = V^{n-1} = the cells' current geometric volumes (a start)."""
+        vol = self._assemble_dg0(self._volume_form)
+        self._set(self.vol_n, vol)
+        self._set(self.vol_nm1, vol)
+
+    def shift_volumes(self):
+        """After an accepted step: V^{n-1} <- V^n <- V^{n+1}, the GCL volume of
+        the step just taken (its BDF coefficients, dt and mesh velocity)."""
+        a0, a1, a2 = (float(c.value) for c in self.a)
+        n = self.vol_n.function_space.dofmap.index_map.size_local
+        sweep = self._assemble_dg0(self._sweep_form)
+        new = (float(self.dt.value) * sweep - a1 * self.vol_n.x.array[:n] - a2 * self.vol_nm1.x.array[:n]) / a0
+        self._set(self.vol_nm1, self.vol_n.x.array[:n])
+        self._set(self.vol_n, new)
+
+    def volume_drift(self):
+        """max over the cells of |V^n - |K|| / |K|: how far the GCL volumes are
+        from the geometric ones of the current mesh. Collective."""
+        vol = self._assemble_dg0(self._volume_form)
+        n = vol.size
+        local = float(np.max(np.abs(self.vol_n.x.array[:n] - vol) / vol)) if n else 0.0
+        return self.model.mesh_obj.mesh.comm.allreduce(local, op=MPI.MAX)
 
     def set_bdf(self, order, dt, dt_prev=None):
         ratio = None if (order == 1 or dt_prev is None) else dt / dt_prev
         for c, val in zip(self.a, bdf_coefficients(order, ratio)):
             c.value = val
         self.inv_dt.value = 1.0 / dt
+        if self.ale:
+            self.dt.value = dt
         return ratio
 
     def physical_off(self):
@@ -250,8 +329,10 @@ class TimeIntegrator:
     (set_up_solver / enable_time_stepping); `term` is its TimeTerm.
 
     Time-dependent boundary conditions (core/farfield.py:TransverseFarfield)
-    register through `boundary_updaters`: objects with prepare(order) before a
-    physical step's Newton solve and commit() after it is accepted.
+    and mesh motions (core/body_motion.py:MeshMotionUpdater) register through
+    `boundary_updaters`: objects with prepare(order, ratio, dt) before a
+    physical step's Newton solve (of every attempt) and commit() after it is
+    accepted.
     """
 
     def __init__(self, model, term):
@@ -365,6 +446,8 @@ class TimeIntegrator:
         self._copy(self.term.U_n, self.model.u_vec)
         if dt_prev is None:
             self._copy(self.term.U_nm1, self.model.u_vec)
+            if self.term.ale:
+                self.term.reset_volumes()
 
     def advance(self, step_control, order=2, newton_rtol=1e-8, newton_atol=1e-10,
                 newton_max_it=20, dual_time=None, newton_criterion="residual", segregated=None):
@@ -411,6 +494,8 @@ class TimeIntegrator:
             dt *= 0.5
         else:
             return StepRecord(accepted=False, dt=dt, retries=step_control.max_retries)
+        if term.ale:
+            term.shift_volumes()
         for b in self.boundary_updaters:
             b.commit()
         self.time += dt
