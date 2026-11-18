@@ -10,7 +10,8 @@ transport wing-weight equation, from the take-off mass, area, aspect ratio, root
 t/c, taper and quarter-chord sweep) is coupled to the take-off mass through the
 Breguet cruise and climb segments, which use the CFD lift and drag (plus a
 fixed fuselage drag). The lift has to carry the mid-cruise weight
-g sqrt(M_cruise_start M_landing).
+g sqrt(M_cruise_start M_landing), and the wing loading (take-off gross mass
+over wing area) may not exceed 650 kg/m^2.
 
 The flow model is CompressibleRANSModel (p = 0, Green-Gauss gradients
 condensed out of Newton, MUSCL, pseudo-transient continuation from the free
@@ -310,6 +311,14 @@ if __name__ == '__main__':
         L_constraint = L_total / W_cruise
         L_constraint.add_name('L_limit')
         L_constraint.set_as_constraint(lower=1.0)
+
+    # Wing loading: the take-off gross mass per unit wing area (both wings)
+    # may not exceed 650 kg/m^2 (~634 kg/m^2 for the baseline wing at this
+    # flight condition, from the fuel model alone).
+    with csdl.namespace('Constraint 4'):
+        wing_loading = TOGM / S_wings
+        wing_loading.add_name('wing_loading')
+        wing_loading.set_as_constraint(upper=650., scaler=1./650.)
 
     # Moment constraints: the root bending moment may not exceed, and the pitching moment may not
     # fall below, its value on the undeformed wing. M_<name> are the raw nondimensional moment integrals (like
