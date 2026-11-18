@@ -1,14 +1,22 @@
 """
-Drag minimization of the Simple Transonic Wing with the SA-neg RANS model: the
-RANS counterpart of wing_opt_euler.py, with the same planform (sweep, aspect
-ratio, span, taper) and section (thickness and camber modes at three spanwise
-stations) design variables plus the angle of attack, at M 0.75.
+Fuel-burn minimization of the Simple Transonic Wing with the SA-neg RANS model,
+with the planform (sweep, aspect ratio, span, taper) and section (thickness and
+camber modes at three spanwise stations) design variables of wing_opt_euler.py
+plus the angle of attack. The flight condition is cruise at 10,400 m (rho 0.3926
+kg/m^3, T 220.55 K, p 24857 Pa) at M 0.77.
+
+The fuel burn comes from STW_fuelburn (STW_opt.py): the wing mass (Raymer's
+transport wing-weight equation, from the take-off mass, area, aspect ratio, root
+t/c, taper and quarter-chord sweep) is coupled to the take-off mass through the
+Breguet cruise and climb segments, which use the CFD lift and drag (plus a
+fixed fuselage drag). The lift has to carry the mid-cruise weight
+g sqrt(M_cruise_start M_landing).
 
 The flow model is CompressibleRANSModel (p = 0, Green-Gauss gradients
 condensed out of Newton, MUSCL, pseudo-transient continuation from the free
 stream), passed to DG_windtunnel_model as model_class; the drag includes the
-wall friction. The lift and the pitching moment may not fall below, and the
-root bending moment may not exceed, their values on the undeformed wing. The wing wall is
+wall friction. The pitching moment may not fall below, and the root bending
+moment may not exceed, their values on the undeformed wing. The wing wall is
 adiabatic no-slip, the y = 0 symmetry plane slip. The L3 grid is wall-resolved (first cell ~9e-6, root chord 5); the
 wall-merged XDMF variant coarsens exactly those layers, so it is not meant
 for RANS.
@@ -34,7 +42,9 @@ from dragonfly_sim.core.postprocessor import DG_postprocessor
 
 from dragonfly_sim.utils.ffd_dv_utils import spanwise_linear_bounds
 from dragonfly_sim.core.shape_design import (FFDShapeParameterization, WingShape,
-                                             ControlPointMotions)
+                                             ControlPointMotions, _section_mode_profiles)
+
+from STW_opt import STW_fuelburn
 
 
 # Meshes are read from the repository's meshes/ directory
@@ -61,23 +71,34 @@ if __name__ == '__main__':
     poly_o = 0
     gamma = 1.4
 
-    # Inlet flow conditions
+    # Flight condition: cruise at 10,400 m. The mesh is in metres (root chord
+    # 5 m, semi-span 14 m, wing area 91 m^2).
+    rho_dim = 0.3926     # [kg/m^3]
+    T_dim = 220.55       # [K]
+    p_dim = 24857.       # [Pa]
+    M_0 = 0.77
+    a_dim = np.sqrt(gamma * p_dim / rho_dim)      # speed of sound, ~297.7 m/s
+    V_dim = M_0 * a_dim                           # cruise speed, ~229.2 m/s
+    q_inf_dim = 0.5 * rho_dim * V_dim ** 2        # dynamic pressure, ~10.3 kPa
+
+    # The flow solver works in nondimensional units, rho_inf = p_inf = 1 with
+    # lengths in metres: only the Mach number carries the flight condition,
+    # and the solver's force unit is p_dim * (1 m)^2.
     rho_0 = 1.0
-    M_0 = 0.75
     p_0 = 1.0
     attack = np.radians(2)
 
     # Reynolds number. The RANS model's Re is per unit length of the mesh
-    # (mu_inf = rho_inf U_inf / Re), and the mesh is in the wing's own units
-    # (root chord 5), so it is set from the Reynolds number on the baseline
-    # mean aerodynamic chord. It stays fixed per unit length when the planform
-    # changes, i.e. the physical scale of the wing is what is held, not Re_mac.
-    # Re_mac is a chosen value, not one from a reference case; set it to the
-    # flight condition of interest (and check the first-cell y+ for it).
-    Re_mac = 5e6
-    c_root, taper = 5.0, 0.3
-    mac = 2. / 3. * c_root * (1. + taper + taper ** 2) / (1. + taper)    # 3.564
-    Re = Re_mac / mac
+    # (mu_inf = rho_inf U_inf / Re), i.e. per metre: rho V / mu at the flight
+    # condition, with mu from Sutherland's law (~1.443e-5 Pa s at 220.55 K),
+    # so ~6.2e6 per metre (Re_mac ~2.2e7 on the baseline mean aerodynamic chord
+    # of 3.564 m). It stays fixed per unit length when the planform changes:
+    # the physical scale of the wing is what is held. Estimated first-cell y+
+    # on the L3 grid (first cell ~9e-6 m): ~2.
+    mu_dim = 1.458e-6 * T_dim ** 1.5 / (T_dim + 110.4)
+    Re = rho_dim * V_dim / mu_dim
+    PETSc.Sys.Print("Flight condition: M {:.3f}, V {:.3f} m/s, q {:.1f} Pa, Re {:.4e} per metre"
+                    .format(M_0, V_dim, q_inf_dim, Re))
 
     # inflow_angle is derived from alpha inside define_farfield_conditions
     # now, so that alpha is the single source of truth for the freestream
@@ -85,9 +106,11 @@ if __name__ == '__main__':
     # direction has to follow it on every evaluation.
     boundary_dict = {'rho': rho_0, 'M': M_0, 'p': p_0, 'alpha': attack}
 
-    # Angle-of-attack design-variable bounds.
+    # Angle-of-attack design-variable bounds. The lift has to carry the
+    # mid-cruise weight (~52 t, c_L ~0.54 at this q and 91 m^2), more than the
+    # baseline's c_l at 2 deg (~0.43), hence the wide upper bound.
     attack_lower = np.radians(1.5)
-    attack_upper = np.radians(2.5)
+    attack_upper = np.radians(5.)
 
     # FFD block: (chord, span, vertical). Three spanwise sections (root, mid-span, tip) are the
     # stations of the section variables; the chordwise basis is a quartic Bezier (5 control points),
@@ -141,10 +164,10 @@ if __name__ == '__main__':
     csdl_flow_model = DG_windtunnel_model(mesh_from_file, boundary_dict, shape,
                                           mesh_inner_bdry_function=wing_inner_bdry_function,
                                           poly_order=poly_o, gamma=1.4,
-                                          filename_suffix="wing_opt_rans_L3mesh_p=0_M=0_75",
+                                          filename_suffix="wing_opt_rans_fuelburn_L3mesh_p=0_M=0_77",
                                           asm_overlap=1, ilu_levels=2,
                                           model_class=CompressibleRANSModel,
-                                          model_kwargs={'Re': Re})
+                                          model_kwargs={'Re': Re, 'T_inf_dim': T_dim})
     # Pseudo-transient continuation from the free stream needs many more steps
     # than a plain Newton solve (~60 for a 2D airfoil at M 0.7; more for a
     # transonic wing).
@@ -199,7 +222,7 @@ if __name__ == '__main__':
                     .format(np.round(root_quarter_chord, 6)))
 
     # D includes the wall friction (D_friction is its viscous part)
-    csdl_coeff_model = DG_postprocessor(csdl_flow_model.mesh, csdl_flow_model.sim_model, csdl_flow_model.WALL_TAG, moments=moments, p_inf_dim=101325.)
+    csdl_coeff_model = DG_postprocessor(csdl_flow_model.mesh, csdl_flow_model.sim_model, csdl_flow_model.WALL_TAG, moments=moments, p_inf_dim=p_dim)
 
     # The moments of the undeformed wing at the initial flow conditions, from a forward solve on
     # the undeformed mesh: the limits of the moment constraints below (upper for root bending,
@@ -241,25 +264,52 @@ if __name__ == '__main__':
     L, D = outputs.L, outputs.D
     M_root_bending, M_pitch = outputs.M_root_bending, outputs.M_pitch
 
-    D.add_name('drag')
-    # The objective and the constraints are scaled by their undeformed-wing values, so that SLSQP's
-    # absolute ftol acts as a relative tolerance (SLSQP has no rtol option): the convergence test is
-    # then on the relative drag change and the relative constraint violation.
-    D.set_as_objective(scaler=1./baseline_forces["D"])
+    # Fuel-burn model. Its inputs follow the current design variables: the
+    # planform quantities (full wing area, aspect ratio, taper ratio and
+    # quarter-chord sweep, as Raymer's wing-weight equation wants) from the
+    # wing layer, and the root t/c from the root section's thickness modes,
+    # the baseline t/c (0.121, RAE2822) scaled by the relative thickness change
+    # at the maximum-thickness chord fraction (~0.38). The thickness variable
+    # holds the root section's modes first.
+    planform = shape.outputs()['wing']
+    S_wings = planform['area']
+    AR = planform['aspect_ratio']
+    taper_ratio = planform['taper_ratio']
+    sweep = planform['sweep']
 
-    # Define lower limit constraint on lift
+    tc_root_baseline = 0.121
+    n_thickness_modes = wing.section_spec['thickness']['modes']
+    root_thickness_weights = _section_mode_profiles('thickness', n_thickness_modes, np.array([0.38]))[0]
+    root_thickness_modes = wing.variables['thickness'][0:n_thickness_modes]
+    tc_root = tc_root_baseline * (1. + csdl.sum(root_thickness_weights * root_thickness_modes))
+
+    # Dimensional lift and drag [N] of both wings: the solver's force unit is
+    # p_dim * (1 m)^2, and the model is the half wing.
+    L_total = 2. * p_dim * L
+    D_wings = 2. * p_dim * D
+
+    fuelburn_model = STW_fuelburn(q_inf_dim, V_cruise=V_dim)
+    TOGM, LGM, cruise_start_mass, fuel_burn = fuelburn_model.evaluate(
+        S_wings, AR, tc_root, taper_ratio, sweep, L_total, D_wings)
+    TOGM.add_name('take_off_gross_mass')
+    LGM.add_name('landing_gross_mass')
+    cruise_start_mass.add_name('cruise_start_mass')
+    tc_root.add_name('tc_root')
+
+    # Objective: the fuel burn mass [kg]. It is ~1e4 kg (the baseline value is
+    # not known before the simulator runs), so the scaler brings it to O(1).
+    D.add_name('drag')   # monitored only
+    fuel_burn.add_name('fuel_burn')
+    fuel_burn.set_as_objective(scaler=1e-4)
+
+    # Lift constraint: the lift of both wings has to carry the mid-cruise
+    # weight g sqrt(M_cruise_start M_landing), the geometric mean of the
+    # cruise segment's start and end weights. As a ratio it is O(1) scaled.
     with csdl.namespace('Constraint 2'):
-        # NOTE: L is always the raw nondimensional pressure-force integral 
-        # (the optimizer never sees a dimensional value, regardless of 
-        # p_inf_dim/L_ref_dim -- those only scale the console printout in 
-        # compute())
-        # Lower bound: the lift of the undeformed wing at these conditions
-        # (M 0.75, alpha 2 deg, Re_mac 5e6), from a converged forward solve
-        # (2026-10-07: 66 PTC steps to |R| 3.6e-10; c_l 0.42571, c_d 0.017270)
-        L_baseline = 7.633754061772796
-        L_constraint = L
+        W_cruise = fuelburn_model.g * csdl.sqrt(cruise_start_mass * LGM)
+        L_constraint = L_total / W_cruise
         L_constraint.add_name('L_limit')
-        L_constraint.set_as_constraint(lower=L_baseline, scaler=1./L_baseline)
+        L_constraint.set_as_constraint(lower=1.0)
 
     # Moment constraints: the root bending moment may not exceed, and the pitching moment may not
     # fall below, its value on the undeformed wing. M_<name> are the raw nondimensional moment integrals (like
