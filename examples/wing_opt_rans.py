@@ -379,7 +379,8 @@ if __name__ == '__main__':
 
     # Fuel volume: the internal volume of both wings between the front and rear spar (15%
     # and 65% of the local chord), plus an auxiliary volume of 2.763 m^3, has to hold the
-    # fuel burn plus the reserve fuel at a density of 804 kg/m^3. The spar-box volume is
+    # fuel burn plus the reserve fuel at a density of 804 kg/m^3. We also assume that only 
+    # 85% of the available volume can be used for fuel storage. The spar-box volume is
     # the vertical wall thickness integrated with the trapezoidal rule over 11 chordwise
     # stations between the spars and 15 span stations from the root to the end of the
     # trapezoid (y = 14, the tip cap beyond it is left out); the stations are embedded in
@@ -395,7 +396,7 @@ if __name__ == '__main__':
         V_spar_box = 2. * wall_geometry.spar_box_volume(shape.coefficients(), spar_box)
         V_spar_box.add_name('spar_box_volume')
         V_fuel_required = (fuel_burn + fuelburn_model.M_fuel_res) / 804.
-        fuel_volume_ratio = (V_spar_box + 2.763) / V_fuel_required
+        fuel_volume_ratio = ((V_spar_box * 0.85) + 2.763) / V_fuel_required  # include a 15% penalty on available fuel volume in the wing
         fuel_volume_ratio.add_name('fuel_volume_limit')
         fuel_volume_ratio.set_as_constraint(lower=1.0)
 
