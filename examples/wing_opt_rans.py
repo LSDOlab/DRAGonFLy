@@ -9,7 +9,7 @@ The fuel burn comes from STW_fuelburn (STW_opt.py): the wing mass (Raymer's
 transport wing-weight equation, from the take-off mass, area, aspect ratio, root
 t/c, taper and quarter-chord sweep) is coupled to the take-off mass through the
 Breguet cruise and climb segments, which use the CFD lift and drag (plus a
-fixed fuselage drag). The lift has to carry the mid-cruise weight
+fixed fuselage drag). The lift has to equal the mid-cruise weight
 g sqrt(M_cruise_start M_landing), the wing loading (take-off gross mass
 over wing area) may not exceed 650 kg/m^2, and the wing volume between the
 spars (15% and 65% chord) plus an auxiliary 2.763 m^3 has to hold the fuel
@@ -113,7 +113,7 @@ if __name__ == '__main__':
     # and the solver's force unit is p_dim * (1 m)^2.
     rho_0 = 1.0
     p_0 = 1.0
-    attack = np.radians(2.5)
+    attack = np.radians(2.6)  # this initial angle of attack should make the initial design approximately feasible
 
     # Reynolds number. The RANS model's Re is per unit length of the mesh
     # (mu_inf = rho_inf U_inf / Re), i.e. per metre: rho V / mu at the flight
@@ -356,14 +356,18 @@ if __name__ == '__main__':
     fuel_burn.add_name('fuel_burn')
     fuel_burn.set_as_objective(scaler=1e-4)
 
-    # Lift constraint: the lift of both wings has to carry the mid-cruise
+    # Lift constraint: the lift of both wings has to equal the mid-cruise
     # weight g sqrt(M_cruise_start M_landing), the geometric mean of the
     # cruise segment's start and end weights. As a ratio it is O(1) scaled.
+    # An equality, not a lower bound: the Breguet segments use the CFD L/D,
+    # and with the fixed fuselage drag a lift above the weight raises L/D, so
+    # an inequality let the optimizer fly at a lift coefficient the aircraft
+    # would not trim at (5.4% excess lift in the first 12 h run).
     with csdl.namespace('Constraint 2'):
         W_cruise = fuelburn_model.g * csdl.sqrt(cruise_start_mass * LGM)
         L_constraint = L_total / W_cruise
         L_constraint.add_name('L_limit')
-        L_constraint.set_as_constraint(lower=1.0)
+        L_constraint.set_as_constraint(equals=1.0)
 
     # Wing loading: the take-off gross mass per unit wing area (both wings)
     # may not exceed 650 kg/m^2 (~634 kg/m^2 for the baseline wing at this
