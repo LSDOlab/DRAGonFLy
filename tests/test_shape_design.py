@@ -413,7 +413,7 @@ def test_specification_checks():
     with pytest.raises(ValueError, match="unknown planform"):
         WingShape(planform={'dihedral': (0., 0.1)})
     with pytest.raises(ValueError, match="unknown section"):
-        WingShape(sections={'twist': 0.1})
+        WingShape(sections={'dihedral': 0.1})
     with pytest.raises(ValueError, match="say which"):
         WingShape(planform={'span': (24., 32.)})
     assert WingShape(planform={'span': (24., 32.)}, derived='root_chord').derived == 'root_chord'
