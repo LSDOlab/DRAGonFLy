@@ -10,13 +10,16 @@ transport wing-weight equation, from the take-off mass, area, aspect ratio, root
 t/c, taper and quarter-chord sweep) is coupled to the take-off mass through the
 Breguet cruise and climb segments, which use the CFD lift and drag (plus a
 fixed fuselage drag). The lift has to carry the mid-cruise weight
-g sqrt(M_cruise_start M_landing), and the wing loading (take-off gross mass
-over wing area) may not exceed 650 kg/m^2.
+g sqrt(M_cruise_start M_landing), the wing loading (take-off gross mass
+over wing area) may not exceed 650 kg/m^2, and the wing volume between the
+spars (15% and 65% chord) plus an auxiliary 2.763 m^3 has to hold the fuel
+burn plus the reserve fuel (804 kg/m^3).
 
 The flow model is CompressibleRANSModel (p = 0, Green-Gauss gradients
 condensed out of Newton, MUSCL, pseudo-transient continuation from the free
 stream), passed to DG_windtunnel_model as model_class; the drag includes the
-wall friction. The pitching moment may not fall below, and the root bending
+wall friction. The pitching moment about the mean aerodynamic chord's quarter
+chord (which moves with the planform) may not fall below, and the root bending
 moment may not exceed, their values on the undeformed wing. The wing wall is
 adiabatic no-slip, the y = 0 symmetry plane slip. The L3 grid is wall-resolved (first cell ~9e-6, root chord 5); the
 wall-merged XDMF variant coarsens exactly those layers, so it is not meant
@@ -46,6 +49,29 @@ from dragonfly_sim.core.shape_design import (FFDShapeParameterization, WingShape
                                              ControlPointMotions, _section_mode_profiles)
 
 from STW_opt import STW_fuelburn
+
+
+def mac_quarter_chord(semi_span, taper_ratio, sweep, tan, baseline):
+    """x, y, z of the quarter chord of the mean aerodynamic chord of the
+    trapezoidal half wing (quarter-chord sweep, root quarter chord at
+    baseline['x_ref_root']). z is on the chord plane of the baseline fit, at
+    the same fraction of the semi-span (span changes stretch y, not z). Works on
+    numbers (tan = np.tan) and csdl variables (tan = csdl.tan)."""
+    y_mac = semi_span / 3. * (1. + 2. * taper_ratio) / (1. + taper_ratio)
+    x_mac = baseline['x_ref_root'] + y_mac * tan(sweep)
+    z_slope, z_root = baseline['z_chord_plane']
+    z_mac = z_root + z_slope * baseline['semi_span'] * y_mac / semi_span
+    return x_mac, y_mac, z_mac
+
+
+def transfer_pitch_moment(M_ref, point_ref, x_new, z_new, L, D, alpha, cos, sin):
+    """The moment about the y direction through (x_new, ., z_new) of a wall
+    force whose moment about point_ref is M_ref: M = M_ref + dx F_z - dz F_x,
+    with the force from the lift (direction (-sin a, 0, cos a)) and the drag
+    (direction (cos a, 0, sin a))."""
+    F_x = D * cos(alpha) - L * sin(alpha)
+    F_z = D * sin(alpha) + L * cos(alpha)
+    return M_ref + (x_new - point_ref[0]) * F_z - (z_new - point_ref[2]) * F_x
 
 
 # Meshes are read from the repository's meshes/ directory
@@ -215,7 +241,11 @@ if __name__ == '__main__':
     #   pitch:        about the y direction (spanwise axis) through the quarter chord of the
     #                 root section, from the fitted baseline planform (x of the root
     #                 quarter chord, z of the chord plane at the root).
-    # The points are fixed in space, also when a design variable moves the root.
+    # The points are fixed in space. The root quarter chord stays there under every
+    # planform and thickness change (the sections scale about the quarter-chord line and
+    # the root does not translate), but the mean aerodynamic chord's quarter chord moves:
+    # the pitching-moment constraint below is posed about that moving point, by
+    # transferring this root moment with the wall force (transfer_pitch_moment).
     root_quarter_chord = (wing.baseline['x_ref_root'], 0., wing.baseline['z_chord_plane'][1])
     moments = [("root_bending", (0., 0., 0.), (1., 0., 0.)),
                ("pitch", root_quarter_chord, (0., 1., 0.))]
@@ -236,6 +266,16 @@ if __name__ == '__main__':
     baseline_moments = baseline_forces["moments"]
     PETSc.Sys.Print("Baseline moments (nondimensional): " + ", ".join(
         "{} {:.8f}".format(name, m["M"]) for name, m in baseline_moments.items()))
+
+    # The baseline pitching moment about the baseline wing's MAC quarter chord: the lower
+    # limit of the pitching-moment constraint
+    wb = wing.baseline
+    x_mac0, y_mac0, z_mac0 = mac_quarter_chord(wb['semi_span'], wb['taper_ratio'], wb['sweep'], np.tan, wb)
+    M_pitch_mac_baseline = transfer_pitch_moment(baseline_moments["pitch"]["M"], root_quarter_chord,
+                                                 x_mac0, z_mac0, baseline_forces["L"], baseline_forces["D"],
+                                                 attack, np.cos, np.sin)
+    PETSc.Sys.Print("Baseline MAC quarter chord ({:.6f}, {:.6f}, {:.6f}); pitching moment about it {:.8f}"
+                    .format(x_mac0, y_mac0, z_mac0, M_pitch_mac_baseline))
 
     # Shape design variables first (all of them as one flat vector), then alpha
     shape_param_vector = shape.declare_design_variables()
@@ -297,6 +337,13 @@ if __name__ == '__main__':
     cruise_start_mass.add_name('cruise_start_mass')
     tc_root.add_name('tc_root')
 
+    # The pitching moment about the current wing's MAC quarter chord
+    x_mac, y_mac, z_mac = mac_quarter_chord(planform['semi_span'], taper_ratio, sweep, csdl.tan,
+                                            wing.baseline)
+    M_pitch_mac = transfer_pitch_moment(M_pitch, root_quarter_chord, x_mac, z_mac, L, D, alpha,
+                                        csdl.cos, csdl.sin)
+    x_mac.add_name('x_mac_quarter_chord')
+
     # Objective: the fuel burn mass [kg]. It is ~1e4 kg (the baseline value is
     # not known before the simulator runs), so the scaler brings it to O(1).
     D.add_name('drag')   # monitored only
@@ -320,16 +367,39 @@ if __name__ == '__main__':
         wing_loading.add_name('wing_loading')
         wing_loading.set_as_constraint(upper=650., scaler=1./650.)
 
-    # Moment constraints: the root bending moment may not exceed, and the pitching moment may not
-    # fall below, its value on the undeformed wing. M_<name> are the raw nondimensional moment integrals (like
-    # L), the quantities to constrain; their coefficients are monitoring only.
+    # Fuel volume: the internal volume of both wings between the front and rear spar (15%
+    # and 65% of the local chord), plus an auxiliary volume of 2.763 m^3, has to hold the
+    # fuel burn plus the reserve fuel at a density of 804 kg/m^3. The spar-box volume is
+    # the vertical wall thickness integrated with the trapezoidal rule over 11 chordwise
+    # stations between the spars and 15 span stations from the root to the end of the
+    # trapezoid (y = 14, the tip cap beyond it is left out); the stations are embedded in
+    # the FFD, so they stay at their chord fractions when the planform changes. On the L3
+    # wall the baseline half-wing volume is 8.849 m^3 (8.851 m^3 with 57 x 41 stations),
+    # i.e. 17.70 m^3 for both wings: with the auxiliary volume 20.46 m^3, against
+    # ~17.7-19.6 m^3 of fuel (fuel burn 12-14 t plus the 2 t reserve).
+    with csdl.namespace('Constraint 5'):
+        wall_geometry = shape.geometry
+        spar_box = wall_geometry.add_spar_box_stations(0.15, 0.65, np.linspace(0., 14., 15), n_chord=11)
+        PETSc.Sys.Print("Baseline spar-box volume (both wings): {:.4f} m^3".format(
+            2. * spar_box['baseline_volume']))
+        V_spar_box = 2. * wall_geometry.spar_box_volume(shape.coefficients(), spar_box)
+        V_spar_box.add_name('spar_box_volume')
+        V_fuel_required = (fuel_burn + fuelburn_model.M_fuel_res) / 804.
+        fuel_volume_ratio = (V_spar_box + 2.763) / V_fuel_required
+        fuel_volume_ratio.add_name('fuel_volume_limit')
+        fuel_volume_ratio.set_as_constraint(lower=1.0)
+
+    # Moment constraints: the root bending moment may not exceed, and the pitching moment
+    # about the current wing's MAC quarter chord may not fall below, its value on the
+    # undeformed wing. M_<name> are the raw nondimensional moment integrals (like L), the
+    # quantities to constrain; their coefficients are monitoring only.
     with csdl.namespace('Constraint 3'):
         M_root_bending.add_name('root_bending_limit')
         M_root_bending.set_as_constraint(upper=baseline_moments["root_bending"]["M"],
                                          scaler=1./abs(baseline_moments["root_bending"]["M"]))
-        M_pitch.add_name('pitch_limit')
-        M_pitch.set_as_constraint(lower=baseline_moments["pitch"]["M"],
-                                  scaler=1./abs(baseline_moments["pitch"]["M"]))
+        M_pitch_mac.add_name('pitch_mac_limit')
+        M_pitch_mac.set_as_constraint(lower=M_pitch_mac_baseline,
+                                      scaler=1./abs(M_pitch_mac_baseline))
 
     # Geometric constraints. The wing's planform quantities follow directly from
     # its variables (shape.outputs()['wing']: area, span, semi_span, root_chord,

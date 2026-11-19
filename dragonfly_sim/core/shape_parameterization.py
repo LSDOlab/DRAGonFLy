@@ -15,8 +15,9 @@ the deformed wall for geometric constraints. Three pieces:
   ``SectionalShape`` for why the sectional layer must act on the constant
   baseline. ``shape_design`` packages these into design-variable layers.
 * ``WallGeometry`` -- geometric constraint quantities of the deformed wall:
-  enclosed area (2D) / volume (3D), thickness at stations, and 3D planform
-  (section chords, span, planform area).
+  enclosed area (2D) / volume (3D), thickness at stations, 3D planform
+  (section chords, span, planform area) and the 3D internal volume between
+  two spars.
 
 Everything here is csdl_alpha graph code on replicated arrays, so derivatives
 come from csdl's autodiff and every rank computes identical values.
@@ -640,6 +641,65 @@ class WallGeometry:
     def thickness_ratio(self, coefficients, handle):
         """Deformed over baseline thickness at the stations of `handle`."""
         return self.thickness(coefficients, handle) / handle['baseline']
+
+    # ---- 3D internal volume between two spars --------------------------------
+    def add_spar_box_stations(self, front_spar, rear_spar, span_stations, n_chord=11):
+        """Embed the points for ``spar_box_volume``: upper and lower wall points
+        at ``n_chord`` chord fractions from ``front_spar`` to ``rear_spar`` (of
+        the local section chord) at each span station (y values, increasing).
+        Returns a handle; ``handle['baseline_volume']`` is the undeformed volume
+        as a number, for constraint bounds."""
+        if self.dim != 3:
+            raise ValueError("the spar-box volume is for 3D walls")
+        span_stations = np.asarray(span_stations, dtype=np.float64)
+        if span_stations.size < 2 or np.any(np.diff(span_stations) <= 0):
+            raise ValueError("need at least two increasing span stations")
+        if not 0. <= front_spar < rear_spar <= 1. or n_chord < 2:
+            raise ValueError("need 0 <= front_spar < rear_spar <= 1 and n_chord >= 2")
+        handle = self.add_thickness_stations(np.linspace(front_spar, rear_spar, n_chord),
+                                             span_stations)
+        handle['shape'] = (span_stations.size, n_chord)
+        upper, _ = self.ffd._probe_points[handle['upper']]
+        lower, _ = self.ffd._probe_points[handle['lower']]
+        handle['baseline_volume'] = float(self._spar_box_volume(upper, lower, handle['shape'], np))
+        return handle
+
+    @staticmethod
+    def _spar_box_volume(upper, lower, shape, ops):
+        """Trapezoidal integration of the thickness: chordwise per section,
+        then spanwise. Works on numpy arrays (ops = np) and csdl variables."""
+        n_span, n_chord = shape
+        # difference and average matrices along an axis of length n
+        def diff(n):
+            return np.eye(n)[1:] - np.eye(n)[:-1]
+
+        def mean(n):
+            return 0.5 * (np.eye(n)[1:] + np.eye(n)[:-1])
+
+        def matmat(a, b):
+            return a @ b if ops is np else csdl.matmat(a, b)
+
+        h = (upper[:, 2] - lower[:, 2]).reshape((n_span, n_chord))
+        x = (0.5 * (upper[:, 0] + lower[:, 0])).reshape((n_span, n_chord))
+        y = (0.5 * (upper[:, 1] + lower[:, 1])).reshape((n_span, n_chord))
+        # section areas between the spars, (n_span,)
+        area_terms = matmat(h, mean(n_chord).T) * matmat(x, diff(n_chord).T)
+        area = ops.sum(area_terms, axis=1) if ops is np else csdl.sum(area_terms, axes=(1,))
+        # span positions of the sections (all points of a section share their y)
+        y_section = matmat(y, np.full((n_chord, 1), 1. / n_chord)).reshape((n_span,))
+        if ops is np:
+            return np.sum((mean(n_span) @ area) * (diff(n_span) @ y_section))
+        return csdl.sum(csdl.matvec(mean(n_span), area) * csdl.matvec(diff(n_span), y_section))
+
+    def spar_box_volume(self, coefficients, handle):
+        """Internal volume of the deformed wall between the spars and span
+        stations of ``handle`` (from ``add_spar_box_stations``): the vertical
+        thickness integrated with the trapezoidal rule over the chord fractions
+        and then over the span. The stations are embedded in the FFD, so the
+        spars stay at their chord fractions when the planform changes."""
+        upper = self.ffd.probe_positions(coefficients, handle['upper'])
+        lower = self.ffd.probe_positions(coefficients, handle['lower'])
+        return self._spar_box_volume(upper, lower, handle['shape'], csdl)
 
     # ---- 3D planform ------------------------------------------------------
     def add_planform_stations(self, span_stations):

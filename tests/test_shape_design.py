@@ -401,3 +401,69 @@ def test_build_planform_dv_scaler():
     dv = build_planform_dv(8.6, (7.5, 10.))
     np.testing.assert_array_equal(dv.value, [8.6])
     np.testing.assert_allclose(dv.scaler, [1. / 1.4])
+
+
+# ---- WallGeometry spar-box volume ------------------------------------------------
+
+@pytest.mark.verification
+def test_spar_box_volume_of_a_rectangular_wing():
+    """Elliptic sections of chord 5 and t/c 0.12: the thickness at chord
+    fraction xi is 2 t c sqrt(xi (1 - xi)), so the volume between the spars is
+    span c^2 t * int 2 sqrt(xi (1 - xi)) dxi (to the facet and quadrature error)."""
+    X, tris = half_wing(n_chord=240, n_span=8, t_over_c=0.12)
+    corners = [[(-0.1, -1e-8, 0.4), (5.1, -1e-8, -0.4)], [(-0.1, 14.1, 0.4), (5.1, 14.1, -0.4)]]
+    shape, _ = wing_shape(X, tris, planform={'sweep': (-0.2, 0.2)}, corners=corners)
+    geo = shape.geometry
+    handle = geo.add_spar_box_stations(0.15, 0.65, np.linspace(0., 13.5, 4), n_chord=41)
+    volume = geo.spar_box_volume(shape.coefficients(), handle).value
+    xi = np.linspace(0.15, 0.65, 200001)
+    exact = 13.5 * 25. * 0.12 * np.trapezoid(2. * np.sqrt(xi * (1. - xi)), xi)
+    np.testing.assert_allclose(volume, exact, rtol=2e-3)
+    np.testing.assert_allclose(handle['baseline_volume'], volume, rtol=1e-12)
+
+
+@pytest.mark.verification
+def test_spar_box_volume_follows_the_affine_planform_map():
+    """Under the exact planform map (fixed taper) x and z scale by the chord
+    ratio r and y by the span ratio, so the volume scales by r^2 s'/s."""
+    X, tris = swept_wing()
+    shape, wing = wing_shape(X, tris, sections={'thickness': 0.1})
+    geo = shape.geometry
+    handle = geo.add_spar_box_stations(0.15, 0.65, np.linspace(0., 13.5, 8), n_chord=9)
+    values = dict(sweep=np.radians(31.), aspect_ratio=10.1, root_chord=5.3, thickness=0.07)
+    set_values(shape, values)
+    volume = geo.spar_box_volume(shape.coefficients(), handle).value
+    b = wing.baseline
+    r = 5.3 / b['root_chord']
+    s_ratio = 10.1 * 5.3 * (1 + b['taper_ratio']) / 4. / b['semi_span']
+    np.testing.assert_allclose(volume, handle['baseline_volume'] * r ** 2 * 1.07 * s_ratio, rtol=1e-10)
+
+
+@pytest.mark.verification
+def test_spar_box_volume_derivatives_match_central_differences():
+    X, tris = swept_wing(n_span=8)
+    shape, wing = wing_shape(X, tris, sections={'thickness': 0.2, 'camber': 0.05})
+    geo = shape.geometry
+    handle = geo.add_spar_box_stations(0.15, 0.65, np.linspace(0.5, 13.5, 5), n_chord=6)
+    point = dict(sweep=np.radians(29.), aspect_ratio=9.6, root_chord=4.9, taper_ratio=0.33,
+                 thickness=np.array([0.02, -0.03, 0.05, 0.01, -0.04]),
+                 camber=np.array([0.01, 0.005, -0.01, 0.02, 0.0]))
+    set_values(shape, point)
+    volume = geo.spar_box_volume(shape.coefficients(), handle)
+    wrts = [shape[name] for name in point]
+    sim = csdl.experimental.PySimulator(csdl.get_current_recorder())
+    an = sim.compute_totals([volume], wrts)
+    h = 1e-6
+    for wrt in wrts:
+        base = wrt.value.copy()
+        for k in range(base.size):
+            vals = []
+            for sign in (1., -1.):
+                pert = base.copy()
+                pert[k] += sign * h
+                sim[wrt] = pert
+                sim.run()
+                vals.append(float(volume.value[0]))
+            sim[wrt] = base
+            np.testing.assert_allclose(np.asarray(an[volume, wrt]).ravel()[k],
+                                       (vals[0] - vals[1]) / (2 * h), rtol=1e-6, atol=1e-8)
