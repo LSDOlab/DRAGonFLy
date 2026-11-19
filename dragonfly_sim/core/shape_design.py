@@ -378,9 +378,10 @@ class WingShape(ShapeLayer):
         Absolute values: each variable starts at the baseline wing's value and
         its bounds must bracket it. A name left out stays at its baseline,
         except the ``derived`` one.
-    sections : {name: spec} for ``thickness`` and/or ``camber``. spec is the
-        bounds, or a dict {'bounds': ..., 'modes': n} for n chordwise modes per
-        FFD spanwise section (default 1). The variable then has n_sections x n
+    sections : {name: spec} for ``thickness``, ``camber`` and/or ``twist``.
+        spec is the bounds, or a dict {'bounds': ..., 'modes': n} for n
+        chordwise modes per FFD spanwise section (default 1; twist has no
+        modes). The variable then has n_sections x n
         entries, section-major (root first: all of the root's modes, then the
         next section's); bounds as for ``build_sectional_dv`` -- a scalar, a
         pair, or a pair of arrays of shape (n_sections,) (the same for every
@@ -393,6 +394,13 @@ class WingShape(ShapeLayer):
                        4 xi (1 - xi) B_m(xi), so the leading and trailing edge
                        stay put; kappa in every mode is a parabolic camber line
                        of maximum kappa
+        ``twist``      change of the section's incidence [rad], one value per
+                       FFD spanwise section, positive nose-up, a rotation about
+                       the reference chord line (the sweep line at
+                       ``sweep_chord_fraction``) on the chord plane. Pin the
+                       root with per-section bounds, e.g.
+                       (np.radians([0, -3, -3]), np.radians([0, 3, 3])), when
+                       the angle of attack is a variable too.
         With one mode these are a uniform thickness change and a parabolic
         camber line. The modes are least-squares fits on the block's chordwise
         basis; they are exact when it is a Bezier (n_chord = degree + 1) of
@@ -414,8 +422,11 @@ class WingShape(ShapeLayer):
     scales it by r_j = c_j'/c_j0 about the reference chord line in x and about
     the chord plane in z (keeping t/c; the thickness modes act on top), and the
     reference line is placed at x_ref,root + y_j' tan(sweep'). These are
-    lsdo_geo sectional stretches and translations; thickness and camber are
-    additive sectional modes. With the taper ratio fixed the map is affine, so
+    lsdo_geo sectional stretches and translations; twist is an lsdo_geo
+    sectional rotation about the reference line, applied after the stretches
+    and before the translations; thickness and camber are additive sectional
+    modes, added last along z (under a twist theta they act vertically instead
+    of normal to the rotated chord, a 1 - cos(theta) difference). With the taper ratio fixed the map is affine, so
     the deformed wall is exactly the trapezoid the variables describe; a taper
     change is exact at the FFD sections and B-spline-blended between them.
     """
@@ -423,7 +434,8 @@ class WingShape(ShapeLayer):
     principal_dim = 1
     PLANFORM_KEYS = ('sweep', 'aspect_ratio', 'root_chord', 'span', 'taper_ratio')
     SIZE_KEYS = ('aspect_ratio', 'root_chord', 'span')
-    SECTION_KEYS = ('thickness', 'camber')
+    SECTION_KEYS = ('thickness', 'camber', 'twist')
+    MODE_KEYS = ('thickness', 'camber')
 
     def __init__(self, planform=None, sections=None, sweep_chord_fraction=0.25,
                  semi_span=None, derived=None, fit_tol=1e-3, scaler_mode='bounds', name='wing'):
@@ -442,6 +454,8 @@ class WingShape(ShapeLayer):
             if 'bounds' not in spec or set(spec) - {'bounds', 'modes'}:
                 raise ValueError("section variable {!r}: spec needs 'bounds' and may have "
                                  "'modes', got {}".format(key, sorted(spec)))
+            if key == 'twist' and 'modes' in spec:
+                raise ValueError("twist is one value per spanwise section; it has no modes")
             modes = int(spec.get('modes', 1))
             if modes < 1:
                 raise ValueError("section variable {!r} needs at least one mode".format(key))
@@ -565,6 +579,8 @@ class WingShape(ShapeLayer):
         self.mode_weights = {}
         self.mode_fit_residual = 0.
         for key, spec in self.section_spec.items():
+            if key not in self.MODE_KEYS:
+                continue
             weights = np.zeros((spec['modes'],) + ffd.shape)
             for j in range(n1):
                 xi = (basis0 @ C[:, j, 0, 0] - x_le0[j]) / self.c0[j]
@@ -577,6 +593,16 @@ class WingShape(ShapeLayer):
                 else:
                     weights[:, :, j, :] = fit.T[:, :, None]
             self.mode_weights[key] = weights
+
+        # lsdo_geo rotates a section about its normal, du x dw of the section's
+        # parametric directions (chordwise, vertical): +y or -y depending on the
+        # block's orientation. A positive twist is nose-up, a rotation about +y.
+        du = C[-1, :, 0, :] - C[0, :, 0, :]
+        dw = C[0, :, -1, :] - C[0, :, 0, :]
+        normal_y = np.cross(du, dw)[:, 1]
+        if not (np.all(normal_y > 0) or np.all(normal_y < 0)):
+            raise ValueError("the FFD sections' normals do not all point along +y or all along -y")
+        self.twist_sign = float(np.sign(normal_y[0]))
 
     # ---- design variables ---------------------------------------------------
     def _section_bounds(self, bounds, n1, modes):
@@ -648,6 +674,8 @@ class WingShape(ShapeLayer):
         # thickness modes scale the (chord-scaled) height above the chord
         # plane; camber modes move by a fraction of the new chord
         n1 = self.parameterization.ffd.shape[1]
+        if 'twist' in self.variables:
+            sectional.add_rotation(self.twist_sign * self.variables['twist'], pivot=self.pivots)
         for key, scale in (('thickness', ratio), ('camber', chord)):
             if key not in self.variables:
                 continue
@@ -683,7 +711,8 @@ class WingShape(ShapeLayer):
             lines.append("  wing sections: {} spanwise stations at y = {}; {} (max chordwise "
                          "mode fit residual {:.2e})".format(
                              n1, np.array2string(self.y, precision=3),
-                             ", ".join("{} {} modes".format(key, spec['modes'])
+                             ", ".join("twist per section" if key == 'twist'
+                                       else "{} {} modes".format(key, spec['modes'])
                                        for key, spec in self.section_spec.items()),
                              self.mode_fit_residual))
         return lines

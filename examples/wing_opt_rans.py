@@ -113,7 +113,7 @@ if __name__ == '__main__':
     # and the solver's force unit is p_dim * (1 m)^2.
     rho_0 = 1.0
     p_0 = 1.0
-    attack = np.radians(2)
+    attack = np.radians(2.5)
 
     # Reynolds number. The RANS model's Re is per unit length of the mesh
     # (mu_inf = rho_inf U_inf / Re), i.e. per metre: rho V / mu at the flight
@@ -166,15 +166,21 @@ if __name__ == '__main__':
     #   camber:    change of camber over local chord, sum_m kappa_m 4 xi (1 - xi)
     #              B_m(xi) (leading and trailing edge fixed; kappa in every mode:
     #              a parabolic camber line of maximum kappa)
+    #   twist:     change of the section incidence [rad], one value per section,
+    #              positive nose-up, about the quarter-chord line (the sweep
+    #              reference). The root is pinned at 0: alpha already sets the
+    #              wing's incidence there, so mid-span and tip twist relative to
+    #              the root, within +-3 deg.
     # Bounds may also be per-section arrays, e.g. to pin the root:
     # {'bounds': (np.array([0., -0.1, -0.1]), np.array([0., 0.1, 0.1])), 'modes': 4}.
     wing = WingShape(
         planform={'sweep': np.radians((20., 30.)),     # quarter-chord sweep [rad]
                   'aspect_ratio': (7.5, 10.),
-                  'span': (26., 30.),                  # full span; the model is the half wing
+                  'span': (22., 34.),                  # full span; the model is the half wing
                   'taper_ratio': (0.2, 0.4)},
         sections={'thickness': {'bounds': 0.1, 'modes': 4},
-                  'camber': {'bounds': 0.01, 'modes': 3}},
+                  'camber': {'bounds': 0.1, 'modes': 3},
+                  'twist': {'bounds': (np.radians([0., -3., -3.]), np.radians([0., 3., 3.]))}},
         sweep_chord_fraction=0.25,
         # the STW's trapezoid ends at y = 14; the wall's largest y (the default)
         # would include the rounded tip cap and shift AR and taper slightly

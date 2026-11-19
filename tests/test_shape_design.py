@@ -226,13 +226,65 @@ def test_section_mode_bounds_broadcast():
     np.testing.assert_array_equal(dv.upper, np.repeat(root_pinned[1], 4))
 
 
+def rotate_about_quarter_chord(X, theta, x_pivot, z_pivot=0.):
+    """Nose-up rotation by theta (about +y) through (x_pivot, ., z_pivot)."""
+    dx, dz = X[:, 0] - x_pivot, X[:, 2] - z_pivot
+    return np.stack([x_pivot + dx * np.cos(theta) + dz * np.sin(theta), X[:, 1],
+                     z_pivot - dx * np.sin(theta) + dz * np.cos(theta)], axis=1)
+
+
+@pytest.mark.verification
+def test_equal_twist_is_a_rigid_nose_up_rotation_about_the_quarter_chord():
+    """Equal twist at every section of a rectangular wing rotates the whole
+    wall about the quarter-chord line (x = 1.25, z = 0), trailing edge down."""
+    X, tris = half_wing(span=14., t_over_c=0.12)
+    shape, wing = wing_shape(X, tris, planform={}, sections={'twist': 0.1}, corners=None)
+    theta = np.radians(3.)
+    set_values(shape, dict(twist=np.full(5, theta)))
+    deformed = shape.wall_displacement().value + X
+    np.testing.assert_allclose(deformed, rotate_about_quarter_chord(X, theta, 1.25), rtol=0, atol=1e-12)
+    trailing_edge = np.isclose(X[:, 0], 5.) & (X[:, 1] < 14.)
+    # nose-up: the trailing edge, 3.75 behind the pivot, drops by 3.75 sin(theta)
+    np.testing.assert_allclose(deformed[trailing_edge, 2], -3.75 * np.sin(theta), rtol=1e-12)
+
+
+@pytest.mark.verification
+def test_twist_with_a_pinned_root():
+    """Root pinned, twist at the tip: the root section stays, the tip section
+    rotates by the tip value about its quarter chord."""
+    X, tris = half_wing(span=14., t_over_c=0.12)
+    root_pinned = (np.radians([0., -3., -3.]), np.radians([0., 3., 3.]))
+    shape, wing = wing_shape(X, tris, planform={}, sections={'twist': {'bounds': root_pinned}},
+                             corners=None, ffd_shape=(5, 3, 2), degree=(4, 2, 1))
+    dv = shape.dvs.dv('twist')
+    np.testing.assert_array_equal(dv.lower, root_pinned[0])
+    np.testing.assert_array_equal(dv.upper, root_pinned[1])
+    theta = np.radians(3.)
+    set_values(shape, dict(twist=np.array([0., 0., theta])))
+    deformed = shape.wall_displacement().value + X
+    root = np.isclose(X[:, 1], 0.)
+    tip = np.isclose(X[:, 1], 14.)
+    # the bounding-box FFD has a margin, so the root and tip rows sit just inside
+    # the end sections (the tip rows see ~0.9998 of the tip value)
+    np.testing.assert_allclose(deformed[root], X[root], rtol=0, atol=1e-8)
+    np.testing.assert_allclose(deformed[tip], rotate_about_quarter_chord(X[tip], theta, 1.25),
+                               rtol=0, atol=1e-4)
+
+
+@pytest.mark.unit_test
+def test_twist_has_no_modes():
+    with pytest.raises(ValueError, match="no modes"):
+        WingShape(sections={'twist': {'bounds': 0.1, 'modes': 2}})
+
+
 @pytest.mark.verification
 def test_wing_derivatives_match_central_differences():
     X, tris = swept_wing(n_span=8)
-    shape, wing = wing_shape(X, tris, sections={'thickness': 0.2, 'camber': 0.05})
+    shape, wing = wing_shape(X, tris, sections={'thickness': 0.2, 'camber': 0.05, 'twist': 0.1})
     point = dict(sweep=np.radians(29.), aspect_ratio=9.6, root_chord=4.9, taper_ratio=0.33,
                  thickness=np.array([0.02, -0.03, 0.05, 0.01, -0.04]),
-                 camber=np.array([0.01, 0.005, -0.01, 0.02, 0.0]))
+                 camber=np.array([0.01, 0.005, -0.01, 0.02, 0.0]),
+                 twist=np.array([0.0, 0.01, -0.02, 0.03, 0.02]))
     set_values(shape, point)
     disp = shape.wall_displacement()
     out = shape.outputs()['wing']
@@ -467,3 +519,16 @@ def test_spar_box_volume_derivatives_match_central_differences():
             sim[wrt] = base
             np.testing.assert_allclose(np.asarray(an[volume, wrt]).ravel()[k],
                                        (vals[0] - vals[1]) / (2 * h), rtol=1e-6, atol=1e-8)
+
+
+@pytest.mark.verification
+def test_spar_box_volume_is_unchanged_by_a_rigid_twist():
+    """Equal twist at every section is a rigid rotation: the polygon section
+    areas, and so the volume, do not change."""
+    X, tris = half_wing(n_chord=120, n_span=8, t_over_c=0.12)
+    shape, _ = wing_shape(X, tris, planform={}, sections={'twist': 0.1}, corners=None)
+    geo = shape.geometry
+    handle = geo.add_spar_box_stations(0.15, 0.65, np.linspace(0., 13.5, 4), n_chord=11)
+    set_values(shape, dict(twist=np.full(5, np.radians(3.))))
+    volume = geo.spar_box_volume(shape.coefficients(), handle).value
+    np.testing.assert_allclose(volume, handle['baseline_volume'], rtol=1e-10)

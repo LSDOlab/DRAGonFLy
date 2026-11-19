@@ -666,8 +666,13 @@ class WallGeometry:
 
     @staticmethod
     def _spar_box_volume(upper, lower, shape, ops):
-        """Trapezoidal integration of the thickness: chordwise per section,
-        then spanwise. Works on numpy arrays (ops = np) and csdl variables."""
+        """Section areas between the spars, integrated over the span with the
+        trapezoidal rule. A section's area is the shoelace area, in the x-z
+        plane, of the polygon through its upper points (front to rear spar)
+        and lower points (rear to front): the trapezoidal rule of the thickness
+        when the points are vertically aligned, and unchanged by a rotation of
+        the section (twist). Works on numpy arrays (ops = np) and csdl
+        variables."""
         n_span, n_chord = shape
         # difference and average matrices along an axis of length n
         def diff(n):
@@ -679,12 +684,24 @@ class WallGeometry:
         def matmat(a, b):
             return a @ b if ops is np else csdl.matmat(a, b)
 
-        h = (upper[:, 2] - lower[:, 2]).reshape((n_span, n_chord))
-        x = (0.5 * (upper[:, 0] + lower[:, 0])).reshape((n_span, n_chord))
+        def per_section(points, k):
+            return points[:, k].reshape((n_span, n_chord))
+
+        # polygon vertices per section, (n_span, 2 n_chord): upper points in
+        # order, then lower points reversed
+        place_upper = np.eye(n_chord, 2 * n_chord)
+        place_lower = np.zeros((n_chord, 2 * n_chord))
+        place_lower[np.arange(n_chord), 2 * n_chord - 1 - np.arange(n_chord)] = 1.
+        x = matmat(per_section(upper, 0), place_upper) + matmat(per_section(lower, 0), place_lower)
+        z = matmat(per_section(upper, 2), place_upper) + matmat(per_section(lower, 2), place_lower)
+        # next vertex (cyclic)
+        shift = np.roll(np.eye(2 * n_chord), -1, axis=1)
+        cross = x * matmat(z, shift) - matmat(x, shift) * z
+        # the polygon runs clockwise in (x, z) (upper side front to rear first),
+        # so the shoelace sum is minus twice the area
+        area = (-0.5 * ops.sum(cross, axis=1) if ops is np
+                else -0.5 * csdl.sum(cross, axes=(1,)))
         y = (0.5 * (upper[:, 1] + lower[:, 1])).reshape((n_span, n_chord))
-        # section areas between the spars, (n_span,)
-        area_terms = matmat(h, mean(n_chord).T) * matmat(x, diff(n_chord).T)
-        area = ops.sum(area_terms, axis=1) if ops is np else csdl.sum(area_terms, axes=(1,))
         # span positions of the sections (all points of a section share their y)
         y_section = matmat(y, np.full((n_chord, 1), 1. / n_chord)).reshape((n_span,))
         if ops is np:
@@ -693,10 +710,12 @@ class WallGeometry:
 
     def spar_box_volume(self, coefficients, handle):
         """Internal volume of the deformed wall between the spars and span
-        stations of ``handle`` (from ``add_spar_box_stations``): the vertical
-        thickness integrated with the trapezoidal rule over the chord fractions
-        and then over the span. The stations are embedded in the FFD, so the
-        spars stay at their chord fractions when the planform changes."""
+        stations of ``handle`` (from ``add_spar_box_stations``): per span
+        station the area of the polygon through the upper and lower wall points
+        between the spars (the trapezoidal rule of the thickness over the chord
+        fractions, also under twist), integrated over the span with the
+        trapezoidal rule. The stations are embedded in the FFD, so the spars
+        stay at their chord fractions when the planform changes."""
         upper = self.ffd.probe_positions(coefficients, handle['upper'])
         lower = self.ffd.probe_positions(coefficients, handle['lower'])
         return self._spar_box_volume(upper, lower, handle['shape'], csdl)
