@@ -168,7 +168,7 @@ class IDWarp_jax(csdl.CustomExplicitOperation):
         anchor_meshtag_vals=(6,),  # the windtunnel's FARFIELD_TAG
         extrusion_width: float = None,
         LdefFact: float = 1.0,
-        err_tol: float = 1.0e-6,
+        err_tol: float = 1.0e-5,
         reuse_tol: float = 1.0e-12,
         **idwarp_kwargs,
     ):
