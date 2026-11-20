@@ -314,21 +314,26 @@ if __name__ == '__main__':
     # Fuel-burn model. Its inputs follow the current design variables: the
     # planform quantities (full wing area, aspect ratio, taper ratio and
     # quarter-chord sweep, as Raymer's wing-weight equation wants) from the
-    # wing layer, and the root t/c from the root section's thickness modes,
-    # the baseline t/c (0.121, RAE2822) scaled by the relative thickness change
-    # at the maximum-thickness chord fraction (~0.38). The thickness variable
-    # holds the root section's modes first.
+    # wing layer, and a wing t/c from the thickness modes of all FFD spanwise
+    # sections: per section, the baseline t/c (0.121, RAE2822) scaled by the
+    # relative thickness change at the maximum-thickness chord fraction (~0.38),
+    # combined as the 2-norm over the sections divided by sqrt(n_sections) (the
+    # RMS), so that the baseline wing keeps t/c = 0.121 in Raymer's (t/c)^-0.4.
+    # The thickness variable is section-major (root section's modes first).
     planform = shape.outputs()['wing']
     S_wings = planform['area']
     AR = planform['aspect_ratio']
     taper_ratio = planform['taper_ratio']
     sweep = planform['sweep']
 
-    tc_root_baseline = 0.121
+    tc_baseline = 0.121
     n_thickness_modes = wing.section_spec['thickness']['modes']
-    root_thickness_weights = _section_mode_profiles('thickness', n_thickness_modes, np.array([0.38]))[0]
-    root_thickness_modes = wing.variables['thickness'][0:n_thickness_modes]
-    tc_root = tc_root_baseline * (1. + csdl.sum(root_thickness_weights * root_thickness_modes))
+    n_thickness_sections = wing.variables['thickness'].size // n_thickness_modes
+    max_thickness_weights = _section_mode_profiles('thickness', n_thickness_modes, np.array([0.38]))[0]
+    section_thickness_modes = csdl.reshape(wing.variables['thickness'],
+                                           (n_thickness_sections, n_thickness_modes))
+    tc_sections = tc_baseline * (1. + csdl.matvec(section_thickness_modes, max_thickness_weights))
+    tc_wing = csdl.norm(tc_sections) / np.sqrt(n_thickness_sections)
 
     # Dimensional lift and drag [N] of both wings: the solver's force unit is
     # p_dim * (1 m)^2, and the model is the half wing.
@@ -337,11 +342,12 @@ if __name__ == '__main__':
 
     fuelburn_model = STW_fuelburn(q_inf_dim, V_cruise=V_dim)
     TOGM, LGM, cruise_start_mass, fuel_burn = fuelburn_model.evaluate(
-        S_wings, AR, tc_root, taper_ratio, sweep, L_total, D_wings)
+        S_wings, AR, tc_wing, taper_ratio, sweep, L_total, D_wings)
     TOGM.add_name('take_off_gross_mass')
     LGM.add_name('landing_gross_mass')
     cruise_start_mass.add_name('cruise_start_mass')
-    tc_root.add_name('tc_root')
+    tc_sections.add_name('tc_sections')
+    tc_wing.add_name('tc_wing')
 
     # The pitching moment about the current wing's MAC quarter chord
     x_mac, y_mac, z_mac = mac_quarter_chord(planform['semi_span'], taper_ratio, sweep, csdl.tan,
